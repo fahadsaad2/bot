@@ -1,7 +1,5 @@
 import yfinance as yf, requests, os, time, threading
 from flask import Flask
-from scipy.stats import norm
-import math
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -13,34 +11,44 @@ def home(): return "Bot is running!"
 
 def send(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", 
+                      data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
     except: pass
 
-def calc_delta(S,K,T,r,sigma,opt="call"):
+def bot_loop():
+    time.sleep(3)
+    # امسح كل الرسائل القديمة عشان ما يصير سبام
     try:
-        d1 = (math.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*math.sqrt(T))
-        return norm.cdf(d1) if opt=="call" else norm.cdf(d1)-1
-    except: return 0.5
+        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset=-1").json()
+        if r.get("result"):
+            last_id = r["result"][-1]["update_id"]
+            requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_id+1}")
+    except: pass
+    
+    send("✅ البوت اشتغل - هذا اخر تنبيه سبام\nارسل /start")
 
-def monitor():
-    time.sleep(10)
-    send("✅ البوت اشتغل تمام ويرد على /start\nلن يرسل سبام بعد الان")
-    last_update_id = 0
+    offset = 0
     while True:
         try:
-            # استقبال رسائل /start
-            r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_update_id+1}&timeout=20").json()
-            for upd in r.get("result", []):
-                last_update_id = upd["update_id"]
-                txt = upd.get("message", {}).get("text", "")
-                if txt == "/start":
-                    send("👋 أهلا! البوت شغال 24 ساعة\nيراقب: " + ", ".join(TICKERS) + "\n\nارسل /status لمعرفة الحالة")
-                if txt == "/status":
-                    send("✅ البوت شغال\nSPX الان مراقب")
-        except: pass
-        time.sleep(2)
+            res = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={offset+1}&timeout=25").json()
+            for upd in res.get("result", []):
+                offset = upd["update_id"]
+                msg = upd.get("message", {})
+                text = msg.get("text", "")
+                chat = str(msg.get("chat", {}).get("id", ""))
+                
+                # يرد فقط على شاتك انت
+                if chat != str(CHAT_ID): continue
+                
+                if text == "/start":
+                    send(f"👋 هلا! البوت شغال تمام\nيراقب: {', '.join(TICKERS)}\n\n/status - حالة البوت")
+                elif text == "/status":
+                    send("✅ شغال 100% ومراقب السوق")
+        except Exception as e:
+            time.sleep(2)
+        time.sleep(1)
 
-threading.Thread(target=monitor, daemon=True).start()
+threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
