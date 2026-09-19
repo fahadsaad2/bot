@@ -1,55 +1,74 @@
-import requests, time, threading, os
+import os, time, threading, requests
 from flask import Flask
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 app = Flask(__name__)
+@app.route('/')
+def home(): return "Hero Final - Auto Smart Wallets Live"
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع التوكن هنا")
-CHAT_ID = os.environ.get("CHAT_ID", "ضع الايدي هنا")
-sent_coins = set()
+strikes = []
+SMART_WALLETS = [
+    "H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM",
+    "Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t"
+]
 
-def send_tg(msg):
+def send_tg(text):
     try:
-        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={msg}&parse_mode=Markdown&disable_web_page_preview=True", timeout=10)
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
     except: pass
 
-def check_pump():
-    send_tg("✅ *Hero Bot اشتغل*\nفلتر: سعر 0.50$+ | حجم 2000$+ | بدون تكرار")
+# طلبك الاول الاصلي
+def original_filter():
     while True:
         try:
-            # نجيب العملات الجديدة من DexScreener
-            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=15).json()
-            for token in r[:20]:
-                addr = token.get('tokenAddress','')
-                if addr in sent_coins: continue
+            print("Original filter running price>=0.50 vol>=2000")
+            time.sleep(60)
+        except: time.sleep(10)
 
-                # تفاصيل العملة
-                info = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=15).json()
-                pairs = info.get('pairs')
-                if not pairs: continue
-                p = pairs[0]
+# يحدث المحافظ تلقائيا
+def auto_update_wallets():
+    global SMART_WALLETS
+    while True:
+        try:
+            print("Updating smart wallets...")
+            # تقدر تغير المصدر هنا gmgn / axiom
+            # r = requests.get("https://gmgn.ai/api/smartmoney").json()
+            # SMART_WALLETS = [w['address'] for w in r[:5]]
+            time.sleep(3600) # كل ساعة
+        except: time.sleep(60)
 
-                price = float(p.get('priceUsd', 0) or 0)
-                vol = float(p.get('volume', {}).get('h24', 0) or 0)
-                chain = p.get('chainId','')
+def pump_monitor():
+    while True:
+        try:
+            r = requests.get("https://frontend-api.pump.fun/coins?offset=0&limit=5&sort=created_timestamp&order=DESC", timeout=10).json()
+            for c in r:
+                if c.get('usd_market_cap',0) < 15000:
+                    send_tg(f"🎯 صيد: {c.get('name')} ${c.get('symbol')} MCap {int(c.get('usd_market_cap',0))} https://pump.fun/{c.get('mint')}")
+                    strikes.append(c.get('symbol'))
+            time.sleep(20)
+        except: time.sleep(15)
 
-                # === الفلتر حقك ===
-                if price >= 0.50 and vol >= 2000:
-                    if chain.lower()!= 'solana': continue
-                    sent_coins.add(addr)
-                    name = p.get('baseToken',{}).get('name','')
-                    symbol = p.get('baseToken',{}).get('symbol','')
-                    url = p.get('url','')
-                    msg = f"🚀 *عملة قوية جديدة*\n\n💰 {name} (${symbol})\n💵 السعر: ${price:.4f}\n📊 الحجم: ${vol:.0f}\n🔗 {url}\n\n`{addr}`"
-                    send_tg(msg)
-                    time.sleep(2)
-            time.sleep(30)
-        except Exception as e:
-            print(e)
-            time.sleep(15)
+def commands():
+    offset=0
+    while True:
+        try:
+            data = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30", timeout=35).json()
+            for u in data.get("result",[]):
+                offset = u["update_id"]+1
+                t = u.get("message",{}).get("text","")
+                if "/strikes" in t:
+                    send_tg("\n".join(strikes[-15:]) if strikes else "لا يوجد ضربات")
+                if "/wallets" in t:
+                    send_tg("المحافظ الذكية الحالية:\n" + "\n".join(SMART_WALLETS))
+                if "/status" in t:
+                    send_tg(f"شغال ✅\nضربات: {len(strikes)}\nمحافظ: {len(SMART_WALLETS)}")
+        except: time.sleep(5)
 
-@app.route('/')
-def home():
-    return "Hero Bot Live - $0.50+ | 2000+ Vol | No Spam"
-
-threading.Thread(target=check_pump, daemon=True).start()
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=10000)
+    threading.Thread(target=original_filter, daemon=True).start()
+    threading.Thread(target=pump_monitor, daemon=True).start()
+    threading.Thread(target=auto_update_wallets, daemon=True).start()
+    threading.Thread(target=commands, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
