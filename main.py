@@ -2,146 +2,93 @@ from flask import Flask
 import os, requests, threading, time
 from datetime import datetime
 import yfinance as yf
-
-app = Flask(__name__)
+app=Flask(__name__)
 @app.route('/')
-def home():
-    return "Live 16+SPX - Ready"
+def home(): return "ALL-IN-ONE LIVE"
+TOKEN=os.getenv("BOT_TOKEN")
+CHAT_ID=os.getenv("CHAT_ID")
+TICKERS=["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","AVGO","PLTR","MSTR","COIN","INTK","SNDK","SMCI"]
+NAMES={"^GSPC":"SPX"}
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+def send(t):
+ try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML"},timeout=15)
+ except: pass
 
-TICKERS = ["SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","SNDK","SMCI","AVGO","PLTR","^GSPC"]
-NAMES = {"^GSPC":"SPX"}
+def get_all():
+ hero=[]; sweeps=[]; golden=[]; gamma=[]; power=[]
+ today=datetime.now().date()
+ for sym in TICKERS:
+  try:
+   ysym="^SPX" if sym=="^GSPC" else sym
+   tk=yf.Ticker(ysym)
+   if not tk.options: continue
+   # Gamma - اكبر OI في كل الشركة
+   try:
+    exp0=tk.options[0]
+    ch0=tk.option_chain(exp0).calls
+    if not ch0.empty:
+     g=ch0.sort_values(by='openInterest',ascending=False).iloc[0]
+     gamma.append((g['openInterest'],f"💥 <b>{NAMES.get(sym,sym)} {g['strike']:.0f}C</b> {exp0} OI:{int(g['openInterest']):,} ${g['lastPrice']:.2f} WALL\n"))
+   except: pass
 
-def send(text):
+   for exp in tk.options[:4]:
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id":CHAT_ID,"text":text,"parse_mode":"HTML"}, timeout=15)
-    except Exception as e:
-        print(e)
+     exp_date=datetime.strptime(exp,"%Y-%m-%d").date()
+     is_today= exp_date == today
+     chain=tk.option_chain(exp).calls
+     chain=chain[(chain['openInterest']>150) & (chain['lastPrice']>=0.15)]
+     if chain.empty: continue
+     chain=chain.copy()
+     chain['premium']=chain['openInterest']*chain['lastPrice']*100
+     chain['sweep_ratio']=chain['volume']/chain['openInterest'].replace(0,1)
 
-def get_hot_strikes():
-    results = []
-    for symbol in TICKERS:
-        try:
-            yf_sym = "SPY" if symbol=="^GSPC" else symbol
-            if symbol=="^GSPC":
-                tk = yf.Ticker("^GSPC")
-                # SPX options ticker is ^SPX? yfinance uses ^GSPC but options under ^SPX sometimes fail, نستخدم SPY كبديل للسترايك
-                # نحاول SPX الحقيقي
-                try:
-                    tk_opt = yf.Ticker("^SPX")
-                    if tk_opt.options and len(tk_opt.options)>0:
-                        tk = tk_opt
-                except: pass
-            else:
-                tk = yf.Ticker(symbol)
+     # HERO
+     if is_today:
+      h=chain[chain['lastPrice']<=1.5].sort_values(by='volume',ascending=False).head(1)
+      for _,r in h.iterrows():
+       hero.append((r['volume'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,}\n"))
 
-            if not tk.options:
-                continue
-            # اقرب اكسبايري فيه حركة
-            exps = tk.options[:3] # اول 3 اكسبايري
-            best_call = None
-            best_exp = ""
+     # SWEEPS & GOLDEN
+     sw=chain[(chain['volume']>800) & (chain['sweep_ratio']>1.2)].sort_values(by='volume',ascending=False).head(1)
+     for _,r in sw.iterrows():
+      d=NAMES.get(sym,sym)
+      if r['premium']>1000000 and r['volume']>3000:
+       golden.append((r['premium'],f"👑 <b>{d} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} ${r['premium']:,.0f} GOLDEN\n"))
+      else:
+       sweeps.append((r['volume'],f"🐋 <b>{d} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} x{float(r['sweep_ratio']):.1f}\n"))
 
-            for exp in exps:
-                try:
-                    chain = tk.option_chain(exp).calls
-                    # فلتر الزخم: فوليوم عالي + اوبن انترست عالي + سعر 1-15 دولار
-                    filtered = chain[(chain['volume']>800) & (chain['openInterest']>1000) & (chain['lastPrice']>=0.5) & (chain['lastPrice']<=20)]
-                    if filtered.empty:
-                        continue
-                    # احسب قيمة الصفقة = فوليوم * سعر * 100
-                    filtered = filtered.copy()
-                    filtered['premium'] = filtered['volume'] * filtered['lastPrice'] * 100
-                    filtered['iv_rank'] = filtered['impliedVolatility']
-                    # ترتيب حسب الزخم = فوليوم * بريميوم
-                    filtered = filtered.sort_values(by=['volume','premium'], ascending=False)
-                    top = filtered.iloc[0]
-                    if best_call is None or top['premium'] > best_call['premium']:
-                        best_call = top
-                        best_exp = exp
-                except:
-                    continue
+     # POWER HOUR - عقود الاسبوع رخيصة
+     if (exp_date - today).days <= 4:
+      ph=chain[(chain['lastPrice']>=0.30) & (chain['lastPrice']<=2.0)].sort_values(by='volume',ascending=False).head(1)
+      for _,r in ph.iterrows():
+       power.append((r['volume'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,}\n"))
+    except: continue
+  except: continue
+ hero.sort(key=lambda x:x[0],reverse=True)
+ sweeps.sort(key=lambda x:x[0],reverse=True)
+ golden.sort(key=lambda x:x[0],reverse=True)
+ gamma.sort(key=lambda x:x[0],reverse=True)
+ power.sort(key=lambda x:x[0],reverse=True)
+ return hero[:6], golden[:6], sweeps[:6], gamma[:6], power[:6]
 
-            if best_call is not None:
-                display = NAMES.get(symbol, symbol)
-                strike = best_call['strike']
-                last = best_call['lastPrice']
-                vol = int(best_call['volume'])
-                oi = int(best_call['openInterest'])
-                premium = best_call['premium']
-                iv = best_call['impliedVolatility']*100
+def loop():
+ time.sleep(3); send("✅ بوت 5x جاهز\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER HOUR\nارسل /strikes")
+ off=0
+ while True:
+  try:
+   r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
+   for u in r.get("result",[]):
+    off=u["update_id"]; txt=u.get("message",{}).get("text","")
+    if "/strikes" in txt.lower() or "/start" in txt.lower():
+     send("⏳ اجيب الـ 5...")
+     h,g,s,ga,p=get_all()
+     if h: send("🚀 <b>HERO ZERO:</b>\n\n"+"".join([x[1] for x in h]))
+     if g: send("👑 <b>GOLDEN SWEEPS (حوت مليوني):</b>\n\n"+"".join([x[1] for x in g]))
+     if s: send("🐋 <b>SWEEPS:</b>\n\n"+"".join([x[1] for x in s]))
+     if ga: send("💥 <b>GAMMA WALL (اقوى جدار):</b>\n\n"+"".join([x[1] for x in ga[:5]]))
+     if p: send("⏰ <b>POWER HOUR (جاهز لاخر ساعة):</b>\n\n"+"".join([x[1] for x in p[:5]]))
+     if not any([h,g,s,ga,p]): send("⚠️ السوق مقفل - الاثنين 4:45 العصر")
+  except: time.sleep(3)
 
-                # وقت الدخول والخروج
-                entry_price = f"${strike:.0f}"
-                # دخول: اذا السهم فوق السترايك
-                # خروج: هدف 25% و 40% + ستوب 15%
-                target1 = last * 1.25
-                target2 = last * 1.40
-                stop = last * 0.85
-
-                # حساب وقت
-                now = datetime.now().strftime("%I:%M %p")
-
-                msg = (
-                    f"🔥 <b>{display} {strike:.0f}C</b> {best_exp}\n"
-                    f"💰 سعر العقد: ${last:.2f} | IV: {iv:.0f}%\n"
-                    f"📊 فوليوم: {vol:,} | OI: {oi:,} | سيولة: ${premium:,.0f}\n"
-                    f"⏰ دخول: الان {now} اذا اخترق ${strike:.0f}\n"
-                    f"🎯 خروج1: ${target1:.2f} (+25%) | خروج2: ${target2:.2f} (+40%)\n"
-                    f"🛑 ستوب: ${stop:.2f} (-15%)\n"
-                )
-                results.append((premium, msg))
-        except Exception as e:
-            print(f"{symbol} error {e}")
-            continue
-
-    # رتب حسب اكبر سيولة (اكبر طلب)
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [r[1] for r in results]
-
-def bot_loop():
-    time.sleep(4)
-    send("✅ <b>بوت 16 شركة + SPX شغال</b>\nارسل /strikes")
-    offset = 0
-    while True:
-        try:
-            r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={offset+1}&timeout=20", timeout=25).json()
-            for upd in r.get("result", []):
-                offset = upd["update_id"]
-                msg = upd.get("message", {})
-                text = msg.get("text","")
-                chat_id = str(msg.get("chat",{}).get("id",""))
-                if chat_id!= str(CHAT_ID):
-                    continue
-
-                if "/strikes" in text.lower() or "/start" in text.lower():
-                    send("⏳ اجيب السترايكات الحارة اللي عليها زخم وطلب كبير... 30 ثانية")
-                    strikes = get_hot_strikes()
-                    if not strikes:
-                        send("⚠️ ما فيه فلو قوي الان - السوق نايم او yfinance معلق، جرب بعد 5 دقايق")
-                    else:
-                        # ارسل على دفعات 5 شركات كل رسالة
-                        chunk = ""
-                        count = 0
-                        for s in strikes:
-                            chunk += s + "\n"
-                            count+=1
-                            if count % 4 == 0:
-                                send(chunk)
-                                chunk=""
-                                time.sleep(1)
-                        if chunk:
-                            send(chunk)
-                        send(f"✅ خلصنا {len(strikes)} سترايك عليها زخم | <b>وقت الدخول: عند الاختراق</b> | <b>الخروج: +25% / +40%</b>")
-
-        except Exception as e:
-            print(e)
-            time.sleep(3)
-
-threading.Thread(target=bot_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)))
+threading.Thread(target=loop,daemon=True).start()
+app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
