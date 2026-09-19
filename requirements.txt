@@ -1,7 +1,6 @@
-Flask==2.3.3
-gunicorn
-yfinance
-pandas
+flask
 requests
-lxml
+gunicorn
 html5lib
+beautifulsoup4
+lxml
