@@ -4,102 +4,79 @@ from flask import Flask
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+print(f"BOT_TOKEN set: {bool(BOT_TOKEN)}")
+print(f"CHAT_ID set: {bool(CHAT_ID)} - value: {CHAT_ID}")
+
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Hero Unified Bot - All in One Live ✅"
+def home(): return "Bot Fixed Live ✅"
 
-# كل المحافظ الذكية
 SMART_WALLETS = [
     "H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM",
     "Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t",
     "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-    "5Q544fKrFoe6tsEbD7S8EmxGTJYAkc4sQqwF8JkR4vGp",
-    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsY9CTQ1t6P7pump"
 ]
 
 strikes_db = []
 
 def send_tg(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Missing BOT_TOKEN or CHAT_ID")
+        return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        print(f"TG sent: {r.status_code} {r.text[:100]}")
     except Exception as e:
         print(f"TG Error: {e}")
 
-# --- البوت الموحد ---
-def unified_monitor():
+def monitor():
+    time.sleep(5)
+    send_tg("🚀 <b>البوت اشتغل!</b>\nجرب /status")
     while True:
         try:
-            # 1- طلبك الاول الاصلي: سعر >=0.50 فوليوم >=2000 سولانا
-            # 2- صيد مبكر + فوليوم سبايك + محافظ
-            r = requests.get("https://frontend-api.pump.fun/coins?offset=0&limit=10&sort=created_timestamp&order=DESC", timeout=10).json()
-            for c in r:
-                price = float(c.get('usd_market_cap', 0))
-                vol = float(c.get('volume', 0)) if 'volume' in c else 2500 # قيمة افتراضية
-                chain = "solana"
-                symbol = c.get('symbol', 'UNKNOWN')
-                name = c.get('name', 'Unknown Company')
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get("https://frontend-api-v3.pump.fun/coins?offset=0&limit=5&sort=created_timestamp&order=DESC", headers=headers, timeout=15)
+            if r.status_code != 200:
+                print(f"Pump API blocked: {r.status_code}")
+                time.sleep(60)
+                continue
+            data = r.json()
+            for c in data:
+                symbol = c.get('symbol','?')
+                name = c.get('name','?')
                 mint = c.get('mint')
                 today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-                # شرطك الاصلي
-                is_original_hit = (price >= 0.50 and vol >= 2000 and chain == 'solana')
-                is_new_hit = (price < 15000)
-
-                if is_original_hit or is_new_hit:
-                    strike_val = int(price) if price < 15000 else 0.55
-
-                    msg = f"""🎯 <b>تنبيه دخول - بوت موحد</b>
-🏢 الشركة: {name} (${symbol})
-💰 السترايك: ${strike_val}
-📅 التاريخ: {today}
-👛 دخلت محفظة: {SMART_WALLETS[0][:6]}...
-🔗 https://pump.fun/{mint}
-📊 الشرط: {'اصلي ✅' if is_original_hit else 'صيد مبكر ✅'}
-"""
-                    send_tg(msg)
-                    strikes_db.append(f"{today} | {symbol} | Strike ${strike_val} | {name}")
-                    print(f"Strike: {symbol}")
-
-            time.sleep(30)
+                msg = f"🎯 <b>دخول جديد</b>\n🏢 الشركة: {name} (${symbol})\n💰 سترايك: ${int(c.get('usd_market_cap',0))}\n📅 التاريخ: {today}\n🔗 https://pump.fun/{mint}"
+                # send_tg(msg) # فعله بعد ما يشتغل /status
+                strikes_db.append(f"{today} | {symbol} | ${int(c.get('usd_market_cap',0))}")
+            time.sleep(45)
         except Exception as e:
-            print(f"Monitor Error: {e}")
-            time.sleep(15)
+            print(f"Monitor loop error: {e}")
+            time.sleep(30)
 
-def handle_commands():
+def commands():
     offset = 0
+    print("Commands thread started")
     while True:
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            data = requests.get(url, timeout=35).json()
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                text = upd.get("message", {}).get("text", "")
-
-                if "/strikes" in text:
-                    if not strikes_db:
-                        send_tg("لا يوجد ضربات اليوم")
-                    else:
-                        send_tg("📋 <b>سجل الضربات:</b>\n" + "\n".join(strikes_db[-20:]))
-
-                elif "/wallets" in text:
-                    send_tg("👛 <b>المحافظ الذكية:</b>\n" + "\n".join(SMART_WALLETS))
-
-                elif "/status" in text:
-                    send_tg(f"""✅ <b>البوت الموحد شغال</b>
-🌐 {len(SMART_WALLETS)} محافظ مراقبة
-🔥 عدد الضربات: {len(strikes_db)}
-⚙️ الشرط الاصلي: price>=0.50 vol>=2000 solana موجود ✅
-💡 انت في دراية تبيع وتشتري يدوي - البوت تنبيه فقط
-""")
-                elif "/start" in text:
-                    send_tg("اهلا! البوت الموحد\n/strikes - الشركات والسترايك والتاريخ\n/wallets - المحافظ\n/status - الحالة")
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=25"
+            resp = requests.get(url, timeout=30).json()
+            for u in resp.get("result", []):
+                offset = u["update_id"] + 1
+                txt = u.get("message", {}).get("text", "")
+                print(f"Got command: {txt}")
+                if "/start" in txt or "/status" in txt:
+                    send_tg(f"✅ <b>البوت شغال 100%!</b>\nCHAT_ID: {CHAT_ID}\nالضربات: {len(strikes_db)}\nالمحافظ: {len(SMART_WALLETS)}\n\n/strikes - السجل\n/wallets - المحافظ")
+                elif "/strikes" in txt:
+                    send_tg("\n".join(strikes_db[-15:]) if strikes_db else "لا يوجد سجل بعد")
+                elif "/wallets" in txt:
+                    send_tg("\n".join(SMART_WALLETS))
         except Exception as e:
             print(f"CMD Error: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
-    threading.Thread(target=unified_monitor, daemon=True).start()
-    threading.Thread(target=handle_commands, daemon=True).start()
-    send_tg("🚀 <b>البوت الموحد اشتغل!</b>\nكل الطلبات في بوت واحد:\n- شرطك الاصلي موجود\n- 5 محافظ ذكية\n- تنبيه بالشركة والسترايك والتاريخ\nجرب /status")
+    threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=commands, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
