@@ -1,65 +1,123 @@
-import os, time, threading, requests
 from flask import Flask
+import os, requests, threading, time
+from datetime import datetime
+import yfinance as yf
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-
-app = Flask(__name__)
+app=Flask(__name__)
 @app.route('/')
-def home():
-    return 'Hero V2 Fixed'
+def home(): return "HERO ZERO + WHALE WALLETS V4 LIVE"
 
-SMART_WALLETS = [
- 'H72yLkhTnoBfhBTXXaj1RBXuirn8s8G5GfcVh2XpQlGgW',
- 'Be9CvxqHW6BYiRAxW903xu1ycTMWaL5z8NX4HR3ha7tM',
- '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S51CNLY3QrkX6H',
- '5Q544fKrFoe6tsEbD7S8EmxGTJYAkc4sQqwF8JkR4vG9',
- '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsY9CTQ1t6P7pump'
-]
+TOKEN=os.getenv("BOT_TOKEN")
+CHAT_ID=os.getenv("CHAT_ID")
+WALLETS=[w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.strip()]
+MORALIS=os.getenv("MORALIS_API","").strip()
+TICKERS=["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","AVGO","PLTR","MSTR","COIN","INTK","SNDK","SMCI"]
+NAMES={"^GSPC":"SPX"}
 
-def send_tg(text):
+seen_tx=set()
+seen_wallets={}
+
+def send(t):
+ try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML"},timeout=15)
+ except: pass
+
+def get_options():
+ hero=[]; sweeps=[]; golden=[]; gamma=[]; power=[]
+ today=datetime.now().date()
+ now_str=datetime.now().strftime("%m/%d %I:%M%p")
+ for sym in TICKERS:
+  try:
+   ysym="^SPX" if sym=="^GSPC" else sym
+   tk=yf.Ticker(ysym)
+   if not tk.options: continue
+   try:
+    ch0=tk.option_chain(tk.options[0]).calls
+    if not ch0.empty:
+     g=ch0.sort_values(by='openInterest',ascending=False).iloc[0]
+     prem=g['openInterest']*g['lastPrice']*100
+     gamma.append((g['openInterest'],f"💥 <b>{NAMES.get(sym,sym)} {g['strike']:.0f}C</b> ${g['lastPrice']:.2f} | OI:{int(g['openInterest']):,} | ${prem:,.0f} | {tk.options[0]} | {now_str}\n🎯 هدف1 ${g['lastPrice']*1.3:.2f} هدف2 ${g['lastPrice']*1.6:.2f}\n"))
+   except: pass
+   for exp in tk.options[:4]:
     try:
-        u = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(u, json={'chat_id': CHAT_ID, 'text': text}, timeout=10)
-    except:
-        pass
+     exp_date=datetime.strptime(exp,"%Y-%m-%d").date()
+     chain=tk.option_chain(exp).calls
+     chain=chain[(chain['openInterest']>150)&(chain['lastPrice']>=0.15)]
+     if chain.empty: continue
+     chain=chain.copy()
+     chain['premium']=chain['openInterest']*chain['lastPrice']*100
+     chain['sweep_ratio']=chain['volume']/chain['openInterest'].replace(0,1)
+     chain['demand']=chain['volume']*chain['lastPrice']
+     if exp_date==today:
+      h=chain[chain['lastPrice']<=1.5].sort_values(by='demand',ascending=False).head(1)
+      for _,r in h.iterrows():
+       hero.append((r['demand'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,} {exp} {now_str}\n🎯 +35% ${r['lastPrice']*1.35:.2f} +80% ${r['lastPrice']*1.8:.2f}\n"))
+     sw=chain[(chain['volume']>800)&(chain['sweep_ratio']>1.2)].sort_values(by='premium',ascending=False).head(1)
+     for _,r in sw.iterrows():
+      msg=f"<b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} x{r['sweep_ratio']:.1f} Vol:{int(r['volume']):,} ${r['premium']:,.0f} {now_str}\n🎯 ${r['lastPrice']*1.3:.2f} / ${r['lastPrice']*1.6:.2f}\n"
+      if r['premium']>1000000 and r['volume']>3000: golden.append((r['premium'],f"👑 {msg}"))
+      else: sweeps.append((r['premium'],f"🐋 {msg}"))
+     if (exp_date-today).days<=4:
+      ph=chain[(chain['lastPrice']>=0.3)&(chain['lastPrice']<=2.0)].sort_values(by='demand',ascending=False).head(1)
+      for _,r in ph.iterrows(): power.append((r['demand'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} {now_str}\n"))
+    except: continue
+  except: continue
+ for lst in [hero,sweeps,golden,gamma,power]: lst.sort(key=lambda x:x[0],reverse=True)
+ return hero[:5],golden[:5],sweeps[:5],gamma[:5],power[:5]
 
-def unified_monitor():
-    hdr = {'User-Agent': 'Mozilla/5.0'}
-    # هذا الرابط عدل النقطة
-    api_url = 'https://frontend-api-v2.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC'
-    api_url = api_url.replace(' ', '')
-    while True:
-        try:
-            resp = requests.get(api_url, headers=hdr, timeout=15)
-            if not resp.text or len(resp.text) < 10:
-                print('Empty')
-                time.sleep(15)
-                continue
-            coins = resp.json()
-            print(f"OK {len(coins)}")
-        except Exception as e:
-            print(f"Monitor Error: {e}")
-            time.sleep(10)
-        time.sleep(20)
+def check_wallets():
+ if not MORALIS or not WALLETS: return []
+ alerts=[]
+ for w in WALLETS:
+  try:
+   url=f"https://deep-index.moralis.io/api/v2.2/{w}/history?chain=bsc&order=DESC&limit=5"
+   r=requests.get(url,headers={"X-API-Key":MORALIS},timeout=15).json()
+   for tx in r.get("result",[]):
+    h=tx.get("hash")
+    if h in seen_tx: continue
+    seen_tx.add(h)
+    val=int(tx.get("value","0"))/1e18
+    if val<0.05: continue
+    to_addr=tx.get("to_address","")[:10]
+    time_str=datetime.now().strftime("%m/%d %I:%M%p")
+    alerts.append(f"💰 <b>محفظة حوت</b> {w[:6]}...{w[-4:]}\n🏢 دخلت: {to_addr}... (BSC)\n💵 قيمة الدخول: {val:.3f} BNB (${val*600:.0f})\n📅 التاريخ: {time_str}\n🔗 Strike/Hash: {h[:12]}...\n")
+  except Exception as e: print(f"WALLET ERR {e}")
+  time.sleep(1)
+ return alerts
 
-def handle_commands():
-    off = 0
-    while True:
-        try:
-            u = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=20"
-            r = requests.get(u, timeout=25).json()
-            for up in r.get('result', []):
-                off = up['update_id'] + 1
-                txt = up.get('message', {}).get('text', '')
-                if '/start' in txt:
-                    send_tg('Hero V2 اشتغل! تم اصلاح JSON')
-                if '/status' in txt:
-                    send_tg('البوت شغال - 5 محافظ')
-        except:
-            time.sleep(5)
+def loop():
+ time.sleep(3)
+ send("✅ <b>Hero V4 جاهز - 19 شركة + 5 محافظ</b>\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ\nارسل /strikes")
+ off=0
+ last_wallet_check=0
+ while True:
+  try:
+   # فحص محافظ كل دقيقتين تلقائي
+   if time.time()-last_wallet_check>120:
+    wa=check_wallets()
+    for a in wa: send(a)
+    last_wallet_check=time.time()
 
-if __name__ == '__main__':
-    threading.Thread(target=unified_monitor, daemon=True).start()
-    threading.Thread(target=handle_commands, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+   r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
+   for u in r.get("result",[]):
+    off=u["update_id"]; txt=u.get("message",{}).get("text","").lower()
+    if "/strikes" in txt or "/start" in txt:
+     send(f"⏳ اجيب السترايكات والمحافظ... {datetime.now().strftime('%H:%M')}")
+     h,g,s,ga,p=get_options()
+     if h: send("🚀 <b>HERO ZERO:</b>\n\n"+"".join([x[1] for x in h]))
+     if g: send("👑 <b>GOLDEN:</b>\n\n"+"".join([x[1] for x in g]))
+     if s: send("🐋 <b>SWEEPS:</b>\n\n"+"".join([x[1] for x in s]))
+     if ga: send("💥 <b>GAMMA WALL:</b>\n\n"+"".join([x[1] for x in ga]))
+     if p: send("⏰ <b>POWER HOUR:</b>\n\n"+"".join([x[1] for x in p]))
+     # محافظ
+     wa=check_wallets()
+     if wa: send("💰 <b>محافظ الحيتان (اخر دخول):</b>\n\n"+"\n".join(wa[:5]))
+     else: send("💰 <b>المحافظ:</b> ما فيه دخول جديد اخر 5 دقايق - 5 محافظ تحت المراقبة")
+    elif "/wallets" in txt:
+     wa=check_wallets()
+     if wa: send("💰 <b>تقرير المحافظ:</b>\n\n"+"\n".join(wa))
+     else: send(f"💰 يراقب {len(WALLETS)} محافظ، لا يوجد حركة جديدة")
+  except Exception as e:
+   print(f"LOOP ERR {e}"); time.sleep(3)
+
+threading.Thread(target=loop,daemon=True).start()
+app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
