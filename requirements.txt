@@ -1,5 +1,7 @@
 Flask==2.3.3
+gunicorn
 yfinance
 pandas
 requests
 lxml
+html5lib
