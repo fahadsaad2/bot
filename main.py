@@ -6,7 +6,7 @@ from collections import deque
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "V14 FIXED"
+def home(): return "V15 FULL ARABIC"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -52,14 +52,14 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
             if time.time() - monster_memory[k][tk]["time"] > 3600: del monster_memory[k][tk]
 
     combos = [
-        (["GOLDEN","POWER"], "GOLDEN+POWER"),
-        (["GOLDEN","GAMMA"], "GOLDEN+GAMMA"),
-        (["HERO","SWEEPS"], "HERO+SWEEPS"),
-        (["HERO","GAMMA"], "HERO+GAMMA"),
-        (["GOLDEN","HERO"], "GOLDEN+HERO"),
-        (["WHALE","GOLDEN"], "WHALE+GOLDEN"),
-        (["WHALE","POWER"], "WHALE+POWER"),
-        (["WHALE","SWEEPS"], "WHALE+SWEEPS")
+        (["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة"),
+        (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار"),
+        (["HERO","SWEEPS"], "🚀🌊 HERO+SWEEPS"),
+        (["HERO","GAMMA"], "💣💥 HERO+GAMMA"),
+        (["GOLDEN","HERO"], "💎🚀 GOLDEN+HERO"),
+        (["WHALE","GOLDEN"], "🐋👑 حوت SPX + GOLDEN SPY/QQQ"),
+        (["WHALE","POWER"], "🐋⚡ حوت SPX + POWER"),
+        (["WHALE","SWEEPS"], "🐋🌊 حوت SPX + SWEEPS")
     ]
     for combo, desc in combos:
         if typ not in combo: continue
@@ -74,7 +74,7 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
                             base_key = f"DOUBLE_WHALE_{market}_{combo[1]}_{int(time.time()/3600)}"
                             if base_key in double_sent: continue
                             double_sent[base_key] = time.time()
-                            queue_send(f"WHALE MONSTER {market} - {desc} Strike {ref['strike']:.0f}{ref['type']} {ref['exp']}")
+                            queue_send(f"🚨🚨🚨 <b>وحش الحيتان V15</b> 🚨🚨🚨\n\n🎯 <b>{market} - {desc}</b>\n💰 حوت SPX اشترى قبل دقايق\n💥 سترايك: {ref['strike']:.0f}{ref['type']} | {ref['exp']}\n🔥 سيولة الحيتان داخلة - ادخل NOW")
             else:
                 if "WHALE" in monster_memory and monster_memory["WHALE"]:
                     for w_ticker in list(monster_memory["WHALE"].keys()):
@@ -83,7 +83,7 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
                             base_key = f"DOUBLE_WHALE_{ticker}_{typ}_{int(time.time()/3600)}"
                             if base_key in double_sent: continue
                             double_sent[base_key] = time.time()
-                            queue_send(f"WHALE MONSTER {ticker} - {desc} Strike {strike:.0f}{opt_type} {exp} ${price:.2f}")
+                            queue_send(f"🚨🚨🚨 <b>وحش الحيتان V15</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {desc}</b>\n💰 حوت SPX اشترى قبل دقايق\n💥 سترايك: {strike:.0f}{opt_type} | {exp}\n💵 ${price:.2f}\n🔥 ادخل NOW")
                             return
         if all(ticker in monster_memory[c] for c in combo if c!= "WHALE"):
             if "WHALE" in combo: continue
@@ -95,7 +95,7 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
                 if base_key in double_sent: continue
                 total = sum(monster_memory[c][ticker]["vol"] for c in combo if c in monster_memory and ticker in monster_memory[c])
                 double_sent[base_key] = time.time()
-                queue_send(f"DOUBLE MONSTER {ticker} - {desc} Strike {ref['strike']:.0f}{ref['type']} {ref['exp']} ${ref['price']:.2f}")
+                queue_send(f"🚨🚨🚨 <b>الوحش المزدوج V15</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {desc}</b>\n💥 سترايك: {ref['strike']:.0f}{ref['type']}\n📅 {ref['exp']}\n💵 ${ref['price']:.2f}\n💰 ${ref['premium']:,.0f}\n💰 مجمع ${total:,.0f}k\n🔥 ادخل NOW")
 
 def check_exit_early(dname, strike, exp, otype_s, curr_price, vol, oi):
     key = f"{dname}_{int(strike)}{otype_s}_{exp}"
@@ -106,8 +106,14 @@ def check_exit_early(dname, strike, exp, otype_s, curr_price, vol, oi):
         if oi_drop > 0.15 and vol > 800:
             if key in exit_sent and time.time() - exit_sent[key] < 10800: return
             exit_sent[key] = time.time()
-            msg = f"EXIT EARLY {dname} {strike:.0f}{otype_s} {exp} OI {prev_oi} -> {oi} drop {oi_drop*100:.0f}% Vol {vol} Price ${curr_price:.2f}"
-            queue_send(msg)
+            txt = "🚨🚨 <b>خروج مبكر - حوت قفل عقده</b> 🚨🚨\n\n"
+            txt += f"🎯 <b>{dname} {strike:.0f}{otype_s}</b>\n"
+            txt += f"📅 {exp}\n"
+            txt += f"📉 OI {prev_oi:,} -> {oi:,} نقص {oi_drop*100:.0f}%\n"
+            txt += f"📦 فوليوم اغلاق {vol:,}\n"
+            txt += f"💵 ${curr_price:.2f}\n"
+            txt += "⚠️ الحوت طلع قبل نزول السعر"
+            queue_send(txt)
 
 def scan_option(tk_symbol, exp, opt_type="calls"):
     try:
@@ -144,19 +150,19 @@ def sniper_loop():
                                     if prem>1000000 and vol>3000:
                                         key = f"GOLDEN{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
-                                            all_found.append((vol, f"GOLDEN {dname} {r['strike']:.0f}{otype_s} {exp} ${price:.2f} ${prem:,.0f}", dname, "GOLDEN", prem/1000, float(r['strike']), exp, price, otype_s, prem))
+                                            all_found.append((vol, f"👑 <b>GOLDEN</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 ${prem:,.0f}", dname, "GOLDEN", prem/1000, float(r['strike']), exp, price, otype_s, prem))
                                     if vol/ max(oi,1) >1.2 and vol>800:
                                         key = f"SWEEPS{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
-                                            all_found.append((vol, f"SWEEPS {dname} {r['strike']:.0f}{otype_s} {exp} ${price:.2f}", dname, "SWEEPS", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
+                                            all_found.append((vol, f"🐋 <b>SWEEPS</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 ${prem_vol:,.0f}", dname, "SWEEPS", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
                                     if ed==today and 0.90 <= price <= 2.5 and vol>1000:
                                         key = f"HERO{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
-                                            all_found.append((vol, f"HERO ZERO {dname} {r['strike']:.0f}{otype_s} {exp} 0DTE ${price:.2f}", dname, "HERO", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
+                                            all_found.append((vol, f"🚀 <b>HERO ZERO</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp} 0DTE\n💵 ${price:.2f}", dname, "HERO", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
                                     if (ed-today).days<=4 and 0.3 <= price <= 2.0 and vol>1000:
                                         key = f"POWER{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
-                                            all_found.append((vol, f"POWER {dname} {r['strike']:.0f}{otype_s} {exp} ${price:.2f}", dname, "POWER", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
+                                            all_found.append((vol, f"⏰ <b>POWER</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}", dname, "POWER", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
                         except: continue
                 except: continue
             all_found = sorted(all_found, key=lambda x: x[0], reverse=True)[:MAX_PER_RUN]
@@ -182,10 +188,10 @@ def check_wallets():
                 is_buy = tx['to'].lower()==w.lower()
                 tx_time = datetime.fromtimestamp(int(tx['timeStamp'])).strftime('%m/%d %I:%M%p')
                 if is_buy:
-                    msg = f"WHALE IN {w[:6]}...{w[-4:]} BUY {val:,.0f} SPX {tx_time}"
+                    msg = f"💰 <b>حوت {w[:6]}...{w[-4:]}</b>\n🟢 شراء {val:,.0f} SPX\n📅 {tx_time}"
                     check_double_monster(f"WHALE_{w[:6]}", "WHALE", val, 0, "", 0, "C", val*1000)
                 else:
-                    msg = f"WHALE EXIT {w[:6]}...{w[-4:]} SELL {val:,.0f} SPX Contract {SPX_CONTRACT[:6]} Date {tx_time} Tx {h[:10]}"
+                    msg = f"🚨 <b>خروج حوت {w[:6]}...{w[-4:]}</b>\n🔴 بيع {val:,.0f} SPX\n📜 العقد رقم {SPX_CONTRACT[:10]}...\n📅 التاريخ {tx_time}\n🔗 {h[:12]}...\n⚠️ خروج سيولة!"
                 alerts.append(msg)
         except: pass
         time.sleep(0.3)
@@ -194,7 +200,7 @@ def check_wallets():
 def main_loop():
     time.sleep(3)
     threading.Thread(target=send_worker, daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":"V14 LIVE FIXED"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":"✅ <b>V15 FULL LIVE - البوت الاصلي + خروج الحيتان</b>", "parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0; last_wallet=0
@@ -208,31 +214,35 @@ def main_loop():
                 off=u["update_id"]
                 txt=u.get("message",{}).get("text","").lower()
                 if "/start" in txt:
-                    t_count = len(TICKERS)
-                    w_count = len(WALLETS)
-                    q_count = len(message_queue)
                     now = datetime.now().strftime('%m/%d %I:%M%p')
-                    queue_send(f"V14 LIVE Bot Working {t_count} tickers {w_count} whales queue {q_count} time {now} /status /whales /top /clear")
+                    m1 = f"✅ <b>V15 FULL LIVE</b>\n\n"
+                    m1 += f"👀 {len(TICKERS)} شركة\n"
+                    m1 += f"💰 {len(WALLETS)} حوت\n"
+                    m1 += f"📬 طابور {len(message_queue)}\n"
+                    m1 += f"🐋👑 ربط الحيتان مفعل\n"
+                    m1 += f"🚨 خروج الحيتان + السويب مفعل\n"
+                    m1 += f"⏰ {now}\n\n"
+                    m1 += "/status /whales /top /clear"
+                    queue_send(m1)
                 if "/status" in txt:
-                    t_count = len(TICKERS)
-                    w_count = len(WALLETS)
-                    q_count = len(message_queue)
                     now = datetime.now().strftime('%m/%d %I:%M%p')
-                    queue_send(f"V14 LIVE Status {t_count} companies {w_count} whales queue {q_count} {now}")
+                    m2 = f"✅ V15 LIVE\n"
+                    m2 += f"👀 {len(TICKERS)} شركة\n"
+                    m2 += f"💰 {len(WALLETS)} حوت\n"
+                    m2 += f"📬 طابور {len(message_queue)}\n"
+                    m2 += f"🐋 خروج مفعل\n"
+                    m2 += f"⏰ {now}"
+                    queue_send(m2)
                 if "/clear" in txt:
-                    sent.clear(); double_sent.clear(); exit_sent.clear(); message_queue.clear()
-                    queue_send("Memory cleared")
+                    sent.clear(); double_sent.clear(); exit_sent.clear(); oi_memory.clear(); message_queue.clear()
+                    queue_send("✅ تم مسح الذاكرة والطابور")
                 if "/whales" in txt:
                     if WALLETS:
-                        w_list = "\n".join([f"{w[:6]}...{w[-4:]}" for w in WALLETS])
-                        queue_send(f"Whales {len(WALLETS)} \n{w_list}")
-                    else:
-                        queue_send("No wallets")
-                if "/top" in txt:
-                    queue_send(f"Queue {len(message_queue)} Double {len(double_sent)} Exit {len(exit_sent)}")
-        except Exception as e:
-            print(f"ERR {e}")
-            time.sleep(3)
+                        w_list = "\n".join([f"🐋 {w[:6]}...{w[-4:]}" for w in WALLETS])
+                        queue_send(f"💰 <b>الحيتان ({len(WALLETS)})</b>\n\n{w_list}")
+                    else: queue_send("❌ ما فيه محافظ")
+                if "/top" in txt: queue_send(f"📊 الطابور: {len(message_queue)} | المزدوج: {len(double_sent)} | الخروج: {len(exit_sent)}")
+        except Exception as e: print(f"ERR {e}"); time.sleep(3)
 
 threading.Thread(target=main_loop,daemon=True).start()
 app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
