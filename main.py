@@ -11,16 +11,41 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 WALLETS = [w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.strip()]
 MORALIS = os.getenv("MORALIS_API","").strip()
+ETHERSCAN_API = os.getenv("ETHERSCAN_API","").strip()
 
 TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","AVGO","PLTR","MSTR","COIN"]
 NAMES = {"^GSPC":"SPX"}
 sent = set()
 seen_tx = set()
 
+# === الجديد: ذاكرة الوحش المزدوج ===
+monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}}
+
 def send(t):
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
     except: pass
+
+# === الجديد: فحص الوحش المزدوج ===
+def check_double_monster(ticker, typ, vol_k):
+    monster_memory[typ][ticker] = {"time": time.time(), "vol": vol_k}
+    for k in monster_memory:
+        for tk in list(monster_memory[k].keys()):
+            if time.time() - monster_memory[k][tk]["time"] > 3600:
+                del monster_memory[k][tk]
+    combos = [
+        (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار جاما"),
+        (["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة بور هور"),
+        (["HERO","SWEEPS"], "🚀🌊 HERO+SWEEPS صندوق يخفي دخول"),
+        (["HERO","GAMMA"], "💣💥 HERO+GAMMA انفجار لحظي"),
+        (["GOLDEN","HERO"], "💎🚀 GOLDEN+HERO أقوى دخول"),
+    ]
+    for combo, desc in combos:
+        if all(ticker in monster_memory[c] for c in combo):
+            times = [monster_memory[c][ticker]["time"] for c in combo]
+            if max(times)-min(times) < 3600:
+                total = sum(monster_memory[c][ticker]["vol"] for c in combo)
+                send(f"🚨🚨🚨 <b>الوحش المزدوج V10</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {' + '.join(combo)}</b>\n📝 {desc}\n💰 سيولة: ${total:,.0f}k\n⏰ خلال ساعة\n🔥 ادخل NOW")
 
 def score(vol, oi, price, prem):
     s=0; r=vol/max(oi,1)
@@ -47,6 +72,7 @@ def get_all():
                     g=ch0.sort_values(by='openInterest',ascending=False).iloc[0]
                     prem=g['openInterest']*g['lastPrice']*100
                     gamma.append((g['openInterest'],f"💥 <b>{NAMES.get(sym,sym)} {g['strike']:.0f}C ${g['lastPrice']:.2f}</b> OI:{int(g['openInterest']):,} ${prem:,.0f} {tk.options[0]} | {now_str}\n🎯 ${g['lastPrice']*1.3:.2f} / ${g['lastPrice']*1.6:.2f}\n"))
+                    check_double_monster(NAMES.get(sym,sym), "GAMMA", prem/1000)
             except: pass
             for exp in tk.options[:4]:
                 try:
@@ -58,23 +84,50 @@ def get_all():
                     chain['premium']=chain['openInterest']*chain['lastPrice']*100
                     if ed==today:
                         h=chain[(chain['lastPrice']>=0.90)&(chain['lastPrice']<=2.5)].sort_values(by='volume',ascending=False).head(1)
-                        for _,r in h.iterrows(): hero.append((r['volume'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,} {exp} {now_str}\n🎯 +35% ${r['lastPrice']*1.35:.2f} +80% ${r['lastPrice']*1.8:.2f}\n"))
+                        for _,r in h.iterrows():
+                            hero.append((r['volume'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,} {exp} {now_str}\n🎯 +35% ${r['lastPrice']*1.35:.2f} +80% ${r['lastPrice']*1.8:.2f}\n"))
+                            check_double_monster(NAMES.get(sym,sym), "HERO", float(r['premium'])/1000)
                     sw=chain[(chain['volume']>800)&(chain['volume']/chain['openInterest'].replace(0,1)>1.2)].sort_values(by='volume',ascending=False).head(1)
                     for _,r in sw.iterrows():
                         prem=float(r['premium']); sc=score(int(r['volume']),int(r['openInterest']),float(r['lastPrice']),prem)
                         msg=f"<b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} x{float(r['volume']/max(r['openInterest'],1)):.1f} Vol:{int(r['volume']):,} ${prem:,.0f} Score:{sc} {now_str}\n🎯 ${r['lastPrice']*1.3:.2f} / ${r['lastPrice']*1.6:.2f}\n"
-                        if prem>1000000 and r['volume']>3000: golden.append((prem,f"👑 {msg}"))
-                        else: sweeps.append((r['volume'],f"🐋 {msg}"))
+                        if prem>1000000 and r['volume']>3000:
+                            golden.append((prem,f"👑 {msg}"))
+                            check_double_monster(NAMES.get(sym,sym), "GOLDEN", prem/1000)
+                        else:
+                            sweeps.append((r['volume'],f"🐋 {msg}"))
+                            check_double_monster(NAMES.get(sym,sym), "SWEEPS", prem/1000)
                     if (ed-today).days<=4:
                         ph=chain[(chain['lastPrice']>=0.3)&(chain['lastPrice']<=2.0)].sort_values(by='volume',ascending=False).head(1)
-                        for _,r in ph.iterrows(): power.append((r['volume'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} {now_str}\n"))
+                        for _,r in ph.iterrows():
+                            power.append((r['volume'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} {now_str}\n"))
+                            check_double_monster(NAMES.get(sym,sym), "POWER", float(r['premium'])/1000)
                 except: continue
         except: continue
     return [sorted(x,key=lambda y:y[0],reverse=True)[:6] for x in [hero,golden,sweeps,gamma,power]]
 
 def check_wallets():
-    if not MORALIS or not WALLETS: return []
+    if not MORALIS and not ETHERSCAN_API: return []
+    if not WALLETS: return []
     alerts=[]
+    # اذا فيه Etherscan - استخدمه لـ SPX ETH
+    if ETHERSCAN_API:
+        SPX = "0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
+        for w in WALLETS:
+            try:
+                url=f"https://api.etherscan.io/api?module=account&action=tokentx&contractaddress={SPX}&address={w}&sort=desc&apikey={ETHERSCAN_API}"
+                r=requests.get(url,timeout=15).json()
+                if r.get("status")=="1" and r["result"]:
+                    tx=r["result"][0]
+                    h=tx["hash"]
+                    if h in seen_tx: continue
+                    seen_tx.add(h)
+                    val=float(tx.get("value",0))/10**18
+                    alerts.append(f"💰 <b>محفظة Murad SPX</b> {w[:6]}...{w[-4:]}\n{'🟢 شراء' if tx['to'].lower()==w.lower() else '🔴 بيع'} {val:,.0f} SPX\n🔗 {h[:10]}...\n")
+            except: pass
+            time.sleep(0.3)
+        if alerts: return alerts
+    # Moralis الأصلي حقك
     for w in WALLETS:
         try:
             url=f"https://deep-index.moralis.io/api/v2.2/{w}/history?chain=bsc&order=DESC&limit=5"
@@ -111,6 +164,7 @@ def sniper_loop():
                                 if sc>=90 and prem>=800000:
                                     sent.add(key); d=NAMES.get(sym,sym)
                                     send(f"🚨 <b>حوت لحظي SCORE {sc}/100</b>\n\n👑 <b>{d} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b>\n📅 {exp}\n💰 ${prem:,.0f} Vol:{int(r['volume']):,}\n\n🎯 دخول ${r['lastPrice']:.2f} هدف ${r['lastPrice']*1.8:.2f}")
+                                    if prem>1000000: check_double_monster(d, "GOLDEN", prem/1000)
                         except: continue
                 except: continue
             time.sleep(60)
@@ -118,7 +172,7 @@ def sniper_loop():
 
 def main_loop():
     time.sleep(3)
-    send("✅ <b>البوت الوحش النهائي شغال V10 - كل شي في بوت واحد</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ (شركة+سترايك+تاريخ+قيمة)\n🚨 تنبيه حيتان لحظي\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
+    send("✅ <b>البوت الوحش النهائي شغال V10 - كل شي في بوت واحد</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ (شركة+سترايك+تاريخ+قيمة)\n🚨 تنبيه حيتان لحظي\n🚨🚨 تنبيه مزدوج DOUBLE MONSTER\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0; last_wallet=0
     while True:
