@@ -5,7 +5,7 @@ import yfinance as yf
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "SPX FINAL - ALL IN ONE V10 LIVE"
+def home(): return "SPX FINAL - ALL IN ONE V10 LIVE - 19 HALAL"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -13,12 +13,12 @@ WALLETS = [w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.
 MORALIS = os.getenv("MORALIS_API","").strip()
 ETHERSCAN_API = os.getenv("ETHERSCAN_API","").strip()
 
-TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","AVGO","PLTR","MSTR","COIN"]
+# 19 شركة حلال - شلنا NFLX وضفنا MU SMCI ARM QCOM
+TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","PLTR","MSTR","COIN","MU","SMCI","ARM","QCOM"]
 NAMES = {"^GSPC":"SPX"}
 sent = set()
 seen_tx = set()
 
-# === الجديد: ذاكرة الوحش المزدوج ===
 monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}}
 
 def send(t):
@@ -26,7 +26,6 @@ def send(t):
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
     except: pass
 
-# === الجديد: فحص الوحش المزدوج ===
 def check_double_monster(ticker, typ, vol_k):
     monster_memory[typ][ticker] = {"time": time.time(), "vol": vol_k}
     for k in monster_memory:
@@ -110,7 +109,6 @@ def check_wallets():
     if not MORALIS and not ETHERSCAN_API: return []
     if not WALLETS: return []
     alerts=[]
-    # اذا فيه Etherscan - استخدمه لـ SPX ETH
     if ETHERSCAN_API:
         SPX = "0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
         for w in WALLETS:
@@ -127,7 +125,6 @@ def check_wallets():
             except: pass
             time.sleep(0.3)
         if alerts: return alerts
-    # Moralis الأصلي حقك
     for w in WALLETS:
         try:
             url=f"https://deep-index.moralis.io/api/v2.2/{w}/history?chain=bsc&order=DESC&limit=5"
@@ -172,7 +169,7 @@ def sniper_loop():
 
 def main_loop():
     time.sleep(3)
-    send("✅ <b>البوت الوحش النهائي شغال V10 - كل شي في بوت واحد</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ (شركة+سترايك+تاريخ+قيمة)\n🚨 تنبيه حيتان لحظي\n🚨🚨 تنبيه مزدوج DOUBLE MONSTER\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
+    send("✅ <b>البوت الوحش النهائي شغال V10 - 19 شركة HALAL</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ\n🚨 لحظي\n🚨🚨 مزدوج\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0; last_wallet=0
     while True:
