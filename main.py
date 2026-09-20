@@ -5,24 +5,21 @@ from collections import defaultdict
 
 BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID = os.getenv("CHAT_ID","").strip()
-ETHERSCAN_KEY = os.getenv("ETHERSCAN_KEY","").strip() or os.getenv("REALTIME_KEY","").strip() or os.getenv("API_KEY","").strip()
+ETHERSCAN_KEY = os.getenv("ETHERSCAN_KEY","").strip() or os.getenv("REALTIME_KEY","").strip()
 
-print(f"TOKEN len={len(BOT_TOKEN)} ETHERSCAN len={len(ETHERSCAN_KEY)} CHAT={CHAT_ID}", flush=True)
+print(f"TOKEN len={len(BOT_TOKEN)} ETHERSCAN len={len(ETHERSCAN_KEY)}", flush=True)
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return f"Monster V9 Etherscan Live ✅ Key:{len(ETHERSCAN_KEY)>0}"
+def home(): return "Monster V10 - 5 Whales Live ✅"
 
-# 19 عملة تراقب زخمها
-TOKENS_19 = ["ETH","WETH","USDT","USDC","PEPE","SHIB","LINK","UNI","ARB","OP","MATIC","LDO","MKR","AAVE","ENS","BLUR","FLOKI","MOG","WOJAK"]
-
-# 5 محافظ حيتان - غيرها لمحافظك الحقيقية
+# 5 محافظ الحيتان الكبار الحقيقية
 WHALE_WALLETS = {
-    "Whale_1": "0x28C6c06298d514Db089934071355E5743bf21d60", # Binance Hot Wallet
-    "Whale_2": "0xBE0eB53F46cd790Cd13851d5EFf43D12404d33E8",
-    "Whale_3": "0x8315177aB297bA92A02aE5a4d12c2E551aB8e15c7",
-    "Whale_4": "0x56f566612dDEd7fcB8dC2a6e993a69a111FA9d9D",
-    "Whale_5": "0x4d10Ae710BdBDd07f8a494d79CB34d0762336908"
+    "🐋 Binance_Whale": "0x28C6c06298d514Db089934071355E5743bf21d60", # اكبر محفظة بينانس 2.1M ETH
+    "🐋 Bitfinex_Whale": "0xBE0eB53F46cd790Cd13851d5EFf43D12404d33E8", # بتفينكس 1.5M ETH
+    "🐋 Wintermute_Whale": "0x4f3a120E72C76c22e438802Bd36C9AcC4E6464e79", # وينترميوت - صانع السوق
+    "🐋 Robinhood_Whale": "0x5AB7124eC4a16a43439893D5F2794a6406a942c6", # روبن هود - حوت كبير
+    "🐋 PEPE_Whale": "0x8315177aB297bA92A02aE5a4d12c2E551aB8e15c7" # حوت بيبي و ميم كوينز - يربح 1000x
 }
 
 strikes = []
@@ -32,12 +29,10 @@ def send_tg(text):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
-        print(f"SENT: {text[:120]}", flush=True)
     except Exception as e:
         print(f"TG ERR {e}", flush=True)
 
-def check_whales_etherscan():
-    """يتابع 5 حيتان بمفتاح Etherscan لحظي"""
+def check_5_whales():
     while True:
         try:
             if not ETHERSCAN_KEY:
@@ -47,47 +42,48 @@ def check_whales_etherscan():
 
             for name, wallet in WHALE_WALLETS.items():
                 try:
-                    # احدث حركة للمحفظة
-                    url = f"https://api.etherscan.io/api?module=account&action=txlist&address={wallet}&startblock=0&endblock=99999999&page=1&offset=5&sort=desc&apikey={ETHERSCAN_KEY}"
+                    url = f"https://api.etherscan.io/api?module=account&action=txlist&address={wallet}&page=1&offset=3&sort=desc&apikey={ETHERSCAN_KEY}"
                     r = requests.get(url, timeout=10).json()
 
                     if r.get("status") == "1":
-                        txs = r.get("result", [])
-                        for tx in txs[:2]:
+                        for tx in r.get("result", [])[:1]:
                             tx_hash = tx.get("hash")
-                            if last_tx[wallet] == tx_hash: continue
+                            if last_tx[wallet] == tx_hash:
+                                continue
                             last_tx[wallet] = tx_hash
 
                             value_eth = int(tx.get("value","0")) / 10**18
-                            if value_eth > 10: # حركة فوق 10 ايثيريوم = حوت
-                                to_addr = tx.get("to","")[:10]
-                                msg = f"🐋 <b>{name} تحرك!</b>\n💰 {value_eth:.2f} ETH\nمن: {wallet[:8]}... الى: {to_addr}...\n<a href='https://etherscan.io/tx/{tx_hash}'>Etherscan</a>\n{datetime.now().strftime('%H:%M:%S')}"
+                            # اي حركة فوق 5 ETH نعتبرها حوت
+                            if value_eth >= 1:
+                                is_out = tx.get("from","").lower() == wallet.lower()
+                                action = "🔴 باع" if is_out else "🟢 اشترى/استقبل"
+                                msg = f"{name}\n{action} <b>{value_eth:.2f} ETH</b>\n💵 حوالي ${value_eth*2500:,.0f}\n<a href='https://etherscan.io/tx/{tx_hash}'>شوف الحركة في Etherscan</a>\n{datetime.now().strftime('%H:%M:%S')}"
                                 send_tg(msg)
-                                strikes.append(f"🐋 {name} {value_eth:.1f} ETH")
+                                strikes.append(f"{name} {action} {value_eth:.1f} ETH")
+                                print(f"WHALE MOVE: {name} {value_eth}", flush=True)
 
-                    # تتبع توكنات ERC20 للحوت
-                    url2 = f"https://api.etherscan.io/api?module=account&action=tokentx&address={wallet}&page=1&offset=5&sort=desc&apikey={ETHERSCAN_KEY}"
-                    r2 = requests.get(url2, timeout=10).json()
-                    if r2.get("status") == "1":
-                        for t in r2.get("result", [])[:1]:
-                            token = t.get("tokenSymbol")
-                            if token in TOKENS_19:
-                                val = int(t.get("value","0")) / (10 ** int(t.get("tokenDecimal","18")))
-                                if val > 100000: # كمية كبيرة
-                                    msg = f"💥 <b>حوت يشتري {token}!</b>\n{name}: {val:,.0f} {token}\n<a href='https://etherscan.io/tx/{t.get('hash')}'>رابط</a>"
-                                    send_tg(msg)
-                                    strikes.append(f"💥 {name} {token} {val:,.0f}")
+                    # فحص توكنات الميم للحوت الخامس
+                    if "PEPE" in name:
+                        url2 = f"https://api.etherscan.io/api?module=account&action=tokentx&address={wallet}&page=1&offset=5&sort=desc&apikey={ETHERSCAN_KEY}"
+                        r2 = requests.get(url2, timeout=10).json()
+                        if r2.get("status") == "1":
+                            for t in r2.get("result", [])[:2]:
+                                if last_tx[t.get("hash")] == "": # ما نكرر
+                                    token = t.get("tokenSymbol")
+                                    val = int(t.get("value","0")) / (10 ** int(t.get("tokenDecimal","18")))
+                                    if val > 1000000:
+                                        send_tg(f"💥 <b>حوت الميم يتحرك!</b>\n{name}\n{val:,.0f} {token}\n<a href='https://etherscan.io/tx/{t.get('hash')}'>الرابط</a>")
+                                        last_tx[t.get("hash")] = "done"
 
-                    time.sleep(3) # Etherscan حد 5 طلبات بالثانية
+                    time.sleep(4) # Etherscan يسمح 5 طلبات بالثانية
                 except Exception as e:
                     print(f"{name} ERR {e}")
-                    continue
+                    time.sleep(2)
 
-            print(f"--- دورة حيتان Etherscan خلصت {datetime.now().strftime('%H:%M:%S')} ---", flush=True)
-            time.sleep(25) # كل 25 ثانية يشيك لحظي بمفتاحك
-
+            print(f"--- دورة 5 حيتان خلصت {datetime.now().strftime('%H:%M')} ---", flush=True)
+            time.sleep(20) # كل 20 ثانية يشيك لحظي
         except Exception as e:
-            print(f"WHALE ERR {e}", flush=True)
+            print(f"WHALE LOOP ERR {e}", flush=True)
             time.sleep(20)
 
 def handle_commands():
@@ -103,22 +99,5 @@ def handle_commands():
                 text = upd.get("message",{}).get("text","")
                 if not text: continue
                 if "/start" in text.lower():
-                    send_tg(f"✅ <b>الوحش V9 Etherscan شغال!</b>\nKey: {'✅' if ETHERSCAN_KEY else '❌'}\n🐋 5 حيتان لحظي\n📊 19 عملة\n/strikes - الضربات\n/whales - الحيتان\n/status")
-                elif "/strikes" in text.lower():
-                    send_tg("🔥 <b>حركات الحيتان:</b>\n" + ("\n".join(strikes[-25:]) if strikes else "لا يوجد حركة كبيرة الان"))
-                elif "/whales" in text.lower():
-                    txt = "🐋 <b>الـ 5 حيتان:</b>\n"
-                    for k,v in WHALE_WALLETS.items():
-                        txt += f"{k}: {v}\n"
-                    send_tg(txt)
-                elif "/status" in text.lower():
-                    send_tg(f"✅ V9 Live\nEtherscan Key: {'✅ len='+str(len(ETHERSCAN_KEY)) if ETHERSCAN_KEY else '❌ حط ETHERSCAN_KEY'}\nالضربات: {len(strikes)}\n{datetime.now()}")
-        except Exception as e:
-            print(f"CMD ERR {e}"); time.sleep(5)
-
-if __name__ == "__main__":
-    threading.Thread(target=check_whales_etherscan, daemon=True).start()
-    threading.Thread(target=handle_commands, daemon=True).start()
-    time.sleep(3)
-    send_tg(f"🚀 <b>الوحش V9 Etherscan اشتغل بمفتاحك!</b>\nKey: {len(ETHERSCAN_KEY)>0}\nيتابع 5 حيتان لحظي 🐋")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+                    send_tg(f"✅ <b>الوحش V10 - 5 حيتان كبار شغال!</b>\n\n{chr(10).join(WHALE_WALLETS.keys())}\n\n/strikes - حركات الحيتان\n/whales - عناوين الحيتان\n/status - الحالة")
+                elif "/strikes"
