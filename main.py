@@ -1,101 +1,153 @@
-import os, time, threading, requests
 from flask import Flask
+import os, requests, threading, time
 from datetime import datetime
-from collections import defaultdict
-
-BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
-CHAT_ID = os.getenv("CHAT_ID","").strip()
-ETHERSCAN_KEY = os.getenv("ETHERSCAN_KEY","").strip() or os.getenv("REALTIME_KEY","").strip()
-
-print(f"TOKEN len={len(BOT_TOKEN)} ETHERSCAN len={len(ETHERSCAN_KEY)}", flush=True)
+import yfinance as yf
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Monster V10 - 5 Whales Live ✅"
+def home(): return "SPX FINAL - ALL IN ONE V10 LIVE"
 
-WHALE_WALLETS = {
-    "Binance_Whale": "0x28C6c06298d514Db089934071355E5743bf21d60",
-    "Bitfinex_Whale": "0xBE0eB53F46cd790Cd13851d5EFf43D12404d33E8",
-    "Wintermute_Whale": "0x4f3a120E72C76c22e438802Bd36C9AcC4E6464e79",
-    "Robinhood_Whale": "0x5AB7124eC4a16a43439893D5F2794a6406a942c6",
-    "PEPE_Whale": "0x8315177aB297bA92A02aE5a4d12c2E551aB8e15c7"
-}
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+WALLETS = [w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.strip()]
+MORALIS = os.getenv("MORALIS_API","").strip()
 
-strikes = []
-last_tx = defaultdict(str)
+TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","NFLX","AMD","AVGO","PLTR","MSTR","COIN"]
+NAMES = {"^GSPC":"SPX"}
+sent = set()
+seen_tx = set()
 
-def send_tg(text):
+def send(t):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
-    except Exception as e:
-        print(f"TG ERR {e}", flush=True)
-
-def check_5_whales():
-    while True:
-        try:
-            if not ETHERSCAN_KEY:
-                time.sleep(60)
-                continue
-            for name, wallet in WHALE_WALLETS.items():
-                try:
-                    url = f"https://api.etherscan.io/api?module=account&action=txlist&address={wallet}&page=1&offset=3&sort=desc&apikey={ETHERSCAN_KEY}"
-                    r = requests.get(url, timeout=10).json()
-                    if r.get("status") == "1":
-                        for tx in r.get("result", [])[:1]:
-                            tx_hash = tx.get("hash")
-                            if last_tx[wallet] == tx_hash:
-                                continue
-                            last_tx[wallet] = tx_hash
-                            value_eth = int(tx.get("value","0")) / 10**18
-                            if value_eth >= 1:
-                                is_out = tx.get("from","").lower() == wallet.lower()
-                                action = "باع" if is_out else "اشترى"
-                                msg = f"{name} {action} {value_eth:.2f} ETH\nhttps://etherscan.io/tx/{tx_hash}\n{datetime.now().strftime('%H:%M:%S')}"
-                                send_tg(msg)
-                                strikes.append(f"{name} {action} {value_eth:.1f}")
-                    time.sleep(4)
-                except Exception as e:
-                    print(f"{name} ERR {e}")
-                    time.sleep(2)
-            time.sleep(20)
-        except Exception as e:
-            print(f"LOOP ERR {e}")
-            time.sleep(20)
-
-def handle_commands():
-    offset = 0
-    try: requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset+9999}", timeout=5)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
     except: pass
+
+def score(vol, oi, price, prem):
+    s=0; r=vol/max(oi,1)
+    if r>3: s+=40
+    elif r>1.5: s+=30
+    if prem>1500000: s+=30
+    elif prem>500000: s+=20
+    if 0.90 <= price <= 2.5: s+=20
+    if vol>5000: s+=10
+    return min(s,99)
+
+def get_all():
+    hero=[]; sweeps=[]; golden=[]; gamma=[]; power=[]
+    today=datetime.now().date()
+    now_str=datetime.now().strftime("%m/%d %I:%M%p")
+    for sym in TICKERS:
+        try:
+            ysym="^SPX" if sym=="^GSPC" else sym
+            tk=yf.Ticker(ysym)
+            if not tk.options: continue
+            try:
+                ch0=tk.option_chain(tk.options[0]).calls
+                if not ch0.empty:
+                    g=ch0.sort_values(by='openInterest',ascending=False).iloc[0]
+                    prem=g['openInterest']*g['lastPrice']*100
+                    gamma.append((g['openInterest'],f"💥 <b>{NAMES.get(sym,sym)} {g['strike']:.0f}C ${g['lastPrice']:.2f}</b> OI:{int(g['openInterest']):,} ${prem:,.0f} {tk.options[0]} | {now_str}\n🎯 ${g['lastPrice']*1.3:.2f} / ${g['lastPrice']*1.6:.2f}\n"))
+            except: pass
+            for exp in tk.options[:4]:
+                try:
+                    ed=datetime.strptime(exp,"%Y-%m-%d").date()
+                    chain=tk.option_chain(exp).calls
+                    chain=chain[(chain['openInterest']>150) & (chain['lastPrice']>=0.30)]
+                    if chain.empty: continue
+                    chain=chain.copy()
+                    chain['premium']=chain['openInterest']*chain['lastPrice']*100
+                    if ed==today:
+                        h=chain[(chain['lastPrice']>=0.90)&(chain['lastPrice']<=2.5)].sort_values(by='volume',ascending=False).head(1)
+                        for _,r in h.iterrows(): hero.append((r['volume'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,} {exp} {now_str}\n🎯 +35% ${r['lastPrice']*1.35:.2f} +80% ${r['lastPrice']*1.8:.2f}\n"))
+                    sw=chain[(chain['volume']>800)&(chain['volume']/chain['openInterest'].replace(0,1)>1.2)].sort_values(by='volume',ascending=False).head(1)
+                    for _,r in sw.iterrows():
+                        prem=float(r['premium']); sc=score(int(r['volume']),int(r['openInterest']),float(r['lastPrice']),prem)
+                        msg=f"<b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} x{float(r['volume']/max(r['openInterest'],1)):.1f} Vol:{int(r['volume']):,} ${prem:,.0f} Score:{sc} {now_str}\n🎯 ${r['lastPrice']*1.3:.2f} / ${r['lastPrice']*1.6:.2f}\n"
+                        if prem>1000000 and r['volume']>3000: golden.append((prem,f"👑 {msg}"))
+                        else: sweeps.append((r['volume'],f"🐋 {msg}"))
+                    if (ed-today).days<=4:
+                        ph=chain[(chain['lastPrice']>=0.3)&(chain['lastPrice']<=2.0)].sort_values(by='volume',ascending=False).head(1)
+                        for _,r in ph.iterrows(): power.append((r['volume'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} {now_str}\n"))
+                except: continue
+        except: continue
+    return [sorted(x,key=lambda y:y[0],reverse=True)[:6] for x in [hero,golden,sweeps,gamma,power]]
+
+def check_wallets():
+    if not MORALIS or not WALLETS: return []
+    alerts=[]
+    for w in WALLETS:
+        try:
+            url=f"https://deep-index.moralis.io/api/v2.2/{w}/history?chain=bsc&order=DESC&limit=5"
+            r=requests.get(url,headers={"X-API-Key":MORALIS},timeout=15).json()
+            for tx in r.get("result",[]):
+                h=tx.get("hash")
+                if h in seen_tx: continue
+                seen_tx.add(h)
+                val=int(tx.get("value","0"))/1e18
+                if val<0.05: continue
+                to_addr=tx.get("to_address","")[:10]
+                alerts.append(f"💰 <b>محفظة حوت</b> {w[:6]}...{w[-4:]}\n🏢 دخلت: {to_addr}... (BSC)\n💵 قيمة الدخول: {val:.3f} BNB (${val*600:.0f})\n📅 التاريخ: {datetime.now().strftime('%m/%d %I:%M%p')}\n🔗 Strike/Hash: {h[:12]}...\n")
+        except: pass
+        time.sleep(1)
+    return alerts
+
+def sniper_loop():
     while True:
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            res = requests.get(url, timeout=35).json()
-            for upd in res.get("result", []):
-                offset = upd["update_id"] + 1
-                text = upd.get("message",{}).get("text","")
-                if not text:
-                    continue
-                low = text.lower()
-                if "/start" in low:
-                    send_tg("✅ الوحش V10 - 5 حيتان شغال!\n/strikes - الحركات\n/whales - عناوين الحيتان\n/status - الحالة")
-                elif "/strikes" in low:
-                    msg = "\n".join(strikes[-20:]) if strikes else "لا يوجد حركة الان"
-                    send_tg(f"حركات الحيتان:\n{msg}")
-                elif "/whales" in low:
-                    txt = "5 حيتان:\n\n"
-                    for k,v in WHALE_WALLETS.items():
-                        txt += f"{k}\n{v}\n\n"
-                    send_tg(txt)
-                elif "/status" in low:
-                    send_tg(f"V10 Live\nحركات: {len(strikes)}\n{datetime.now().strftime('%H:%M:%S')}")
-        except Exception as e:
-            print(f"CMD ERR {e}")
-            time.sleep(5)
+            for sym in TICKERS:
+                try:
+                    ysym="^SPX" if sym=="^GSPC" else sym
+                    tk=yf.Ticker(ysym)
+                    if not tk.options: continue
+                    for exp in tk.options[:2]:
+                        try:
+                            chain=tk.option_chain(exp).calls
+                            chain=chain[(chain['volume']>1500)&(chain['lastPrice']>=0.90)]
+                            for _,r in chain.iterrows():
+                                key=f"{sym}{r['strike']}{exp}{int(r['volume']/100)*100}"
+                                if key in sent: continue
+                                prem=float(r['openInterest']*r['lastPrice']*100)
+                                sc=score(int(r['volume']),int(r['openInterest']),float(r['lastPrice']),prem)
+                                if sc>=90 and prem>=800000:
+                                    sent.add(key); d=NAMES.get(sym,sym)
+                                    send(f"🚨 <b>حوت لحظي SCORE {sc}/100</b>\n\n👑 <b>{d} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b>\n📅 {exp}\n💰 ${prem:,.0f} Vol:{int(r['volume']):,}\n\n🎯 دخول ${r['lastPrice']:.2f} هدف ${r['lastPrice']*1.8:.2f}")
+                        except: continue
+                except: continue
+            time.sleep(60)
+        except: time.sleep(30)
 
-if __name__ == "__main__":
-    threading.Thread(target=check_5_whales, daemon=True).start()
-    threading.Thread(target=handle_commands, daemon=True).start()
-    time.sleep(2)
-    send_tg("🚀 الوحش V10 اشتغل! 5 حيتان كبار ✅")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+def main_loop():
+    time.sleep(3)
+    send("✅ <b>البوت الوحش النهائي شغال V10 - كل شي في بوت واحد</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ (شركة+سترايك+تاريخ+قيمة)\n🚨 تنبيه حيتان لحظي\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
+    threading.Thread(target=sniper_loop,daemon=True).start()
+    off=0; last_wallet=0
+    while True:
+        try:
+            if time.time()-last_wallet>120:
+                wa=check_wallets()
+                for a in wa: send(a)
+                last_wallet=time.time()
+            r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
+            for u in r.get("result",[]):
+                off=u["update_id"]; txt=u.get("message",{}).get("text","").lower()
+                if "/strikes" in txt or "/start" in txt:
+                    send(f"⏳ اجيب لك كل الطلبات... {datetime.now().strftime('%H:%M')}")
+                    h,g,s,ga,p=get_all()
+                    if h: send("🚀 <b>HERO ZERO:</b>\n\n"+"".join([x[1] for x in h]))
+                    if g: send("👑 <b>GOLDEN:</b>\n\n"+"".join([x[1] for x in g]))
+                    if s: send("🐋 <b>SWEEPS:</b>\n\n"+"".join([x[1] for x in s]))
+                    if ga: send("💥 <b>GAMMA WALL:</b>\n\n"+"".join([x[1] for x in ga[:5]]))
+                    if p: send("⏰ <b>POWER HOUR:</b>\n\n"+"".join([x[1] for x in p[:5]]))
+                    wa=check_wallets()
+                    if wa: send("💰 <b>محافظ الحيتان (اخر دخول):</b>\n\n"+"\n".join(wa[:5]))
+                    else: send(f"💰 <b>المحافظ:</b> يراقب {len(WALLETS)} محافظ - لا يوجد دخول جديد")
+                elif "/wallets" in txt:
+                    wa=check_wallets()
+                    send("💰 <b>تقرير المحافظ:</b>\n\n"+"\n".join(wa) if wa else f"💰 يراقب {len(WALLETS)} محافظ")
+                elif "/status" in txt:
+                    send(f"✅ شغال V10\n👀 يراقب {len(TICKERS)} شركة\n💰 يراقب {len(WALLETS)} محفظة\n⏰ {datetime.now().strftime('%m/%d %I:%M%p')}")
+        except Exception as e:
+            print(f"LOOP ERR {e}"); time.sleep(3)
+
+threading.Thread(target=main_loop,daemon=True).start()
+app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
