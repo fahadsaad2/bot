@@ -6,7 +6,7 @@ from collections import deque
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "V10 ALL - 20 HALAL + 8 WHALES + DOUBLE - FIXED"
+def home(): return "V11 WHALE+SPY LINK"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -17,11 +17,10 @@ TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META"
 NAMES = {"^GSPC":"SPX"}
 sent = {}
 seen_tx = set()
-monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}}
+monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}, "WHALE": {}}
 double_sent = {}
 SPX_CONTRACT = "0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
 
-# --- جديد: طابور لحظي عشان ما ننحظر ---
 message_queue = deque()
 MAX_PER_RUN = 25
 DELAY = 1.5
@@ -30,17 +29,13 @@ def send_worker():
     while True:
         if message_queue:
             t = message_queue.popleft()
-            try:
-                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
+            try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
             except: pass
             time.sleep(DELAY)
-        else:
-            time.sleep(0.2)
+        else: time.sleep(0.2)
 
 def queue_send(t):
-    # ما يضيف اكثر من 25 في الطابور بنفس اللحظة
-    if len(message_queue) < MAX_PER_RUN:
-        message_queue.append(t)
+    if len(message_queue) < 100: message_queue.append(t)
 
 def is_new(key):
     if key not in sent or time.time() - sent[key] > 21600:
@@ -53,19 +48,55 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
     for k in list(monster_memory.keys()):
         for tk in list(monster_memory[k].keys()):
             if time.time() - monster_memory[k][tk]["time"] > 3600: del monster_memory[k][tk]
-    combos = [(["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة"),(["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار"),(["HERO","SWEEPS"], "🚀🌊 HERO+SWEEPS"),(["HERO","GAMMA"], "💣💥 HERO+GAMMA"),(["GOLDEN","HERO"], "💎🚀 GOLDEN+HERO")]
+
+    combos = [
+        (["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة"),
+        (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار"),
+        (["HERO","SWEEPS"], "🚀🌊 HERO+SWEEPS"),
+        (["HERO","GAMMA"], "💣💥 HERO+GAMMA"),
+        (["GOLDEN","HERO"], "💎🚀 GOLDEN+HERO"),
+        (["WHALE","GOLDEN"], "🐋👑 حوت SPX + GOLDEN SPY/QQQ"),
+        (["WHALE","POWER"], "🐋⚡ حوت SPX + POWER"),
+        (["WHALE","SWEEPS"], "🐋🌊 حوت SPX + SWEEPS")
+    ]
     for combo, desc in combos:
         if typ not in combo: continue
-        if all(ticker in monster_memory[c] for c in combo):
+        # ربط الحيتان مع SPY/QQQ/SPX فقط
+        if "WHALE" in combo:
+            if ticker not in ["SPY","QQQ","SPX","^GSPC"] and typ!= "WHALE": continue
+            # اذا النوع الحالي WHALE، شيك اذا فيه GOLDEN/POWER لـ SPY/QQQ
+            if typ == "WHALE":
+                for market in ["SPY","QQQ","SPX"]:
+                    if market in monster_memory[combo[1]]:
+                        times = [monster_memory["WHALE"][ticker]["time"], monster_memory[combo[1]][market]["time"]]
+                        if max(times)-min(times) < 3600:
+                            ref = monster_memory[combo[1]][market]
+                            base_key = f"DOUBLE_WHALE_{market}_{combo[1]}_{int(time.time()/3600)}"
+                            if base_key in double_sent: continue
+                            double_sent[base_key] = time.time()
+                            queue_send(f"🚨🚨🚨 <b>وحش الحيتان V11</b> 🚨🚨🚨\n\n🎯 <b>{market} - {desc}</b>\n💰 حوت SPX اشترى قبل دقايق\n💥 سترايك: {ref['strike']:.0f}{ref['type']} | {ref['exp']}\n🔥 سيولة الحيتان داخلة - ادخل NOW")
+            else:
+                # اذا النوع الحالي GOLDEN/POWER وجاء بعد حوت
+                if "WHALE" in monster_memory and monster_memory["WHALE"]:
+                    for w_ticker in list(monster_memory["WHALE"].keys()):
+                        times = [monster_memory["WHALE"][w_ticker]["time"], monster_memory[typ][ticker]["time"]]
+                        if max(times)-min(times) < 3600:
+                            base_key = f"DOUBLE_WHALE_{ticker}_{typ}_{int(time.time()/3600)}"
+                            if base_key in double_sent: continue
+                            double_sent[base_key] = time.time()
+                            queue_send(f"🚨🚨🚨 <b>وحش الحيتان V11</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {desc}</b>\n💰 حوت SPX اشترى قبل دقايق\n💥 سترايك: {strike:.0f}{opt_type} | {exp}\n💵 ${price:.2f}\n🔥 ادخل NOW")
+                            return
+        if all(ticker in monster_memory[c] for c in combo if c!= "WHALE"):
+            if "WHALE" in combo: continue
             times = [monster_memory[c][ticker]["time"] for c in combo]
             if max(times)-min(times) < 3600:
                 ref = monster_memory["GOLDEN"][ticker] if "GOLDEN" in combo else monster_memory[combo[0]][ticker]
                 prem_bucket = int(ref['premium'] / 50000) * 50000
                 base_key = f"DOUBLE_{ticker}_{'_'.join(combo)}_{int(ref['strike'])}{ref['type']}_{ref['exp']}_{prem_bucket}"
                 if base_key in double_sent: continue
-                total = sum(monster_memory[c][ticker]["vol"] for c in combo)
+                total = sum(monster_memory[c][ticker]["vol"] for c in combo if c in monster_memory and ticker in monster_memory[c])
                 double_sent[base_key] = time.time()
-                queue_send(f"🚨🚨🚨 <b>الوحش المزدوج V10</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {desc}</b>\n💥 سترايك: {ref['strike']:.0f}{ref['type']}\n📅 {ref['exp']}\n💵 ${ref['price']:.2f}\n💰 ${ref['premium']:,.0f}\n💰 مجمع ${total:,.0f}k\n🔥 ادخل NOW")
+                queue_send(f"🚨🚨🚨 <b>الوحش المزدوج V11</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {desc}</b>\n💥 سترايك: {ref['strike']:.0f}{ref['type']}\n📅 {ref['exp']}\n💵 ${ref['price']:.2f}\n💰 ${ref['premium']:,.0f}\n💰 مجمع ${total:,.0f}k\n🔥 ادخل NOW")
 
 def scan_option(tk_symbol, exp, opt_type="calls"):
     try:
@@ -116,14 +147,11 @@ def sniper_loop():
                                             all_found.append((vol, f"⏰ <b>POWER</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}", dname, "POWER", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
                         except: continue
                 except: continue
-
-            # رتب اقوى فوليوم اول وارسله لحظي
             all_found = sorted(all_found, key=lambda x: x[0], reverse=True)[:MAX_PER_RUN]
             for item in all_found:
                 vol, msg, dname, typ, vk, strike, exp, price, otype_s, prem = item
                 queue_send(msg)
                 check_double_monster(dname, typ, vk, strike, exp, price, otype_s, prem)
-
             time.sleep(60)
         except: time.sleep(20)
 
@@ -140,7 +168,11 @@ def check_wallets():
                 seen_tx.add(h)
                 val=float(tx.get("value",0))/10**18
                 side="🟢 شراء" if tx['to'].lower()==w.lower() else "🔴 بيع"
-                alerts.append(f"💰 <b>حوت {w[:6]}...{w[-4:]}</b>\n{side} {val:,.0f} SPX")
+                msg = f"💰 <b>حوت {w[:6]}...{w[-4:]}</b>\n{side} {val:,.0f} SPX"
+                alerts.append(msg)
+                if "شراء" in side:
+                    # سجل شراء الحوت كـ WHALE للربط مع SPY/QQQ
+                    check_double_monster(f"WHALE_{w[:6]}", "WHALE", val, 0, "", 0, "C", val*1000)
         except: pass
         time.sleep(0.3)
     return alerts
@@ -148,7 +180,7 @@ def check_wallets():
 def main_loop():
     time.sleep(3)
     threading.Thread(target=send_worker, daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":"✅ <b>V10 FIXED - لحظي + حماية حظر</b>", "parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":"✅ <b>V11 LIVE - ربط الحيتان مع SPY/QQQ</b>\n🐋+👑 = اشارة قوية", "parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0; last_wallet=0
@@ -161,8 +193,14 @@ def main_loop():
             for u in r.get("result",[]):
                 off=u["update_id"]
                 txt=u.get("message",{}).get("text","").lower()
-                if "/status" in txt: queue_send(f"✅ V10 FIXED LIVE\n👀 {len(TICKERS)} شركة\n💰 {len(WALLETS)} حوت\n📬 طابور: {len(message_queue)}\n⏰ {datetime.now().strftime('%m/%d %I:%M%p')}")
+                if "/status" in txt: queue_send(f"✅ V11 LIVE\n👀 {len(TICKERS)} شركة\n💰 {len(WALLETS)} حوت\n📬 طابور: {len(message_queue)}\n🐋👑 ربط الحيتان مفعل\n⏰ {datetime.now().strftime('%m/%d %I:%M%p')}")
                 if "/clear" in txt: sent.clear(); double_sent.clear(); message_queue.clear(); queue_send("✅ تم مسح الذاكرة والطابور")
+                if "/whales" in txt:
+                    if WALLETS:
+                        w_list = "\n".join([f"🐋 {w[:6]}...{w[-4:]}" for w in WALLETS])
+                        queue_send(f"💰 <b>الحيتان ({len(WALLETS)})</b>\n\n{w_list}")
+                    else: queue_send("❌ ما فيه محافظ")
+                if "/top" in txt: queue_send(f"📊 الطابور: {len(message_queue)} | المزدوج: {len(double_sent)}")
         except Exception as e: print(f"ERR {e}"); time.sleep(3)
 
 threading.Thread(target=main_loop,daemon=True).start()
