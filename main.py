@@ -5,46 +5,47 @@ import yfinance as yf
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "SPX FINAL - ALL IN ONE V10 LIVE - 19 HALAL"
+def home(): return "SPX V10 PRIVATE DOUBLE MONSTER - 20 HALAL"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 WALLETS = [w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.strip()]
 MORALIS = os.getenv("MORALIS_API","").strip()
 ETHERSCAN_API = os.getenv("ETHERSCAN_API","").strip()
+ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS","").split(",") if x.strip()]
 
-# 19 شركة حلال - شلنا NFLX وضفنا MU SMCI ARM QCOM
-TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","PLTR","MSTR","COIN","MU","SMCI","ARM","QCOM"]
+TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK"]
 NAMES = {"^GSPC":"SPX"}
 sent = set()
 seen_tx = set()
-
 monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}}
 
+def is_allowed(uid, cid):
+    if ALLOWED_IDS: return uid in ALLOWED_IDS
+    return str(cid) == str(CHAT_ID)
+
 def send(t):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":t, "parse_mode":"HTML"}, timeout=15)
     except: pass
 
-def check_double_monster(ticker, typ, vol_k):
-    monster_memory[typ][ticker] = {"time": time.time(), "vol": vol_k}
-    for k in monster_memory:
+def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, otype="C", prem=0):
+    monster_memory[typ][ticker] = {"time": time.time(), "vol": vol_k, "strike": strike, "exp": exp, "price": price, "type": otype, "premium": prem}
+    for k in list(monster_memory.keys()):
         for tk in list(monster_memory[k].keys()):
-            if time.time() - monster_memory[k][tk]["time"] > 3600:
-                del monster_memory[k][tk]
+            if time.time() - monster_memory[k][tk]["time"] > 3600: del monster_memory[k][tk]
     combos = [
-        (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار جاما"),
         (["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة بور هور"),
+        (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار جاما"),
         (["HERO","SWEEPS"], "🚀🌊 HERO+SWEEPS صندوق يخفي دخول"),
         (["HERO","GAMMA"], "💣💥 HERO+GAMMA انفجار لحظي"),
         (["GOLDEN","HERO"], "💎🚀 GOLDEN+HERO أقوى دخول"),
     ]
     for combo, desc in combos:
         if all(ticker in monster_memory[c] for c in combo):
-            times = [monster_memory[c][ticker]["time"] for c in combo]
-            if max(times)-min(times) < 3600:
+            if max([monster_memory[c][ticker]["time"] for c in combo]) - min([monster_memory[c][ticker]["time"] for c in combo]) < 3600:
                 total = sum(monster_memory[c][ticker]["vol"] for c in combo)
-                send(f"🚨🚨🚨 <b>الوحش المزدوج V10</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {' + '.join(combo)}</b>\n📝 {desc}\n💰 سيولة: ${total:,.0f}k\n⏰ خلال ساعة\n🔥 ادخل NOW")
+                last = monster_memory[combo[-1]][ticker]
+                send(f"🚨🚨🚨 <b>الوحش المزدوج V10</b> 🚨🚨🚨\n\n🎯 <b>{ticker} - {' + '.join(combo)}</b>\n📝 {desc}\n💥 <b>سترايك: {last['strike']:.0f}{last['type']}</b>\n📅 تاريخ: {last['exp']}\n💵 عقد: ${last['price']:.2f}\n💰 دخول: ${last['premium']:,.0f}\n💰 مجمع: ${total:,.0f}k\n🔥 NOW")
 
 def score(vol, oi, price, prem):
     s=0; r=vol/max(oi,1)
@@ -56,149 +57,80 @@ def score(vol, oi, price, prem):
     if vol>5000: s+=10
     return min(s,99)
 
-def get_all():
-    hero=[]; sweeps=[]; golden=[]; gamma=[]; power=[]
-    today=datetime.now().date()
-    now_str=datetime.now().strftime("%m/%d %I:%M%p")
-    for sym in TICKERS:
+def sniper_loop():
+    while True:
         try:
-            ysym="^SPX" if sym=="^GSPC" else sym
-            tk=yf.Ticker(ysym)
-            if not tk.options: continue
-            try:
-                ch0=tk.option_chain(tk.options[0]).calls
-                if not ch0.empty:
-                    g=ch0.sort_values(by='openInterest',ascending=False).iloc[0]
-                    prem=g['openInterest']*g['lastPrice']*100
-                    gamma.append((g['openInterest'],f"💥 <b>{NAMES.get(sym,sym)} {g['strike']:.0f}C ${g['lastPrice']:.2f}</b> OI:{int(g['openInterest']):,} ${prem:,.0f} {tk.options[0]} | {now_str}\n🎯 ${g['lastPrice']*1.3:.2f} / ${g['lastPrice']*1.6:.2f}\n"))
-                    check_double_monster(NAMES.get(sym,sym), "GAMMA", prem/1000)
-            except: pass
-            for exp in tk.options[:4]:
+            today=datetime.now().date()
+            for sym in TICKERS:
                 try:
-                    ed=datetime.strptime(exp,"%Y-%m-%d").date()
-                    chain=tk.option_chain(exp).calls
-                    chain=chain[(chain['openInterest']>150) & (chain['lastPrice']>=0.30)]
-                    if chain.empty: continue
-                    chain=chain.copy()
-                    chain['premium']=chain['openInterest']*chain['lastPrice']*100
-                    if ed==today:
-                        h=chain[(chain['lastPrice']>=0.90)&(chain['lastPrice']<=2.5)].sort_values(by='volume',ascending=False).head(1)
-                        for _,r in h.iterrows():
-                            hero.append((r['volume'],f"🚀 <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> 0DTE Vol:{int(r['volume']):,} {exp} {now_str}\n🎯 +35% ${r['lastPrice']*1.35:.2f} +80% ${r['lastPrice']*1.8:.2f}\n"))
-                            check_double_monster(NAMES.get(sym,sym), "HERO", float(r['premium'])/1000)
-                    sw=chain[(chain['volume']>800)&(chain['volume']/chain['openInterest'].replace(0,1)>1.2)].sort_values(by='volume',ascending=False).head(1)
-                    for _,r in sw.iterrows():
-                        prem=float(r['premium']); sc=score(int(r['volume']),int(r['openInterest']),float(r['lastPrice']),prem)
-                        msg=f"<b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} x{float(r['volume']/max(r['openInterest'],1)):.1f} Vol:{int(r['volume']):,} ${prem:,.0f} Score:{sc} {now_str}\n🎯 ${r['lastPrice']*1.3:.2f} / ${r['lastPrice']*1.6:.2f}\n"
-                        if prem>1000000 and r['volume']>3000:
-                            golden.append((prem,f"👑 {msg}"))
-                            check_double_monster(NAMES.get(sym,sym), "GOLDEN", prem/1000)
-                        else:
-                            sweeps.append((r['volume'],f"🐋 {msg}"))
-                            check_double_monster(NAMES.get(sym,sym), "SWEEPS", prem/1000)
-                    if (ed-today).days<=4:
-                        ph=chain[(chain['lastPrice']>=0.3)&(chain['lastPrice']<=2.0)].sort_values(by='volume',ascending=False).head(1)
-                        for _,r in ph.iterrows():
-                            power.append((r['volume'],f"⏰ <b>{NAMES.get(sym,sym)} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b> {exp} Vol:{int(r['volume']):,} {now_str}\n"))
-                            check_double_monster(NAMES.get(sym,sym), "POWER", float(r['premium'])/1000)
+                    tk=yf.Ticker("^SPX" if sym=="^GSPC" else sym)
+                    if not tk.options: continue
+                    d=NAMES.get(sym,sym)
+                    # GAMMA
+                    try:
+                        exp0=tk.options[0]
+                        for ot in ["calls","puts"]:
+                            ch=tk.option_chain(exp0).__getattribute__(ot)
+                            if ch.empty: continue
+                            g=ch.sort_values(by='openInterest',ascending=False).iloc[0]
+                            if int(g['openInterest'])>3000:
+                                ots="C" if ot=="calls" else "P"; prem=float(g['openInterest']*g['lastPrice']*100)
+                                key=f"GAMMA{sym}{g['strike']}{exp0}{ots}"
+                                if key not in sent:
+                                    sent.add(key)
+                                    send(f"💥 <b>GAMMA لحظي</b>\n<b>{d} {g['strike']:.0f}{ots}</b>\n📅 {exp0}\n💵 ${g['lastPrice']:.2f}\n💰 دخول: ${prem:,.0f}\n📊 OI:{int(g['openInterest']):,}")
+                                    check_double_monster(d, "GAMMA", prem/1000, float(g['strike']), exp0, float(g['lastPrice']), ots, prem)
+                    except: pass
+                    for exp in tk.options[:3]:
+                        try:
+                            ed=datetime.strptime(exp,"%Y-%m-%d").date()
+                            for ot in ["calls","puts"]:
+                                chain=tk.option_chain(exp).__getattribute__(ot)
+                                chain=chain[(chain['openInterest']>100) & (chain['lastPrice']>=0.30)]
+                                if chain.empty: continue
+                                ots="C" if ot=="calls" else "P"
+                                for _,r in chain.iterrows():
+                                    vol=int(r['volume']); oi=int(r['openInterest']); price=float(r['lastPrice'])
+                                    if vol<800: continue
+                                    prem=float(oi*price*100); prem_vol=float(vol*price*100); sc=score(vol,oi,price,prem)
+                                    if prem>1000000 and vol>3000:
+                                        key=f"GOLDEN{sym}{r['strike']}{exp}{ots}{int(vol/100)*100}"
+                                        if key not in sent:
+                                            sent.add(key)
+                                            send(f"👑 <b>GOLDEN لحظي {sc}</b>\n<b>{d} {r['strike']:.0f}{ots}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 دخول: ${prem:,.0f}\nVol:{vol:,} OI:{oi:,}\n🎯 ${price*1.8:.2f}")
+                                            check_double_monster(d, "GOLDEN", prem/1000, float(r['strike']), exp, price, ots, prem)
+                                    elif vol/max(oi,1)>1.2 and vol>800:
+                                        key=f"SWEEPS{sym}{r['strike']}{exp}{ots}{vol}"
+                                        if key not in sent:
+                                            sent.add(key)
+                                            send(f"🐋 <b>SWEEPS لحظي</b>\n<b>{d} {r['strike']:.0f}{ots}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 دخول: ${prem_vol:,.0f}\nVol:{vol:,} x{vol/max(oi,1):.1f}")
+                                            check_double_monster(d, "SWEEPS", prem_vol/1000, float(r['strike']), exp, price, ots, prem_vol)
+                                    if ed==today and 0.90<=price<=2.5 and vol>1000:
+                                        key=f"HERO{sym}{r['strike']}{exp}{ots}{vol}"
+                                        if key not in sent:
+                                            sent.add(key)
+                                            send(f"🚀 <b>HERO 0DTE لحظي</b>\n<b>{d} {r['strike']:.0f}{ots}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 دخول: ${prem_vol:,.0f}")
+                                            check_double_monster(d, "HERO", prem_vol/1000, float(r['strike']), exp, price, ots, prem_vol)
+                                    if (ed-today).days<=4 and 0.3<=price<=2.0 and vol>1000:
+                                        key=f"POWER{sym}{r['strike']}{exp}{ots}{vol}"
+                                        if key not in sent:
+                                            sent.add(key)
+                                            send(f"⏰ <b>POWER لحظي</b>\n<b>{d} {r['strike']:.0f}{ots}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 دخول: ${prem_vol:,.0f}")
+                                            check_double_monster(d, "POWER", prem_vol/1000, float(r['strike']), exp, price, ots, prem_vol)
+                        except: continue
                 except: continue
-        except: continue
-    return [sorted(x,key=lambda y:y[0],reverse=True)[:6] for x in [hero,golden,sweeps,gamma,power]]
+            time.sleep(45)
+        except: time.sleep(20)
 
 def check_wallets():
-    if not MORALIS and not ETHERSCAN_API: return []
-    if not WALLETS: return []
     alerts=[]
+    if not WALLETS: return alerts
     if ETHERSCAN_API:
-        SPX = "0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
-        for w in WALLETS:
+        SPX="0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
+        for w in WALLETS[:8]:
             try:
                 url=f"https://api.etherscan.io/api?module=account&action=tokentx&contractaddress={SPX}&address={w}&sort=desc&apikey={ETHERSCAN_API}"
                 r=requests.get(url,timeout=15).json()
                 if r.get("status")=="1" and r["result"]:
-                    tx=r["result"][0]
-                    h=tx["hash"]
-                    if h in seen_tx: continue
-                    seen_tx.add(h)
-                    val=float(tx.get("value",0))/10**18
-                    alerts.append(f"💰 <b>محفظة Murad SPX</b> {w[:6]}...{w[-4:]}\n{'🟢 شراء' if tx['to'].lower()==w.lower() else '🔴 بيع'} {val:,.0f} SPX\n🔗 {h[:10]}...\n")
-            except: pass
-            time.sleep(0.3)
-        if alerts: return alerts
-    for w in WALLETS:
-        try:
-            url=f"https://deep-index.moralis.io/api/v2.2/{w}/history?chain=bsc&order=DESC&limit=5"
-            r=requests.get(url,headers={"X-API-Key":MORALIS},timeout=15).json()
-            for tx in r.get("result",[]):
-                h=tx.get("hash")
-                if h in seen_tx: continue
-                seen_tx.add(h)
-                val=int(tx.get("value","0"))/1e18
-                if val<0.05: continue
-                to_addr=tx.get("to_address","")[:10]
-                alerts.append(f"💰 <b>محفظة حوت</b> {w[:6]}...{w[-4:]}\n🏢 دخلت: {to_addr}... (BSC)\n💵 قيمة الدخول: {val:.3f} BNB (${val*600:.0f})\n📅 التاريخ: {datetime.now().strftime('%m/%d %I:%M%p')}\n🔗 Strike/Hash: {h[:12]}...\n")
-        except: pass
-        time.sleep(1)
-    return alerts
-
-def sniper_loop():
-    while True:
-        try:
-            for sym in TICKERS:
-                try:
-                    ysym="^SPX" if sym=="^GSPC" else sym
-                    tk=yf.Ticker(ysym)
-                    if not tk.options: continue
-                    for exp in tk.options[:2]:
-                        try:
-                            chain=tk.option_chain(exp).calls
-                            chain=chain[(chain['volume']>1500)&(chain['lastPrice']>=0.90)]
-                            for _,r in chain.iterrows():
-                                key=f"{sym}{r['strike']}{exp}{int(r['volume']/100)*100}"
-                                if key in sent: continue
-                                prem=float(r['openInterest']*r['lastPrice']*100)
-                                sc=score(int(r['volume']),int(r['openInterest']),float(r['lastPrice']),prem)
-                                if sc>=90 and prem>=800000:
-                                    sent.add(key); d=NAMES.get(sym,sym)
-                                    send(f"🚨 <b>حوت لحظي SCORE {sc}/100</b>\n\n👑 <b>{d} {r['strike']:.0f}C ${r['lastPrice']:.2f}</b>\n📅 {exp}\n💰 ${prem:,.0f} Vol:{int(r['volume']):,}\n\n🎯 دخول ${r['lastPrice']:.2f} هدف ${r['lastPrice']*1.8:.2f}")
-                                    if prem>1000000: check_double_monster(d, "GOLDEN", prem/1000)
-                        except: continue
-                except: continue
-            time.sleep(60)
-        except: time.sleep(30)
-
-def main_loop():
-    time.sleep(3)
-    send("✅ <b>البوت الوحش النهائي شغال V10 - 19 شركة HALAL</b>\n\n🚀 HERO\n👑 GOLDEN\n🐋 SWEEPS\n💥 GAMMA\n⏰ POWER\n💰 محافظ\n🚨 لحظي\n🚨🚨 مزدوج\n\n/strikes - كل الطلبات\n/wallets - المحافظ\n/status - الحالة")
-    threading.Thread(target=sniper_loop,daemon=True).start()
-    off=0; last_wallet=0
-    while True:
-        try:
-            if time.time()-last_wallet>120:
-                wa=check_wallets()
-                for a in wa: send(a)
-                last_wallet=time.time()
-            r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
-            for u in r.get("result",[]):
-                off=u["update_id"]; txt=u.get("message",{}).get("text","").lower()
-                if "/strikes" in txt or "/start" in txt:
-                    send(f"⏳ اجيب لك كل الطلبات... {datetime.now().strftime('%H:%M')}")
-                    h,g,s,ga,p=get_all()
-                    if h: send("🚀 <b>HERO ZERO:</b>\n\n"+"".join([x[1] for x in h]))
-                    if g: send("👑 <b>GOLDEN:</b>\n\n"+"".join([x[1] for x in g]))
-                    if s: send("🐋 <b>SWEEPS:</b>\n\n"+"".join([x[1] for x in s]))
-                    if ga: send("💥 <b>GAMMA WALL:</b>\n\n"+"".join([x[1] for x in ga[:5]]))
-                    if p: send("⏰ <b>POWER HOUR:</b>\n\n"+"".join([x[1] for x in p[:5]]))
-                    wa=check_wallets()
-                    if wa: send("💰 <b>محافظ الحيتان (اخر دخول):</b>\n\n"+"\n".join(wa[:5]))
-                    else: send(f"💰 <b>المحافظ:</b> يراقب {len(WALLETS)} محافظ - لا يوجد دخول جديد")
-                elif "/wallets" in txt:
-                    wa=check_wallets()
-                    send("💰 <b>تقرير المحافظ:</b>\n\n"+"\n".join(wa) if wa else f"💰 يراقب {len(WALLETS)} محافظ")
-                elif "/status" in txt:
-                    send(f"✅ شغال V10\n👀 يراقب {len(TICKERS)} شركة\n💰 يراقب {len(WALLETS)} محفظة\n⏰ {datetime.now().strftime('%m/%d %I:%M%p')}")
-        except Exception as e:
-            print(f"LOOP ERR {e}"); time.sleep(3)
-
-threading.Thread(target=main_loop,daemon=True).start()
-app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
+                    tx=r["result"][0]; h=tx["hash"]
+                    if h in
