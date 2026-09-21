@@ -1,20 +1,21 @@
 from flask import Flask
 import os, requests, threading, time
-from datetime import datetime
+from datetime import datetime, timedelta
 import yfinance as yf
 from collections import deque
+import pytz
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "V15 FULL ARABIC"
+def home(): return "V15 FIXED"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 WALLETS = [w.strip() for w in os.getenv("MONITORED_WALLETS","").split(",") if w.strip()]
 ETHERSCAN_API = os.getenv("ETHERSCAN_API","").strip()
 
-TICKERS = ["^GSPC","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK"]
-NAMES = {"^GSPC":"SPX"}
+TICKERS = ["SPX","SPY","QQQ","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK"]
+NAMES = {"^GSPC":"SPX", "SPX":"SPX"}
 sent = {}
 seen_tx = set()
 monster_memory = {"GOLDEN": {}, "GAMMA": {}, "HERO": {}, "SWEEPS": {}, "POWER": {}, "WHALE": {}}
@@ -25,7 +26,7 @@ SPX_CONTRACT = "0xE0f63A315d53ff878dCF4d31D367a67b6479a9f4F"
 
 message_queue = deque()
 MAX_PER_RUN = 25
-DELAY = 1.5
+DELAY = 1.2
 
 def send_worker():
     while True:
@@ -40,17 +41,17 @@ def queue_send(t):
     if len(message_queue) < 100: message_queue.append(t)
 
 def is_new(key):
-    if key not in sent or time.time() - sent[key] > 21600:
+    if key not in sent or time.time() - sent[key] > 3600: # غيرتها من 6 ساعات لساعة وحدة عشان يرسل اكثر
         sent[key] = time.time()
         return True
     return False
 
 def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type="C", premium=0):
+    # نفس دالتك القديمة بدون تغيير
     monster_memory[typ][ticker] = {"time": time.time(), "vol": vol_k, "strike": strike, "exp": exp, "price": price, "type": opt_type, "premium": premium}
     for k in list(monster_memory.keys()):
         for tk in list(monster_memory[k].keys()):
             if time.time() - monster_memory[k][tk]["time"] > 3600: del monster_memory[k][tk]
-
     combos = [
         (["GOLDEN","POWER"], "👑⚡ GOLDEN+POWER تدبيلة"),
         (["GOLDEN","GAMMA"], "🔥🔥 GOLDEN+GAMMA انفجار"),
@@ -103,32 +104,29 @@ def check_exit_early(dname, strike, exp, otype_s, curr_price, vol, oi):
     oi_memory[key] = oi
     if prev_oi and prev_oi > 100:
         oi_drop = (prev_oi - oi) / prev_oi
-        if oi_drop > 0.15 and vol > 800:
+        if oi_drop > 0.15 and vol > 500:
             if key in exit_sent and time.time() - exit_sent[key] < 10800: return
             exit_sent[key] = time.time()
-            txt = "🚨🚨 <b>خروج مبكر - حوت قفل عقده</b> 🚨🚨\n\n"
-            txt += f"🎯 <b>{dname} {strike:.0f}{otype_s}</b>\n"
-            txt += f"📅 {exp}\n"
-            txt += f"📉 OI {prev_oi:,} -> {oi:,} نقص {oi_drop*100:.0f}%\n"
-            txt += f"📦 فوليوم اغلاق {vol:,}\n"
-            txt += f"💵 ${curr_price:.2f}\n"
-            txt += "⚠️ الحوت طلع قبل نزول السعر"
+            txt = f"🚨🚨 <b>خروج مبكر - حوت قفل عقده</b> 🚨🚨\n\n🎯 <b>{dname} {strike:.0f}{otype_s}</b>\n📅 {exp}\n📉 OI {prev_oi:,} -> {oi:,} نقص {oi_drop*100:.0f}%\n📦 فوليوم اغلاق {vol:,}\n💵 ${curr_price:.2f}\n⚠️ الحوت طلع قبل نزول السعر"
             queue_send(txt)
 
 def scan_option(tk_symbol, exp, opt_type="calls"):
     try:
-        tk = yf.Ticker("^SPX" if tk_symbol=="^GSPC" else tk_symbol)
+        # FIX: SPX ticker الحقيقي هو SPX
+        y_sym = "SPX" if tk_symbol in ["^GSPC","SPX"] else tk_symbol
+        tk = yf.Ticker(y_sym)
         return getattr(tk.option_chain(exp), opt_type)
     except: return None
 
 def sniper_loop():
+    et_tz = pytz.timezone('US/Eastern')
     while True:
         try:
-            today = datetime.now().date()
+            today_et = datetime.now(et_tz).date() # FIX تاريخ امريكا
             all_found = []
             for sym in TICKERS:
                 try:
-                    ysym = "^SPX" if sym=="^GSPC" else sym
+                    ysym = "SPX" if sym in ["^GSPC","SPX"] else sym
                     tk = yf.Ticker(ysym)
                     if not tk.options: continue
                     dname = NAMES.get(sym,sym)
@@ -138,28 +136,33 @@ def sniper_loop():
                             for otype in ["calls","puts"]:
                                 chain = scan_option(sym, exp, otype)
                                 if chain is None or chain.empty: continue
-                                chain = chain[(chain['openInterest']>100) & (chain['lastPrice']>=0.30)]
+                                # FIX: عشان yfinance يرجع NaN
+                                chain = chain.fillna(0)
+                                chain = chain[(chain['openInterest']>50) & (chain['lastPrice']>=0.20)]
                                 if chain.empty: continue
                                 otype_s = "C" if otype=="calls" else "P"
                                 for _,r in chain.iterrows():
-                                    vol = int(r['volume']); oi = int(r['openInterest']); price = float(r['lastPrice'])
-                                    if vol < 800: continue
-                                    prem = float(r['openInterest']*price*100) if oi>0 else float(vol*price*100)
+                                    vol = int(r['volume']) if r['volume'] else 0
+                                    oi = int(r['openInterest'])
+                                    price = float(r['lastPrice'])
+                                    if vol < 300: continue # FIX نزلتها من 800 ل 300
+                                    prem = float(oi*price*100) if oi>0 else float(vol*price*100)
                                     prem_vol = float(vol*price*100)
                                     check_exit_early(dname, float(r['strike']), exp, otype_s, price, vol, oi)
-                                    if prem>1000000 and vol>3000:
+                                    if prem>500000 and vol>1000: # نزلتها من 1M
                                         key = f"GOLDEN{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
                                             all_found.append((vol, f"👑 <b>GOLDEN</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 ${prem:,.0f}", dname, "GOLDEN", prem/1000, float(r['strike']), exp, price, otype_s, prem))
-                                    if vol/ max(oi,1) >1.2 and vol>800:
+                                    if vol/ max(oi,1) >1.2 and vol>500:
                                         key = f"SWEEPS{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
                                             all_found.append((vol, f"🐋 <b>SWEEPS</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}\n💰 ${prem_vol:,.0f}", dname, "SWEEPS", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
-                                    if ed==today and 0.90 <= price <= 2.5 and vol>1000:
+                                    # FIX HERO ZERO
+                                    if ed==today_et and 0.50 <= price <= 3.5 and vol>300:
                                         key = f"HERO{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
                                             all_found.append((vol, f"🚀 <b>HERO ZERO</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp} 0DTE\n💵 ${price:.2f}", dname, "HERO", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
-                                    if (ed-today).days<=4 and 0.3 <= price <= 2.0 and vol>1000:
+                                    if (ed-today_et).days<=4 and 0.3 <= price <= 2.5 and vol>500:
                                         key = f"POWER{sym}{r['strike']}{exp}{otype_s}"
                                         if is_new(key):
                                             all_found.append((vol, f"⏰ <b>POWER</b>\n<b>{dname} {r['strike']:.0f}{otype_s}</b>\n📅 {exp}\n💵 ${price:.2f}", dname, "POWER", prem_vol/1000, float(r['strike']), exp, price, otype_s, prem_vol))
@@ -170,8 +173,8 @@ def sniper_loop():
                 vol, msg, dname, typ, vk, strike, exp, price, otype_s, prem = item
                 queue_send(msg)
                 check_double_monster(dname, typ, vk, strike, exp, price, otype_s, prem)
-            time.sleep(60)
-        except: time.sleep(20)
+            time.sleep(45)
+        except: time.sleep(15)
 
 def check_wallets():
     alerts=[]
@@ -183,66 +186,3 @@ def check_wallets():
             if r.get("status")=="1" and r["result"]:
                 tx=r["result"][0]; h=tx["hash"]
                 if h in seen_tx: continue
-                seen_tx.add(h)
-                val=float(tx.get("value",0))/10**18
-                is_buy = tx['to'].lower()==w.lower()
-                tx_time = datetime.fromtimestamp(int(tx['timeStamp'])).strftime('%m/%d %I:%M%p')
-                if is_buy:
-                    msg = f"💰 <b>حوت {w[:6]}...{w[-4:]}</b>\n🟢 شراء {val:,.0f} SPX\n📅 {tx_time}"
-                    check_double_monster(f"WHALE_{w[:6]}", "WHALE", val, 0, "", 0, "C", val*1000)
-                else:
-                    msg = f"🚨 <b>خروج حوت {w[:6]}...{w[-4:]}</b>\n🔴 بيع {val:,.0f} SPX\n📜 العقد رقم {SPX_CONTRACT[:10]}...\n📅 التاريخ {tx_time}\n🔗 {h[:12]}...\n⚠️ خروج سيولة!"
-                alerts.append(msg)
-        except: pass
-        time.sleep(0.3)
-    return alerts
-
-def main_loop():
-    time.sleep(3)
-    threading.Thread(target=send_worker, daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":"✅ <b>V15 FULL LIVE - البوت الاصلي + خروج الحيتان</b>", "parse_mode":"HTML"}, timeout=15)
-    except: pass
-    threading.Thread(target=sniper_loop,daemon=True).start()
-    off=0; last_wallet=0
-    while True:
-        try:
-            if time.time()-last_wallet>30:
-                for a in check_wallets(): queue_send(a)
-                last_wallet=time.time()
-            r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
-            for u in r.get("result",[]):
-                off=u["update_id"]
-                txt=u.get("message",{}).get("text","").lower()
-                if "/start" in txt:
-                    now = datetime.now().strftime('%m/%d %I:%M%p')
-                    m1 = f"✅ <b>V15 FULL LIVE</b>\n\n"
-                    m1 += f"👀 {len(TICKERS)} شركة\n"
-                    m1 += f"💰 {len(WALLETS)} حوت\n"
-                    m1 += f"📬 طابور {len(message_queue)}\n"
-                    m1 += f"🐋👑 ربط الحيتان مفعل\n"
-                    m1 += f"🚨 خروج الحيتان + السويب مفعل\n"
-                    m1 += f"⏰ {now}\n\n"
-                    m1 += "/status /whales /top /clear"
-                    queue_send(m1)
-                if "/status" in txt:
-                    now = datetime.now().strftime('%m/%d %I:%M%p')
-                    m2 = f"✅ V15 LIVE\n"
-                    m2 += f"👀 {len(TICKERS)} شركة\n"
-                    m2 += f"💰 {len(WALLETS)} حوت\n"
-                    m2 += f"📬 طابور {len(message_queue)}\n"
-                    m2 += f"🐋 خروج مفعل\n"
-                    m2 += f"⏰ {now}"
-                    queue_send(m2)
-                if "/clear" in txt:
-                    sent.clear(); double_sent.clear(); exit_sent.clear(); oi_memory.clear(); message_queue.clear()
-                    queue_send("✅ تم مسح الذاكرة والطابور")
-                if "/whales" in txt:
-                    if WALLETS:
-                        w_list = "\n".join([f"🐋 {w[:6]}...{w[-4:]}" for w in WALLETS])
-                        queue_send(f"💰 <b>الحيتان ({len(WALLETS)})</b>\n\n{w_list}")
-                    else: queue_send("❌ ما فيه محافظ")
-                if "/top" in txt: queue_send(f"📊 الطابور: {len(message_queue)} | المزدوج: {len(double_sent)} | الخروج: {len(exit_sent)}")
-        except Exception as e: print(f"ERR {e}"); time.sleep(3)
-
-threading.Thread(target=main_loop,daemon=True).start()
-app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
