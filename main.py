@@ -6,14 +6,13 @@ from collections import deque
 import pytz
 app = Flask(__name__)
 @app.route('/')
-def home(): return "V20 LEGENDARY 20 COMPANIES"
+def home(): return "V20 LEGENDARY 20 COMPANIES + SPX"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# 20 شركة + مؤشرات
-TICKERS = ["SPY","QQQ","IWM","DIA","^GSPC","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","NFLX","PLTR","NFLX"]
-NAMES = {"^GSPC":"SPX"}
+TICKERS = ["SPY","QQQ","IWM","DIA","^GSPC","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","NFLX","PLTR"]
+NAMES = {"^GSPC":"SPX","SPY":"SPX 🔥"} # <-- عدلت SPY يصير SPX
 
 sent = {}
 monster_memory = {"GOLDEN":{},"MEGA":{},"ULTRA":{},"MOMENTUM":{},"HERO":{}}
@@ -78,7 +77,6 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         base_key=f"DOUBLE_{ticker}_{'_'.join(combo)}_{int(time.time()/600)}"
         if base_key in double_sent: continue
 
-        # فلاتر أسطوري
         if not (1.0 <= ref['price'] <= 10.0): continue
         if not is_buy_signal(ref.get('row',{})): continue
         try:
@@ -87,7 +85,7 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
             iv_txt=f"IV {iv:.0f}% رخيص"
         except: continue
 
-        rsi=get_rsi("^GSPC" if ticker=="SPX" else ticker)
+        rsi=get_rsi("^GSPC" if ticker=="SPX" or "SPX" in ticker else ticker)
         opt_t=ref['type']
         if opt_t=="C" and rsi>25: continue
         if opt_t=="P" and rsi<75: continue
@@ -103,7 +101,12 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         valid_str=datetime.fromtimestamp(now_et.timestamp()+180, et_tz).strftime("%H:%M:%S ET")
         now_str=now_et.strftime("%H:%M:%S ET")
 
-        queue_send(f"🚨 TOP5 مضمون 1-10$ + IV + RSI 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n\n✅ {iv_txt}\n✅ {rsi_txt}\n✅ 🟢 BUY TO OPEN\n✅ سعر ${entry:.2f} بين 1-10$\n\n💵 دخول: ${entry:.2f}\n🎯 هدف1: ${t1:.2f} (+50%)\n🎯 هدف2: ${t2:.2f} (+100%)\n🎯 هدف3: ${t3:.2f} (+200%)\n🛑 وقف: ${stop:.2f}\n💰 مجمع ${total:,.0f}k\n\n⏰ اكتشاف: {now_str}\n⚡️ ادخل قبل: {valid_str} (3 دقايق)\n🔥 سيولة حية - لا تتأخر")
+        # === تحويل SPY إلى SPX بإضافة صفر ===
+        is_spx = "SPX" in ticker
+        spx_strike = int(ref['strike'] * 10) if is_spx else 0
+        spx_label = f" (SPX {spx_strike}{ref['type']})" if is_spx else ""
+
+        queue_send(f"🚨 TOP5 مضمون 1-10$ + IV + RSI 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']}{spx_label} - {ref['exp']}\n\n✅ {iv_txt}\n✅ {rsi_txt}\n✅ 🟢 BUY TO OPEN\n✅ سعر ${entry:.2f} بين 1-10$\n\n💵 دخول: ${entry:.2f}\n🎯 هدف1: ${t1:.2f} (+50%)\n🎯 هدف2: ${t2:.2f} (+100%)\n🎯 هدف3: ${t3:.2f} (+200%)\n🛑 وقف: ${stop:.2f}\n💰 مجمع ${total:,.0f}k\n\n⏰ اكتشاف: {now_str}\n⚡️ ادخل قبل: {valid_str} (3 دقايق)\n🔥 سيولة حية - لا تتأخر")
 
 def sniper_loop():
     et_tz=pytz.timezone('US/Eastern')
@@ -151,7 +154,7 @@ def sniper_loop():
 def main_loop():
     time.sleep(2)
     threading.Thread(target=send_worker,daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V20 أسطوري 20 شركة شغال</b>\n💵 1-10$\n✅ IV 35-80% رخيص\n📉 RSI<25 CALL قاع\n📈 RSI>75 PUT قمة\n⏰ دخول 3 دقايق","parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V20 أسطوري 20 شركة + SPX 0 شغال</b>\n💵 1-10$\n✅ IV 35-80% رخيص\n📉 RSI<25 CALL قاع\n📈 RSI>75 PUT قمة\n⏰ دخول 3 دقايق\n🔥 SPY = SPX x10","parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0
