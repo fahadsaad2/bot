@@ -8,7 +8,7 @@ import pytz
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "V21 RSI 40/70 NO REPEAT"
+    return "V21 RSI 40/70 FIXED"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -87,9 +87,8 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         sent_today.clear()
         double_sent.clear()
         last_reset_day = datetime.now().day
-
     monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row}
-    combos=[(["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),(["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),(["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),(["GOLDEN","HERO"],"👑🚀 GOLDEN+HERO"),(["GOLDEN","ULTRA"],"👑🐳 GOLDEN+ULTRA")]
+    combos=[(["MEGA","MOMENTUM"],"MEGA+MOMENTUM"),(["ULTRA","MOMENTUM"],"ULTRA+MOMENTUM"),(["GOLDEN","MOMENTUM"],"GOLDEN+MOMENTUM"),(["GOLDEN","HERO"],"GOLDEN+HERO"),(["GOLDEN","ULTRA"],"GOLDEN+ULTRA")]
     for combo,desc in combos:
         if typ not in combo:
             continue
@@ -102,11 +101,9 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         for c in combo:
             if monster_memory[c][ticker]["premium"] > ref["premium"]:
                 ref=monster_memory[c][ticker]
-
         contract_key = f"{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}"
         if contract_key in sent_today:
             continue
-
         base_key=f"DOUBLE_{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}_{'_'.join(combo)}"
         if base_key in double_sent:
             continue
@@ -120,21 +117,16 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
                 continue
         except:
             continue
-
         rsi=get_rsi("^GSPC" if "SPX" in ticker else ticker)
         opt_t=ref['type']
-        # التعديل الجديد 40/70
         if opt_t=="C" and rsi>40:
             continue
         if opt_t=="P" and rsi<70:
             continue
-
         double_sent[base_key]=time.time()
         sent_today.add(contract_key)
-
         exit_key=f"{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}"
         exit_memory[exit_key]={"entry":ref['price'],"high":ref['price'],"time":time.time(),"ticker":ticker,"strike":ref['strike'],"exp":ref['exp'],"type":ref['type']}
-
         entry=ref['price']
         t1=entry*1.5
         t2=entry*2.0
@@ -143,7 +135,7 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         total=sum(monster_memory[c][ticker]["vol"] for c in combo)
         et_tz=pytz.timezone('US/Eastern')
         now_et=datetime.now(et_tz)
-        queue_send(f"🚨 دخول حوت 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n✅ IV {iv:.0f}% رخيص\n✅ RSI {rsi:.0f} {'CALL قاع' if opt_t=='C' else 'PUT قمة'}\n✅ 🟢 BUY\n\n💵 دخول: ${entry:.2f}\n🎯 هدف1: ${t1:.2f} (+50%)\n🎯 هدف2: ${t2:.2f} (+100%)\n🎯 هدف3: ${t3:.2f} (+200%)\n🛑 وقف: ${stop:.2f}\n💰 مجمع ${total:,.0f}k\n⏰ {now_et.strftime('%H:%M:%S ET')}")
+        queue_send(f"🚨 دخول حوت 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n✅ IV {iv:.0f}% رخيص\n✅ RSI {rsi:.0f}\n✅ BUY\n\n💵 دخول: ${entry:.2f}\n🎯 هدف1: ${t1:.2f} (+50%)\n🎯 هدف2: ${t2:.2f} (+100%)\n🎯 هدف3: ${t3:.2f} (+200%)\n🛑 وقف: ${stop:.2f}\n💰 مجمع ${total:,.0f}k\n⏰ {now_et.strftime('%H:%M:%S ET')}")
 
 def check_exits():
     while True:
@@ -177,10 +169,10 @@ def check_exits():
                         et_tz=pytz.timezone('US/Eastern')
                         now_et=datetime.now(et_tz)
                         profit=(cur-mem['entry'])/mem['entry']*100
-                        queue_send(f"🚨 خروج حوت - بيع الآن 🚨\n\n🎯 {mem['ticker']}\n💥 {mem['strike']:g}{mem['type']} - {mem['exp']}\n\n⚠️ الحيتان يبيعون\n📉 نزل {drop_from_high:.0f}% من القمة ${mem['high']:.2f} -> ${cur:.2f}\n🔴 SELL TO CLOSE\n💵 سعرك: ${mem['entry']:.2f}\n💵 الآن: ${cur:.2f} ({profit:+.0f}%)\n⏰ {now_et.strftime('%H:%M:%S ET')}")
+                        queue_send(f"🚨 خروج حوت\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n📉 نزل {drop_from_high:.0f}% من ${mem['high']:.2f} -> ${cur:.2f}\n💵 {profit:+.0f}%\n⏰ {now_et.strftime('%H:%M:%S ET')}")
                         del exit_memory[key]
                     elif cur <= mem['entry']*0.7:
-                        queue_send(f"🛑 وقف خسارة\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n💵 دخول ${mem['entry']:.2f} -> الآن ${cur:.2f}")
+                        queue_send(f"🛑 وقف\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n💵 ${mem['entry']:.2f} -> ${cur:.2f}")
                         del exit_memory[key]
                 except:
                     continue
@@ -219,8 +211,4 @@ def sniper_loop():
                                         continue
                                     if vol < 50:
                                         continue
-                                    oi=int(r['openInterest']) if r['openInterest'] else 0
-                                    prem_vol=float(vol*price*100)
-                                    prem_oi=float(oi*price*100) if oi>0 else prem_vol
-                                    if prem_vol > 2000000 and vol>300:
-                                        check_double_monster(dname,"ULTRA",prem_vol/1000,float(r['strike']),exp,price,"C" if otype
+                                    oi=int(r['openInterest']) if r['openInterest
