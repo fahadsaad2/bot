@@ -6,7 +6,7 @@ from collections import deque
 import pytz
 app = Flask(__name__)
 @app.route('/')
-def home(): return "V21 ENTRY+EXIT"
+def home(): return "V21 ENTRY+EXIT - NO REPEAT"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -16,9 +16,11 @@ NAMES = {"^GSPC":"SPX","SPY":"SPX 🔥"}
 
 monster_memory = {"GOLDEN":{},"MEGA":{},"ULTRA":{},"MOMENTUM":{},"HERO":{}}
 double_sent = {}
-exit_memory = {} # يحفظ العقود اللي دخلناها
+exit_memory = {}
 message_queue = deque()
 rsi_cache = {}
+sent_today = set() # جديد - يمنع تكرار نفس العقد طول اليوم
+last_reset_day = datetime.now().day
 
 def send_worker():
     while True:
@@ -51,11 +53,18 @@ def is_buy_signal(row):
 def is_sell_signal(row):
     try:
         bid=row.get('bid',0); ask=row.get('ask',0); last=row.get('lastPrice',0)
-        if ask>0 and bid>0: return last <= (bid+ask)/2 + 0.02 # باع على الـ BID
+        if ask>0 and bid>0: return last <= (bid+ask)/2 + 0.02
         return False
     except: return False
 
 def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",premium=0,row=None):
+    global last_reset_day, sent_today
+    # تصفير يومي
+    if datetime.now().day!= last_reset_day:
+        sent_today.clear()
+        double_sent.clear()
+        last_reset_day = datetime.now().day
+
     monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row}
     combos=[(["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),(["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),(["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),(["GOLDEN","HERO"],"👑🚀 GOLDEN+HERO"),(["GOLDEN","ULTRA"],"👑🐳 GOLDEN+ULTRA")]
     for combo,desc in combos:
@@ -66,8 +75,15 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         ref=monster_memory[combo[0]][ticker]
         for c in combo:
             if monster_memory[c][ticker]["premium"] > ref["premium"]: ref=monster_memory[c][ticker]
+
+        # منع التكرار الجديد - نفس العقد بكل شي
+        contract_key = f"{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}"
+        if contract_key in sent_today:
+            continue # انرسل اليوم خلاص لا ترسله ابداً
+
         base_key=f"DOUBLE_{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}_{'_'.join(combo)}"
-        if base_key in double_sent and time.time()-double_sent[base_key] < 300: continue # 5 دقايق يكرر اذا حوت جديد
+        if base_key in double_sent: continue # كان 300 صار ما يكرر نهائياً
+
         if not (1.0 <= ref['price'] <= 10.0): continue
         if not is_buy_signal(ref.get('row',{})): continue
         try:
@@ -80,7 +96,8 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         if opt_t=="P" and rsi<75: continue
 
         double_sent[base_key]=time.time()
-        # حفظ للخروج
+        sent_today.add(contract_key) # احفظ انه انرسل
+
         exit_key=f"{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}"
         exit_memory[exit_key]={"entry":ref['price'],"high":ref['price'],"time":time.time(),"ticker":ticker,"strike":ref['strike'],"exp":ref['exp'],"type":ref['type']}
 
@@ -90,13 +107,12 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         queue_send(f"🚨 دخول حوت 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n✅ IV {iv:.0f}% رخيص\n✅ RSI {rsi:.0f} {'CALL قاع' if opt_t=='C' else 'PUT قمة'}\n✅ 🟢 BUY\n\n💵 دخول: ${entry:.2f}\n🎯 هدف1: ${t1:.2f} (+50%)\n🎯 هدف2: ${t2:.2f} (+100%)\n🎯 هدف3: ${t3:.2f} (+200%)\n🛑 وقف: ${stop:.2f}\n💰 مجمع ${total:,.0f}k\n⏰ {now_et.strftime('%H:%M:%S ET')}")
 
 def check_exits():
-    # يراقب العقود اللي دخلناها
     while True:
         try:
             time.sleep(20)
             if not exit_memory: continue
             for key, mem in list(exit_memory.items()):
-                if time.time()-mem['time'] > 14400: del exit_memory[key]; continue # 4 ساعات ويمسح
+                if time.time()-mem['time'] > 14400: del exit_memory[key]; continue
                 try:
                     sym = "SPY" if "SPX" in mem['ticker'] else mem['ticker'].split()[0]
                     tk=yf.Ticker("^GSPC" if sym=="SPX" else sym)
@@ -109,25 +125,17 @@ def check_exits():
                     r=row.iloc[0]
                     cur=float(r['lastPrice']); vol=int(r['volume'])
                     bid=float(r.get('bid',0)); ask=float(r.get('ask',0))
-                    # تحديث الهاي
                     if cur > mem['high']: exit_memory[key]['high']=cur
-
-                    # شروط خروج الحوت
                     drop_from_high = (mem['high']-cur)/mem['high']*100 if mem['high']>0 else 0
                     is_heavy_sell = is_sell_signal(r) and vol>300
-
-                    # خروج اذا نزل 25% من القمة + بيع على البيد
                     if drop_from_high >= 20 and is_heavy_sell:
                         et_tz=pytz.timezone('US/Eastern'); now_et=datetime.now(et_tz)
                         profit=(cur-mem['entry'])/mem['entry']*100
                         queue_send(f"🚨 خروج حوت - بيع الآن 🚨\n\n🎯 {mem['ticker']}\n💥 {mem['strike']:g}{mem['type']} - {mem['exp']}\n\n⚠️ الحيتان يبيعون\n📉 نزل {drop_from_high:.0f}% من القمة ${mem['high']:.2f} -> ${cur:.2f}\n🔴 SELL TO CLOSE على BID\n💰 سيولة بيع ثقيلة\n💵 سعرك: ${mem['entry']:.2f}\n💵 الآن: ${cur:.2f} ({profit:+.0f}%)\n\n⏰ {now_et.strftime('%H:%M:%S ET')}\n🏃 اطلع قبل لا ينهار")
                         del exit_memory[key]
-
-                    # خروج اذا ضرب وقف 30%
                     elif cur <= mem['entry']*0.7:
                         queue_send(f"🛑 وقف خسارة\n\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n💵 دخول ${mem['entry']:.2f} -> الآن ${cur:.2f}\n❌ الحيتان طلعوا")
                         del exit_memory[key]
-
                 except: continue
         except: time.sleep(5)
 
@@ -171,7 +179,7 @@ def main_loop():
     time.sleep(2)
     threading.Thread(target=send_worker,daemon=True).start()
     threading.Thread(target=check_exits,daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V21 دخول+خروج شغال</b>\n✅ دخول يكرر كل 5 دقايق اذا حوت جديد\n✅ خروج اذا الحوت باع","parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V21 دخول+خروج - بدون تكرار ✅</b>\n✅ يرسل العقد مرة وحدة بس طول اليوم\n✅ ما يكرر نفس Strike ابداً","parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0
@@ -181,8 +189,8 @@ def main_loop():
             for u in r.get("result",[]):
                 off=u["update_id"]; txt=u.get("message",{}).get("text","").lower()
                 if "/test" in txt: queue_send("🏆 V21 ✅")
-                if "/status" in txt: queue_send(f"✅ طابور {len(message_queue)} | متابع خروج {len(exit_memory)} عقد")
-                if "/clear" in txt: double_sent.clear(); exit_memory.clear(); message_queue.clear(); queue_send("✅ تم المسح")
+                if "/status" in txt: queue_send(f"✅ طابور {len(message_queue)} | متابع خروج {len(exit_memory)} عقد | مرسل اليوم {len(sent_today)} عقد")
+                if "/clear" in txt: double_sent.clear(); exit_memory.clear(); message_queue.clear(); sent_today.clear(); queue_send("✅ تم المسح")
         except: time.sleep(3)
 
 threading.Thread(target=main_loop,daemon=True).start()
