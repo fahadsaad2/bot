@@ -8,7 +8,7 @@ import pytz
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "V21 RSI 30/70 NO REPEAT"
+    return "V21 RSI 40/70 NO REPEAT"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -123,7 +123,8 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
 
         rsi=get_rsi("^GSPC" if "SPX" in ticker else ticker)
         opt_t=ref['type']
-        if opt_t=="C" and rsi>30:
+        # التعديل الجديد 40/70
+        if opt_t=="C" and rsi>40:
             continue
         if opt_t=="P" and rsi<70:
             continue
@@ -222,52 +223,4 @@ def sniper_loop():
                                     prem_vol=float(vol*price*100)
                                     prem_oi=float(oi*price*100) if oi>0 else prem_vol
                                     if prem_vol > 2000000 and vol>300:
-                                        check_double_monster(dname,"ULTRA",prem_vol/1000,float(r['strike']),exp,price,"C" if otype=="calls" else "P",prem_vol,r)
-                                    elif prem_vol > 800000 and vol>300:
-                                        check_double_monster(dname,"MEGA",prem_vol/1000,float(r['strike']),exp,price,"C" if otype=="calls" else "P",prem_vol,r)
-                                    elif prem_oi>150000 and vol>200:
-                                        check_double_monster(dname,"GOLDEN",prem_oi/1000,float(r['strike']),exp,price,"C" if otype=="calls" else "P",prem_oi,r)
-                                    if vol / max(oi,1) > 3.0 and vol>500:
-                                        check_double_monster(dname,"MOMENTUM",prem_vol/1000,float(r['strike']),exp,price,"C" if otype=="calls" else "P",prem_vol,r)
-                                    if is_0dte and vol>50:
-                                        check_double_monster(dname,"HERO",prem_vol/1000,float(r['strike']),exp,price,"C" if otype=="calls" else "P",prem_vol,r)
-                        except:
-                            continue
-                except:
-                    continue
-            time.sleep(30)
-        except Exception as e:
-            print(f"ERR {e}")
-            time.sleep(10)
-
-def main_loop():
-    time.sleep(2)
-    threading.Thread(target=send_worker,daemon=True).start()
-    threading.Thread(target=check_exits,daemon=True).start()
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V21 RSI 30/70 بدون تكرار شغال</b>","parse_mode":"HTML"}, timeout=15)
-    except:
-        pass
-    threading.Thread(target=sniper_loop,daemon=True).start()
-    off=0
-    while True:
-        try:
-            r=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=20",timeout=25).json()
-            for u in r.get("result",[]):
-                off=u["update_id"]
-                txt=u.get("message",{}).get("text","").lower()
-                if "/test" in txt:
-                    queue_send("🏆 V21 ✅")
-                if "/status" in txt:
-                    queue_send(f"✅ طابور {len(message_queue)} | خروج {len(exit_memory)} | مرسل اليوم {len(sent_today)}")
-                if "/clear" in txt:
-                    double_sent.clear()
-                    exit_memory.clear()
-                    message_queue.clear()
-                    sent_today.clear()
-                    queue_send("✅ تم المسح")
-        except:
-            time.sleep(3)
-
-threading.Thread(target=main_loop,daemon=True).start()
-app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
+                                        check_double_monster(dname,"ULTRA",prem_vol/1000,float(r['strike']),exp,price,"C" if otype
