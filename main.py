@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "V21 RSI 40/70 FIXED"
+    return "V21 RSI 45/70 FIXED"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -135,7 +135,7 @@ def check_double_monster(ticker, typ, vol_k, strike=0, exp="", price=0, opt_type
         rsi = get_rsi("^GSPC" if "SPX" in ticker else ticker)
         opt_t = ref["type"]
 
-        if opt_t == "C" and rsi > 40:
+        if opt_t == "C" and rsi > 45:
             continue
         if opt_t == "P" and rsi < 70:
             continue
@@ -264,7 +264,7 @@ def main_loop():
     threading.Thread(target=send_worker, daemon=True).start()
     threading.Thread(target=check_exits, daemon=True).start()
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": "🏆 <b>V21 RSI 40/70 FIXED شغال</b>", "parse_mode": "HTML"}, timeout=15)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": "🏆 <b>V21 RSI 45/70 FIXED شغال</b>", "parse_mode": "HTML"}, timeout=15)
     except:
         pass
     threading.Thread(target=sniper_loop, daemon=True).start()
