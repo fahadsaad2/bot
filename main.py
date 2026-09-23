@@ -8,12 +8,11 @@ import pytz
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "V23 SINGLE+DOUBLE 24 TICKERS"
+    return "V24 KSA TIME 24 TICKERS"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# الـ 24 شركة كاملة
 TICKERS = ["SPY","QQQ","IWM","DIA","^GSPC","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","NFLX","PLTR"]
 NAMES = {"^GSPC":"SPX","SPY":"SPX"}
 
@@ -26,6 +25,9 @@ rsi_cache = {}
 sent_today = set()
 blocked_today = 0
 last_reset_day = datetime.now().day
+
+KSA = pytz.timezone("Asia/Riyadh")
+ET = pytz.timezone("US/Eastern")
 
 def send_worker():
     while True:
@@ -76,12 +78,10 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
     if datetime.now().day!= last_reset_day:
         sent_today.clear(); double_sent.clear(); single_sent.clear(); blocked_today=0
         last_reset_day = datetime.now().day
-
     monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row}
 
-    # 1- الحوت المفرد (مبلغ كبير بدون ما ينتظر الثاني)
     if typ in ["ULTRA","MEGA"]:
-        if premium >= 500000: # 500k وما فوق يرسل مباشرة
+        if premium >= 500000:
             single_key = f"SINGLE_{ticker}_{strike}_{exp}_{opt_type}"
             if single_key not in single_sent and single_key not in sent_today:
                 rsi=get_rsi("^GSPC" if "SPX" in ticker else ticker)
@@ -94,14 +94,13 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
                                 sent_today.add(f"{ticker}_{strike}_{exp}_{opt_type}")
                                 exit_key=f"{ticker}_{strike}_{exp}_{opt_type}"
                                 exit_memory[exit_key]={"entry":price,"high":price,"time":time.time(),"ticker":ticker,"strike":strike,"exp":exp,"type":opt_type}
-                                et_tz=pytz.timezone("US/Eastern"); now_et=datetime.now(et_tz)
+                                now_ksa=datetime.now(KSA)
                                 icon = "🐳🚀 ULTRA" if typ=="ULTRA" else "🐋 MEGA"
-                                queue_send(f"{icon} حوت مفرد\n\n🎯 {ticker}\n💥 {strike:g}{opt_type} - {exp}\n✅ IV {iv:.0f}% | RSI {rsi:.0f}\n💵 دخول: ${price:.2f}\n💰 ${premium/1000:,.0f}k\n⏰ {now_et.strftime('%H:%M:%S ET')}")
+                                queue_send(f"{icon} حوت مفرد\n\n🎯 {ticker}\n💥 {strike:g}{opt_type} - {exp}\n✅ IV {iv:.0f}% | RSI {rsi:.0f}\n💵 دخول: ${price:.2f}\n💰 ${premium/1000:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
                         except: pass
                 else:
                     blocked_today+=1
 
-    # 2- الحوت المزدوج (القديم)
     combos=[(["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),(["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),(["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),(["GOLDEN","HERO"],"👑🚀 GOLDEN+HERO"),(["GOLDEN","ULTRA"],"👑🐳 GOLDEN+ULTRA")]
     for combo,desc in combos:
         if typ not in combo: continue
@@ -135,8 +134,8 @@ def check_double_monster(ticker,typ,vol_k,strike=0,exp="",price=0,opt_type="C",p
         exit_memory[exit_key]={"entry":ref["price"],"high":ref["price"],"time":time.time(),"ticker":ticker,"strike":ref["strike"],"exp":ref["exp"],"type":ref["type"]}
         entry=ref["price"]; t1=entry*1.5; t2=entry*2.0; t3=entry*3.0; stop=entry*0.7
         total=sum(monster_memory[c][ticker]["vol"] for c in combo)
-        et_tz=pytz.timezone("US/Eastern"); now_et=datetime.now(et_tz)
-        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n✅ IV {iv:.0f}% | RSI {rsi:.0f}\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_et.strftime('%H:%M:%S ET')}")
+        now_ksa=datetime.now(KSA)
+        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}\n💥 {ref['strike']:g}{ref['type']} - {ref['exp']}\n✅ IV {iv:.0f}% | RSI {rsi:.0f}\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
 
 def check_exits():
     while True:
@@ -158,9 +157,9 @@ def check_exits():
                     drop_from_high = (mem["high"]-cur)/mem["high"]*100 if mem["high"]>0 else 0
                     is_heavy_sell = is_sell_signal(r) and vol>300
                     if drop_from_high >= 20 and is_heavy_sell:
-                        et_tz=pytz.timezone("US/Eastern"); now_et=datetime.now(et_tz)
+                        now_ksa=datetime.now(KSA)
                         profit=(cur-mem["entry"])/mem["entry"]*100
-                        queue_send(f"🚨 خروج حوت\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n📉 نزل {drop_from_high:.0f}%\n💵 {profit:+.0f}%\n⏰ {now_et.strftime('%H:%M:%S ET')}")
+                        queue_send(f"🚨 خروج حوت\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n📉 نزل {drop_from_high:.0f}%\n💵 {profit:+.0f}%\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
                         del exit_memory[key]
                     elif cur <= mem["entry"]*0.7:
                         queue_send(f"🛑 وقف\n🎯 {mem['ticker']} {mem['strike']:g}{mem['type']} {mem['exp']}\n💵 ${mem['entry']:.2f} -> ${cur:.2f}")
@@ -169,10 +168,9 @@ def check_exits():
         except: time.sleep(5)
 
 def sniper_loop():
-    et_tz=pytz.timezone("US/Eastern")
     while True:
         try:
-            today_et=datetime.now(et_tz).date()
+            today_et=datetime.now(ET).date()
             for sym in TICKERS:
                 try:
                     tk=yf.Ticker(sym)
@@ -225,7 +223,7 @@ def main_loop():
     time.sleep(2)
     threading.Thread(target=send_worker,daemon=True).start()
     threading.Thread(target=check_exits,daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V23 SINGLE+DOUBLE 24 سهم شغال</b>","parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V24 بتوقيت السعودية KSA شغال - 24 سهم</b>","parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0
@@ -235,13 +233,15 @@ def main_loop():
             for u in r.get("result",[]):
                 off=u["update_id"]
                 txt=u.get("message",{}).get("text","").lower()
-                if "/test" in txt: queue_send("🏆 V23 ✅ شغال")
+                if "/test" in txt: queue_send("🏆 V24 ✅ شغال KSA")
                 if "/status" in txt:
                     rsi_spx=get_rsi("^GSPC")
-                    queue_send(f"✅ طابور {len(message_queue)} | خروج {len(exit_memory)} | ارسل اليوم {len(sent_today)} | محجوب RSI {blocked_today} | SPX RSI {rsi_spx:.0f} | مفرد {len(single_sent)}")
+                    now_ksa=datetime.now(KSA)
+                    queue_send(f"✅ طابور {len(message_queue)} | خروج {len(exit_memory)} | ارسل اليوم {len(sent_today)} | محجوب {blocked_today} | SPX RSI {rsi_spx:.0f}\n⏰ {now_ksa.strftime('%H:%M KSA')}")
                 if "/rsi" in txt:
                     rsi_spx=get_rsi("^GSPC")
-                    queue_send(f"📊 SPX RSI: {rsi_spx:.0f}\nCALL <50 | PUT >68\nالـ 24 سهم شغالين")
+                    now_ksa=datetime.now(KSA)
+                    queue_send(f"📊 SPX RSI: {rsi_spx:.0f}\nCALL <50 | PUT >68\n⏰ {now_ksa.strftime('%H:%M KSA')}")
                 if "/clear" in txt:
                     double_sent.clear(); exit_memory.clear(); message_queue.clear(); sent_today.clear(); single_sent.clear()
                     queue_send("✅ تم المسح")
