@@ -8,20 +8,21 @@ import pytz
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "V26 SPX REAL PRICE FIXED"
+    return "V28 WAVE + 6 DOUBLES"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# شلت SPY نهائيا عشان لا يلخبط سعر SPX
-TICKERS = ["^GSPC","QQQ","IWM","DIA","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","NFLX","PLTR"]
+TICKERS = ["^GSPC","QQQ","IWM","DIA","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","PLTR"]
 NAMES = {"^GSPC":"SPX"}
+INDEX_WAVE = ["SPX","QQQ","IWM","DIA"] # الموجات بس على هذول
 
 monster_memory = {"GOLDEN":{},"MEGA":{},"ULTRA":{},"MOMENTUM":{},"HERO":{},"EXPLOSIVE":{}}
 double_sent = {}
 single_sent = set()
 message_queue = deque()
 rsi_cache = {}
+wave_cache = {}
 sent_today = set()
 last_reset_day = datetime.now().day
 
@@ -53,6 +54,34 @@ def get_rsi(sym):
         return val
     except: return 50
 
+# === فلتر الموجات الجديد ===
+def get_wave_state(sym):
+    try:
+        cache_key = sym
+        if cache_key in wave_cache and time.time()-wave_cache[cache_key]["t"] < 180:
+            return wave_cache[cache_key]["v"]
+        # ^GSPC للـ SPX
+        yf_sym = "^GSPC" if sym=="SPX" else sym
+        hist=yf.Ticker(yf_sym).history(period="5d", interval="5m")
+        if len(hist)<100: return {"allow":True,"wave":"مومنتوم","fib":0}
+        high=hist["High"][-60:].max()
+        low=hist["Low"][-60:].min()
+        last=hist["Close"].iloc[-1]
+        swing=high-low
+        if swing==0: return {"allow":True,"wave":"?","fib":0}
+        drop_pct=(high-last)/swing*100
+        # موجة 4 = تصحيح 23-50% من القمة
+        if 23 <= drop_pct <= 50:
+            res={"allow":True,"wave":f"موجة 4->{drop_pct:.0f}% جاهز","fib":drop_pct}
+        elif drop_pct < 23:
+            res={"allow":False,"wave":f"قمة موجة 3 ({drop_pct:.0f}%) انتظار","fib":drop_pct}
+        else:
+            res={"allow":True,"wave":f"تصحيح {drop_pct:.0f}%","fib":drop_pct}
+        wave_cache[cache_key]={"v":res,"t":time.time()}
+        return res
+    except:
+        return {"allow":True,"wave":"?","fib":0}
+
 def get_above_ask(row):
     try:
         ask=float(row.get("ask",0)); last=float(row.get("lastPrice",0))
@@ -64,9 +93,27 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
     if datetime.now().day!= last_reset_day:
         sent_today.clear(); double_sent.clear(); single_sent.clear()
         last_reset_day=datetime.now().day
+
+    # === فلتر الموجات - بس للمؤشرات ===
+    wave_text=""
+    if ticker in INDEX_WAVE:
+        wave=get_wave_state(ticker)
+        if not wave["allow"]:
+            return # في قمة موجة 3 لا ترسل
+        wave_text=f"\n🌊 {wave['wave']}"
+
     monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row,"above_ask":above_ask}
     if above_ask<80: return
-    combos=[(["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),(["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),(["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),(["EXPLOSIVE","MOMENTUM"],"💥 EXPLOSIVE+MOMENTUM")]
+
+    # === الـ 6 المزدوجة كاملة بالترتيب اللي تبيه ===
+    combos=[
+        (["GOLDEN","ULTRA"],"🏆 GOLDEN+ULTRA"),
+        (["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),
+        (["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),
+        (["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),
+        (["EXPLOSIVE","MOMENTUM"],"💥 EXPLOSIVE+MOMENTUM"),
+        (["GOLDEN","HERO"],"⚡ GOLDEN+HERO")
+    ]
     for combo,desc in combos:
         if typ not in combo: continue
         if not all(ticker in monster_memory[c] for c in combo): continue
@@ -78,7 +125,7 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
         if contract_key in sent_today: continue
         base_key=f"DOUBLE_{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}_{'_'.join(combo)}"
         if base_key in double_sent: continue
-        if not (0.25 <= ref["price"] <= 500.0): continue # فتحت الحد لان SPX سعره 80
+        if not (0.25 <= ref["price"] <= 500.0): continue
         try:
             iv=float(ref["row"].get("impliedVolatility",0))*100
             if not (10 <= iv <= 120): continue
@@ -92,18 +139,14 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
         t1,t2,t3,stop = (entry*1.3, entry*1.6, entry*2.2, entry*0.7) if entry>10 else (entry*1.5, entry*2.0, entry*3.0, entry*0.7)
         total=sum(monster_memory[c][ticker]["vol"] for c in combo)
         now_ksa=datetime.now(KSA)
-
-        # SPX من ^GSPC يجي جاهز 7590 - ما يحتاج ضرب
         display_strike = ref['strike']
-        # لو لسه في عقد قديم اقل من 1000 اضربه
         if ticker=="SPX" and display_strike < 2000:
             display_strike = display_strike*10
-
         exp_occ = datetime.strptime(ref['exp'],"%Y-%m-%d").strftime("%y%m%d")
         strike_occ = int(display_strike*1000)
         occ_symbol = f"SPXW {exp_occ}{ref['type']}{strike_occ:08d}" if ticker=="SPX" else f"{ticker} {exp_occ}{ref['type']}{strike_occ:08d}"
 
-        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}\n💥 {display_strike:g}{ref['type']} - {ref['exp']}\n📋 عقد: <code>{occ_symbol}</code>\n✅ IV {iv:.0f}% | RSI {rsi:.0f} | فوق Ask {ref['above_ask']}% ✅\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
+        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}{wave_text}\n💥 {display_strike:g}{ref['type']} - {ref['exp']}\n📋 عقد: <code>{occ_symbol}</code>\n✅ IV {iv:.0f}% | RSI {rsi:.0f} | فوق Ask {ref['above_ask']}% ✅\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
 
 def sniper_loop():
     while True:
@@ -145,7 +188,7 @@ def sniper_loop():
 def main_loop():
     time.sleep(2)
     threading.Thread(target=send_worker,daemon=True).start()
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V26 SPX REAL PRICE $80 FIXED شغال</b>","parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V28 WAVE + 6 DOUBLES شغال</b>","parse_mode":"HTML"}, timeout=15)
     except: pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     off=0
@@ -157,8 +200,13 @@ def main_loop():
                 msg=u.get("message",{})
                 if str(msg.get("chat",{}).get("id"))!=str(CHAT_ID): continue
                 txt=msg.get("text","").lower()
-                if "/test" in txt: queue_send("🏆 V26 ✅ شغال - SPX سعره الحقيقي")
-                if "/status" in txt: queue_send(f"✅ ارسل اليوم {len(sent_today)} | RSI {get_rsi('^GSPC'):.0f}")
+                if "/test" in txt: queue_send("🏆 V28 WAVE ✅ شغال - 6 مزدوجة + موجات")
+                if "/status" in txt:
+                    w=get_wave_state("SPX")
+                    queue_send(f"✅ ارسل اليوم {len(sent_today)} | RSI {get_rsi('^GSPC'):.0f} | موجة {w['wave']}")
+                if "/wave" in txt:
+                    w=get_wave_state("SPX")
+                    queue_send(f"🌊 SPX: {w['wave']}")
                 if "/clear" in txt: double_sent.clear(); sent_today.clear(); single_sent.clear(); message_queue.clear(); queue_send("✅ تم المسح")
         except: time.sleep(3)
 
