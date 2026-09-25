@@ -8,7 +8,7 @@ import pytz
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "V29 FIXED"
+    return "V29 ARABIC FIXED"
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -36,7 +36,7 @@ def send_worker():
             t = message_queue.popleft()
             try:
                 requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML"}, timeout=15)
-            except:
+            except Exception:
                 pass
             time.sleep(1.2)
         else:
@@ -59,7 +59,7 @@ def get_rsi(sym):
         val=float(100-(100/(1+gain/loss)).iloc[-1])
         rsi_cache[sym]={"v":val,"t":time.time()}
         return val
-    except:
+    except Exception:
         return 50
 
 def get_wave_state(sym):
@@ -69,7 +69,7 @@ def get_wave_state(sym):
         yf_sym = "^GSPC" if sym=="SPX" else sym
         hist=yf.Ticker(yf_sym).history(period="5d", interval="5m")
         if len(hist)<100:
-            return {"allow":True,"wave":"momentum","fib":0}
+            return {"allow":True,"wave":"مومنتوم","fib":0}
         high=hist["High"][-60:].max()
         low=hist["Low"][-60:].min()
         last=hist["Close"].iloc[-1]
@@ -78,14 +78,14 @@ def get_wave_state(sym):
             return {"allow":True,"wave":"?","fib":0}
         drop=(high-last)/swing*100
         if 23 <= drop <= 50:
-            res={"allow":True,"wave":f"Wave4 {drop:.0f}% ready","fib":drop}
+            res={"allow":True,"wave":f"موجة 4 -> {drop:.0f}% جاهز","fib":drop}
         elif drop < 23:
-            res={"allow":False,"wave":f"Wave3 top {drop:.0f}% wait","fib":drop}
+            res={"allow":False,"wave":f"قمة موجة 3 ({drop:.0f}%) انتظار","fib":drop}
         else:
-            res={"allow":True,"wave":f"Pull {drop:.0f}%","fib":drop}
+            res={"allow":True,"wave":f"تصحيح {drop:.0f}%","fib":drop}
         wave_cache[sym]={"v":res,"t":time.time()}
         return res
-    except:
+    except Exception:
         return {"allow":True,"wave":"?","fib":0}
 
 def get_above_ask(row):
@@ -93,7 +93,7 @@ def get_above_ask(row):
         ask=float(row.get("ask",0))
         last=float(row.get("lastPrice",0))
         return 90 if ask>0 and last>=ask else 0
-    except:
+    except Exception:
         return 0
 
 def get_gex_report():
@@ -112,8 +112,8 @@ def get_gex_report():
         call_wall = calls.loc[calls["openInterest"].idxmax()]["strike"] if not calls.empty else 0
         put_wall = puts.loc[puts["openInterest"].idxmax()]["strike"] if not puts.empty else 0
         flip = (call_wall + put_wall)/2
-        now=datetime.now(KSA).strftime("%d %b %Y %I:%M %p KSA")
-        report = f"Gamma Exposure Report\n\nTicker : $SPX\nExp : {exp}\nSpot : ${spot:.2f}\n\nNet GEX ${net_gex:.2f}B\nCall GEX ${call_gex:.2f}B\nPut GEX -${put_gex:.2f}B\n\nCall Wall {call_wall:g}\nPut Wall {put_wall:g}\nFlip {flip:.2f}\n\n{now}"
+        now=datetime.now(KSA).strftime("%d %b %Y • %I:%M %p KSA")
+        report = f"📈 <b>Gamma Exposure Report</b>\n\n🏷 Ticker : $SPX\n📅 Expiration : {exp}\n💰 Spot : ${spot:.2f}\n\nالسيولة:\n{'🟢' if net_gex>0 else '🔴'} Net GEX ${net_gex:.2f}B\n🟢 Call GEX ${call_gex:.2f}B\n🔴 Put GEX -${put_gex:.2f}B\n\nالجدران:\n🟢 Call Wall {call_wall:g}\n🔴 Put Wall {put_wall:g}\n\nالفاصل:\n⚖️ Gamma Flip {flip:.2f}\n\n🕒 {now}"
         return report
     except Exception as e:
         print(f"GEX error {e}")
@@ -132,19 +132,19 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
         wave=get_wave_state(ticker)
         if not wave["allow"]:
             return
-        wave_text=f"\nWave {wave['wave']}"
+        wave_text=f"\n🌊 {wave['wave']}"
 
     monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row,"above_ask":above_ask}
     if above_ask<80:
         return
 
     combos=[
-        (["GOLDEN","ULTRA"],"GOLDEN+ULTRA"),
-        (["ULTRA","MOMENTUM"],"ULTRA+MOMENTUM"),
-        (["MEGA","MOMENTUM"],"MEGA+MOMENTUM"),
-        (["GOLDEN","MOMENTUM"],"GOLDEN+MOMENTUM"),
-        (["EXPLOSIVE","MOMENTUM"],"EXPLOSIVE+MOMENTUM"),
-        (["GOLDEN","HERO"],"GOLDEN+HERO")
+        (["GOLDEN","ULTRA"],"🏆 GOLDEN+ULTRA"),
+        (["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),
+        (["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),
+        (["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),
+        (["EXPLOSIVE","MOMENTUM"],"💥 EXPLOSIVE+MOMENTUM"),
+        (["GOLDEN","HERO"],"⚡ GOLDEN+HERO")
     ]
     for combo,desc in combos:
         if typ not in combo:
@@ -170,7 +170,7 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
             iv=float(ref["row"].get("impliedVolatility",0))*100
             if not (10 <= iv <= 120):
                 continue
-        except:
+        except Exception:
             continue
         rsi=get_rsi("^GSPC" if "SPX" in ticker else ticker)
         if ref["type"]=="C" and rsi>55:
@@ -193,7 +193,7 @@ def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row,
         exp_occ = datetime.strptime(ref['exp'],"%Y-%m-%d").strftime("%y%m%d")
         strike_occ = int(display_strike*1000)
         occ_symbol = f"SPXW {exp_occ}{ref['type']}{strike_occ:08d}" if ticker=="SPX" else f"{ticker} {exp_occ}{ref['type']}{strike_occ:08d}"
-        queue_send(f"Whale Double\n\n{ticker} - {desc}{wave_text}\n{float(display_strike):g}{ref['type']} - {ref['exp']}\n<code>{occ_symbol}</code>\nIV {iv:.0f}% RSI {rsi:.0f} Ask {ref['above_ask']}%\nEntry ${entry:.2f} T1 ${t1:.2f} T2 ${t2:.2f} T3 ${t3:.2f} Stop ${stop:.2f}\n${total:,.0f}k {now_ksa.strftime('%H:%M:%S KSA')}")
+        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}{wave_text}\n💥 {float(display_strike):g}{ref['type']} - {ref['exp']}\n📋 عقد: <code>{occ_symbol}</code>\n✅ IV {iv:.0f}% | RSI {rsi:.0f} | فوق Ask {ref['above_ask']}% ✅\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
 
 def check_whale_exit():
     while True:
@@ -206,7 +206,7 @@ def check_whale_exit():
                     ticker=trade["ticker"]
                     yf_sym="^GSPC" if ticker=="SPX" else ticker
                     tk=yf.Ticker(yf_sym)
-                    if not trade["exp"] in tk.options:
+                    if trade["exp"] not in tk.options:
                         continue
                     chain=getattr(tk.option_chain(trade["exp"]), "calls" if trade["type"]=="C" else "puts")
                     row=chain[chain["strike"]==trade["strike"]]
@@ -216,11 +216,11 @@ def check_whale_exit():
                     if price>trade["high"]:
                         active_trades[key]["high"]=price
                     if price <= trade["entry"]*0.7:
-                        queue_send(f"EXIT Stop Hit\n{ticker} {trade['strike']}{trade['type']} {trade['entry']:.2f} -> {price:.2f} -30%")
+                        queue_send(f"🔴 خروج حوت - وقف ضرب\n🎯 {ticker} {trade['strike']}{trade['type']} ${trade['entry']:.2f} → ${price:.2f} (-30%)")
                         del active_trades[key]
                     elif price <= trade["high"]*0.7 and price>trade["entry"]:
                         profit=(price-trade["entry"])/trade["entry"]*100
-                        queue_send(f"EXIT Take Profit\n{ticker} {trade['strike']}{trade['type']} {trade['entry']:.2f} -> {price:.2f} +{profit:.0f}% drop from high")
+                        queue_send(f"🟡 خروج حوت - جني ربح\n🎯 {ticker} {trade['strike']}{trade['type']} ${trade['entry']:.2f} → ${price:.2f} (+{profit:.0f}%)\n💡 نزل 30% من القمة")
                         del active_trades[key]
                 except Exception:
                     continue
@@ -237,7 +237,7 @@ def gex_loop():
                     queue_send(rep)
                 last_gex_time=time.time()
             time.sleep(60)
-        except:
+        except Exception:
             time.sleep(60)
 
 def sniper_loop():
@@ -258,7 +258,7 @@ def sniper_loop():
                         for otype in ["calls","puts"]:
                             try:
                                 chain=getattr(tk.option_chain(exp),otype)
-                            except:
+                            except Exception:
                                 continue
                             if chain is None or chain.empty:
                                 continue
@@ -287,18 +287,18 @@ def sniper_loop():
                                     check_double_monster(dname,"HERO",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
                                 if price<=1.50 and vol>=max(oi*2.5,150) and above_ask>=80:
                                     check_double_monster(dname,"EXPLOSIVE",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                except:
+                except Exception:
                     continue
             time.sleep(45)
-        except:
+        except Exception:
             time.sleep(10)
 
 def main_loop():
     time.sleep(2)
     threading.Thread(target=send_worker,daemon=True).start()
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"<b>V29 FIXED - $10 MAX + EXIT + GEX</b>","parse_mode":"HTML"}, timeout=15)
-    except:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V29 عربي - $10 + خروج + GEX شغال</b>","parse_mode":"HTML"}, timeout=15)
+    except Exception:
         pass
     threading.Thread(target=sniper_loop,daemon=True).start()
     threading.Thread(target=check_whale_exit,daemon=True).start()
@@ -314,21 +314,21 @@ def main_loop():
                     continue
                 txt=msg.get("text","").lower()
                 if "/test" in txt:
-                    queue_send("V29 FIXED working")
+                    queue_send("🏆 V29 عربي ✅ شغال")
                 if "/gex" in txt:
                     rep=get_gex_report()
                     if rep:
                         queue_send(rep)
                 if "/status" in txt:
                     w=get_wave_state("SPX")
-                    queue_send(f"Active {len(active_trades)} Today {len(sent_today)} Wave {w['wave']}")
+                    queue_send(f"✅ نشط {len(active_trades)} صفقات | ارسل اليوم {len(sent_today)} | موجة {w['wave']}")
                 if "/clear" in txt:
                     double_sent.clear()
                     sent_today.clear()
                     active_trades.clear()
                     message_queue.clear()
-                    queue_send("Cleared")
-        except:
+                    queue_send("✅ تم المسح")
+        except Exception:
             time.sleep(3)
 
 threading.Thread(target=main_loop,daemon=True).start()
