@@ -1,84 +1,153 @@
-import requests, time
-from datetime import datetime, date, timedelta, timezone
+import yfinance as yf
+import requests
+import time
+import pandas as pd
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+
+# ============ الإعدادات ============
+BOT_TOKEN = "حط توكنك"
+CHAT_ID = "حط ايديك"
+KSA = timezone(timedelta(hours=3))
 
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
-BOT_TOKEN = "حط_التوكن_هنا"
-CHAT_ID = "حط_الايدي_هنا"
 
-CONFIG = {
-    "MIN_PREMIUM": 25000,
-    "MIN_VOL": 150,
-    "MIN_VOL_OI_RATIO": 1.5,
-    "MIN_SCORE": 5,
-    "MIN_DTE": 2,
-    "MAX_DTE": 14,
-    "MIN_DELTA": 0.45,
-}
+daily_top = defaultdict(list)
+daily_count = defaultdict(int)
+last_reset_day = datetime.now(KSA).day
 
-KSA = timezone(timedelta(hours=3))
-def now_ksa(): return datetime.now(KSA)
+def now_ksa():
+    return datetime.now(KSA)
 
-def calc_dte(expiry_str):
+def send_tg(msg, chart_path=None):
+    if chart_path:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+            data={"chat_id": CHAT_ID, "caption": msg, "parse_mode": "Markdown"},
+            files={"photo": open(chart_path, 'rb')})
+    else:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+def is_market_open_ksa():
+    now = now_ksa()
+    # 4:30 عصر - 11 مساء الرياض
+    return 16 <= now.hour <= 23 and now.weekday() < 5
+
+def get_gamma_wall(ticker):
+    stock = yf.Ticker(ticker)
+    price = stock.history(period="1d")['Close'].iloc[-1]
     try:
-        exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-        return (exp - now_ksa().date()).days
-    except: return 0
+        walls = []
+        for exp in stock.options[:2]:
+            chain = stock.option_chain(exp)
+            biggest = chain.calls.loc[chain.calls['openInterest'].idxmax()]
+            walls.append(biggest)
+        wall = sorted(walls, key=lambda x: x['openInterest'], reverse=True)[0]
+        return {'strike': wall['strike'], 'oi': wall['openInterest'], 'stock_price': price}
+    except:
+        return {'strike': price, 'oi': 0, 'stock_price': price}
 
-def send_tg(text):
-    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=5)
-    except: pass
+def plot_gamma_chart(ticker, wall):
+    stock = yf.Ticker(ticker)
+    price = wall['stock_price']
+    plt.figure(figsize=(10,5))
+    plt.bar([wall['strike']], [wall['oi']], color='red', alpha=0.7, width=1.5, label=f"حائط {wall['strike']} - {wall['oi']:,} عقد")
+    plt.axvline(price, color='green', linewidth=3, label=f'السعر {price:.2f}')
+    plt.axvspan(price, wall['strike'], color='gold', alpha=0.3, label='منطقة انفجار 💎')
+    plt.title(f"{ticker} - Level 4 Gamma Trap - {now_ksa().strftime('%I:%M %p')} KSA")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    path = f"/tmp/{ticker}_gamma.png"
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return path
 
-def explosion_score(t):
-    s=0
-    r=t['volume']/max(t['openInterest'],1)
-    if r>=5: s+=4
-    elif r>=3: s+=3
-    elif r>=1.5: s+=1
-    if t['premium']>=100000: s+=3
-    elif t['premium']>=50000: s+=2
-    elif t['premium']>=25000: s+=1
-    if t.get('ask_pct',0)>=80: s+=2
-    elif t.get('ask_pct',0)>=50: s+=1
-    if t['openInterest']<1500 and t['volume']>150: s+=1
-    return min(s,10)
+def get_flow_mock(ticker):
+    # هنا تحط كود الفلو الحقيقي حقك (Benzinga / UnusualWhales)
+    # هذا مثال
+    import random
+    return {
+        'premium': random.randint(20000, 150000),
+        'ask_pct': random.randint(60, 98),
+        'vol': random.randint(1000, 5000),
+        'oi': random.randint(500, 2000),
+        'strike': 180,
+        'option_price': 0.25,
+        'stock_price': get_gamma_wall(ticker)['stock_price']
+    }
 
-def is_valid(t):
-    if t['ticker'] not in TICKERS: return False
-    if not (CONFIG["MIN_DTE"] <= t.get('dte',0) <= CONFIG["MAX_DTE"]): return False
-    if t.get('delta',0) < CONFIG["MIN_DELTA"]: return False
-    if t['premium'] < CONFIG["MIN_PREMIUM"]: return False
-    if t['volume'] < CONFIG["MIN_VOL"]: return False
-    if t['volume']/max(t['openInterest'],1) < CONFIG["MIN_VOL_OI_RATIO"]: return False
-    if explosion_score(t) < CONFIG["MIN_SCORE"]: return False
-    return True
+# ============ اللوب الرئيسي ============
+send_tg(f"🚀 بوت V35 ليفل 4 اشتغل\n📊 13 شركة × 5 عقود = 65 توب يوميا\n⏰ {now_ksa().strftime('%d/%m %I:%M %p')} الرياض")
 
-def build_msg(t):
-    score = explosion_score(t)
-    if score >= 9: icon, desc = "💎", "حوت كبير جدا - لا تفوته"
-    elif score >= 7: icon, desc = "🔥", "انفجار قوي"
-    else: icon, desc = "💥", "انفجار متوسط"
+while True:
+    now = now_ksa()
+    if now.day!= last_reset_day and now.hour == 0:
+        daily_top.clear(); daily_count.clear()
+        last_reset_day = now.day
+        send_tg(f"🔄 تصفير يومي - جاهز لـ 65 عقد توب")
 
-    نوع = "شراء" if t['type']=="C" else "بيع"
-    return f"""{icon} *{desc} {score}/10*
-*الشركة:* `{t['ticker']}` - عقد {نوع}
-*السعر المستهدف:* `{t['strike']}` - ينتهي بعد `{t.get('dte',0)} يوم`
-*قوة العقد:* دلتا `{t.get('delta',0):.2f}` - ثابت ويرتفع
+    if not is_market_open_ksa():
+        time.sleep(60); continue
 
-*💰 حجم السيولة:* `${t['premium']:,.0f}`
-*📊 الحجم:* `{t['volume']}` / المفتوح `{t['openInterest']}` = `{t['volume']/max(t['openInterest'],1):.1f} ضعف`
-*⚡ الشراء:* فوق سعر الطلب `{t.get('ask_pct',0)}%` - مستعجل
-*💵 سعر العقد الان:* `${t['price']:.2f}`
+    for ticker in TICKERS:
+        if daily_count[ticker] >= 5: continue
 
-*⏰ {now_ksa().strftime('%I:%M:%S %p')} بتوقيت الرياض 🇸🇦*"""
+        flow = get_flow_mock(ticker)
+        wall = get_gamma_wall(ticker)
 
-def handle_trade(raw):
-    raw['dte'] = calc_dte(raw.get('expiry',''))
-    if not is_valid(raw): return
-    msg = build_msg(raw)
-    print(msg)
-    send_tg(msg)
+        dist = ((wall['strike'] - wall['stock_price'])/wall['stock_price'])*100 if wall['stock_price'] else 10
+        premium, ask_pct, vol, oi = flow['premium'], flow['ask_pct'], flow['vol'], flow['oi']
 
-if __name__ == "__main__":
-    send_tg(f"✅ *البوت اشتغل - رسائل عربية*\nالوقت: {now_ksa().strftime('%I:%M %p')} الرياض\nالشركات: {', '.join(TICKERS)}\nبيجيك 15-20 انفجار بالساعة وتختار اللي يعجبك")
-    while True: time.sleep(1)
+        score = 0
+        reasons = []
+        if premium >= 100000: score+=3; reasons.append(f"💰 ${premium/1000:.0f}K")
+        elif premium >= 50000: score+=2; reasons.append(f"💰 ${premium/1000:.0f}K")
+        if ask_pct >= 90: score+=3; reasons.append(f"🔥 {ask_pct}% Ask")
+        elif ask_pct >= 75: score+=2; reasons.append(f"🔥 {ask_pct}% Ask")
+        if vol/oi >= 3: score+=2; reasons.append(f"⚡ {vol/oi:.1f}x Vol/OI")
+        if 0.3 < dist < 1.8 and wall['oi'] > 15000:
+            score+=2; reasons.append(f"💎 حائط {wall['strike']} باقي {dist:.1f}% - تورط MM")
+
+        if score < 7: continue
+
+        data = {'score': score, 'premium': premium, 'wall': wall, 'dist': dist, 'reasons': reasons, **flow, 'sent': False}
+
+        # هل دخل توب 5؟
+        daily_top[ticker].append(data)
+        daily_top[ticker] = sorted(daily_top[ticker], key=lambda x: (x['score'], x['premium']), reverse=True)[:5]
+
+        if data in daily_top[ticker] and not data['sent'] and score >= 8:
+            level = "💎💎💎 ليفل 4 TOP 85%" if score>=9 and dist<1.5 else f"🔥 ليفل {score}/10"
+
+            forced = wall['oi']*100*0.5
+            chart = plot_gamma_chart(ticker, wall)
+
+            msg = f"""{level}
+{'█'*9} {score}/10
+
+*{ticker} - {flow['strike']}C @ ${flow['option_price']:.2f}*
+
+{' | '.join(reasons)}
+
+*💥 تورط صانع السوق:*
+حائط {wall['strike']} فيه {wall['oi']:,} عقد
+باقي {dist:.2f}% بس
+اذا كسر = مجبور يشتري {forced:,.0f} سهم
+
+*📊 الفلو:*
+${premium:,.0f} - {ask_pct}% Ask - Vol/OI {vol/oi:.1f}x
+
+*🎯 الخطة:*
+دخول ${flow['option_price']:.2f} قبله
+هدف +150% لما يكسر
+وقف -30%
+
+*⏰ {now.strftime('%I:%M %p')} الرياض - {daily_count[ticker]+1}/5 اليوم*
+*🏢 {ticker} - 13 شركة*"""
+
+            send_tg(msg, chart)
+            data['sent'] = True
+            daily_count[ticker] += 1
+
+    time.sleep(30)
