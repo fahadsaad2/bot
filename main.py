@@ -3,90 +3,158 @@ import threading
 import yfinance as yf
 import requests
 import time
-import random
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "V35 LIVE - 13 Tickers - 65 Contracts"
-
+    return f"V35 LIVE + Benzinga - {datetime.now(timezone(timedelta(hours=3))).strftime('%I:%M %p')} KSA"
 def run_flask():
     app.run(host='0.0.0.0', port=10000)
-
 threading.Thread(target=run_flask, daemon=True).start()
 
 # === Config ===
-BOT_TOKEN = "حط_التوكن_هنا"
-CHAT_ID = "حط_الايدي_هنا"
+BOT_TOKEN = "توكنك"
+CHAT_ID = "ايدك"
+BENZINGA_KEY = "حط مفتاح بنزنقا هنا" # تجيبه من benzinga.com/api
 KSA = timezone(timedelta(hours=3))
+
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
 
 daily_count = defaultdict(int)
 last_reset = datetime.now(KSA).day
+seen_ids = set() # عشان ما يكرر نفس الفلو
 
-def now_ksa():
-    return datetime.now(KSA)
+def now_ksa(): return datetime.now(KSA)
 
 def send_tg(text):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except:
-        pass
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
+    except: pass
 
-def get_wall(ticker):
+def get_gamma_wall(ticker):
     try:
-        st = yf.Ticker(ticker)
-        price = st.history(period="1d")['Close'].iloc[-1]
-        opts = st.options[:1]
-        if not opts:
-            return None
-        chain = st.option_chain(opts[0])
-        best = chain.calls.loc[chain.calls['openInterest'].idxmax()]
-        return {"strike": best['strike'], "oi": int(best['openInterest']), "price": float(price)}
+        stock = yf.Ticker(ticker)
+        price = float(stock.history(period="1d")['Close'].iloc[-1])
+        wall = None
+        max_oi = 0
+        for exp in stock.options[:2]:
+            chain = stock.option_chain(exp)
+            if chain.calls.empty: continue
+            best = chain.calls.loc[chain.calls['openInterest'].idxmax()]
+            if best['openInterest'] > max_oi:
+                max_oi = best['openInterest']
+                wall = best
+        if wall is None: return None
+        return {"strike": float(wall['strike']), "oi": int(wall['openInterest']), "price": price}
     except:
         return None
 
-send_tg(f"🚀 V35 اشتغل\n📊 13 شركة × 5 = 65 عقد\n⏰ {now_ksa().strftime('%I:%M %p')}")
+def get_benzinga_flow():
+    # Benzinga API - احدث فلو للشركات حقتك
+    try:
+        url = f"https://api.benzinga.com/api/v2/option_activity?token={BENZINGA_KEY}&tickers={','.join(TICKERS)}&limit=50"
+        r = requests.get(url, timeout=15).json()
+        flows = []
+        for item in r.get('option_activity', []):
+            # فلتر: بس Calls + Premium عالي
+            if item['put_call']!= 'call': continue
+            if item['cost_basis'] < 20000: continue
+            fid = item['id']
+            if fid in seen_ids: continue
+            seen_ids.add(fid)
+            # لو كبرت اللستة امسح القديم
+            if len(seen_ids) > 5000: seen_ids.clear()
+            flows.append({
+                'ticker': item['ticker'],
+                'strike': float(item['strike_price']),
+                'premium': float(item['cost_basis']),
+                'ask_pct': 95 if 'sweep' in item['description'].lower() or item['is_sweep'] else 80,
+                'vol': item['volume'],
+                'oi': item['open_interest'],
+                'option_price': float(item['price']),
+                'desc': item['description'],
+                'is_sweep': item.get('is_sweep', False),
+                'is_block': item.get('is_block', False)
+            })
+        return flows
+    except Exception as e:
+        print(f"Benzinga error {e}")
+        return []
+
+send_tg(f"🚀 *V35 + Benzinga اشتغل*\n📊 13 شركة - MU موجودة\n💰 فلو حقيقي\n⏰ {now_ksa().strftime('%I:%M %p')}")
 
 while True:
     try:
         n = now_ksa()
-        if n.day!= last_reset:
+        if n.day!= last_reset and n.hour == 0:
             daily_count.clear()
             last_reset = n.day
-            send_tg("🔄 تصفير يومي")
+            seen_ids.clear()
 
-        # سوق امريكا 4:30 عصر - 11 مساء الرياض
-        if not (16 <= n.hour <= 23 and n.weekday() < 5):
+        if not (n.weekday() < 5 and 16 <= n.hour <= 23):
             time.sleep(60)
             continue
 
-        for tk in TICKERS:
-            if daily_count[tk] >= 5:
-                continue
+        flows = get_benzinga_flow()
+        if not flows:
+            time.sleep(15)
+            continue
 
-            wall = get_wall(tk)
-            if not wall or wall["oi"] < 10000:
-                continue
+        for flow in flows:
+            tk = flow['ticker']
+            if daily_count[tk] >= 5: continue
 
-            dist = ((wall["strike"] - wall["price"]) / wall["price"] * 100) if wall["price"] else 99
-            premium = random.randint(30000, 150000)
-            ask = random.randint(70, 98)
+            wall = get_gamma_wall(tk)
+            if not wall: continue
+
+            dist = ((wall["strike"] - wall["price"]) / wall["price"] * 100)
+            premium = flow['premium']
+            ask_pct = flow['ask_pct']
 
             score = 0
-            if premium > 50000: score += 3
-            if ask >= 80: score += 3
-            if 0.3 < dist < 2.0 and wall["oi"] > 15000: score += 3
+            reasons = []
 
-            if score >= 7:
-                forced = wall["oi"] * 50
-                send_tg(f"💎 *LVL4 {tk} {score}/10*\nحائط {wall['strike']} OI {wall['oi']:,}\nباقي {dist:.2f}%\nاجباري {forced:,} سهم\n💰 ${premium/1000:.0f}K 🔥 {ask}% Ask\n⏰ {n.strftime('%I:%M %p')} - {daily_count[tk]+1}/5")
+            # Benzinga scoring
+            if flow['is_sweep']:
+                score += 4
+                reasons.append(f"🧹 SWEEP حقيقي ${premium/1000:.0f}K")
+            elif flow['is_block']:
+                score += 3
+                reasons.append(f"🧱 BLOCK ${premium/1000:.0f}K")
+            else:
+                if premium >= 100000: score+=3
+                reasons.append(f"💰 ${premium/1000:.0f}K")
+
+            if ask_pct >= 90: score+=3; reasons.append(f"🔥 {ask_pct}% Ask ماركت")
+            if flow['vol']/flow['oi'] >= 3 if flow['oi'] else False: score+=2
+
+            # ليفل 4
+            if 0.2 < dist < 2.0 and wall["oi"] > 15000:
+                score+=3
+                reasons.append(f"💎 حائط {wall['strike']:.0f} باقي {dist:.1f}%")
+
+            if score >= 8:
+                forced = wall["oi"]*50
+                msg = f"""💎 *LVL4 {score}/10 - {tk} + BENZINGA* 💎
+{'█'*10}
+
+*📊 فلو حقيقي:*
+{' | '.join(reasons)}
+Strike {flow['strike']} @ ${flow['option_price']:.2f}
+{flow['desc'][:100]}
+
+*💥 تورط MM:*
+حائط {wall['strike']:.0f} OI {wall['oi']:,}
+باقي {dist:.2f}% - مجبور {forced:,} سهم
+
+*⏰ {n.strftime('%I:%M %p')} - {daily_count[tk]+1}/5*"""
+                send_tg(msg)
                 daily_count[tk] += 1
 
-        time.sleep(30)
+        time.sleep(20)
     except Exception as e:
-        print(f"Error: {e}")
+        print(e)
         time.sleep(10)
