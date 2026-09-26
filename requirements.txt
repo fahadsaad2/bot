@@ -1,6 +1,7 @@
-yfinance
+yfinance==0.2.38
 requests
 pandas
 flask
+lxml
 
 
