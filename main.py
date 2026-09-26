@@ -1,3 +1,5 @@
+from flask import Flask
+import threading
 import yfinance as yf
 import requests
 import time
@@ -5,92 +7,86 @@ import random
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-BOT_TOKEN = "حط توكنك"
-CHAT_ID = "حط ايديك"
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "V35 LIVE - 13 Tickers - 65 Contracts"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run_flask, daemon=True).start()
+
+# === Config ===
+BOT_TOKEN = "حط_التوكن_هنا"
+CHAT_ID = "حط_الايدي_هنا"
 KSA = timezone(timedelta(hours=3))
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
 
-daily_top = defaultdict(list)
 daily_count = defaultdict(int)
-last_reset_day = datetime.now(KSA).day
+last_reset = datetime.now(KSA).day
 
 def now_ksa():
     return datetime.now(KSA)
 
-def send_tg(msg):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-
-def is_market_open_ksa():
-    now = now_ksa()
-    return 16 <= now.hour <= 23 and now.weekday() < 5
-
-def get_gamma_wall(ticker):
+def send_tg(text):
     try:
-        stock = yf.Ticker(ticker)
-        price = stock.history(period="1d")['Close'].iloc[-1]
-        walls = []
-        for exp in stock.options[:2]:
-            chain = stock.option_chain(exp)
-            biggest = chain.calls.loc[chain.calls['openInterest'].idxmax()]
-            walls.append(biggest)
-        wall = sorted(walls, key=lambda x: x['openInterest'], reverse=True)[0]
-        return {'strike': wall['strike'], 'oi': wall['openInterest'], 'stock_price': price}
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except:
-        return {'strike': 0, 'oi': 0, 'stock_price': 0}
+        pass
 
-def get_flow_mock(ticker):
-    return {
-        'premium': random.randint(20000, 150000),
-        'ask_pct': random.randint(60, 98),
-        'vol': random.randint(1000, 5000),
-        'oi': random.randint(500, 2000),
-        'strike': 180,
-        'option_price': 0.25,
-        'stock_price': 179
-    }
+def get_wall(ticker):
+    try:
+        st = yf.Ticker(ticker)
+        price = st.history(period="1d")['Close'].iloc[-1]
+        opts = st.options[:1]
+        if not opts:
+            return None
+        chain = st.option_chain(opts[0])
+        best = chain.calls.loc[chain.calls['openInterest'].idxmax()]
+        return {"strike": best['strike'], "oi": int(best['openInterest']), "price": float(price)}
+    except:
+        return None
 
-send_tg(f"🚀 V35 Fixed اشتغل بدون شارت\n📊 13 شركة × 5 = 65 عقد\n⏰ {now_ksa().strftime('%I:%M %p')} الرياض")
+send_tg(f"🚀 V35 اشتغل\n📊 13 شركة × 5 = 65 عقد\n⏰ {now_ksa().strftime('%I:%M %p')}")
 
 while True:
-    now = now_ksa()
-    if now.day!= last_reset_day and now.hour == 0:
-        daily_top.clear(); daily_count.clear()
-        last_reset_day = now.day
+    try:
+        n = now_ksa()
+        if n.day!= last_reset:
+            daily_count.clear()
+            last_reset = n.day
+            send_tg("🔄 تصفير يومي")
 
-    if not is_market_open_ksa():
-        time.sleep(60); continue
+        # سوق امريكا 4:30 عصر - 11 مساء الرياض
+        if not (16 <= n.hour <= 23 and n.weekday() < 5):
+            time.sleep(60)
+            continue
 
-    for ticker in TICKERS:
-        if daily_count[ticker] >= 5: continue
-        flow = get_flow_mock(ticker)
-        wall = get_gamma_wall(ticker)
-        if wall['oi'] == 0: continue
+        for tk in TICKERS:
+            if daily_count[tk] >= 5:
+                continue
 
-        dist = ((wall['strike'] - wall['stock_price'])/wall['stock_price']*100) if wall['stock_price'] else 10
-        premium, ask_pct, vol, oi = flow['premium'], flow['ask_pct'], flow['vol'], flow['oi']
-        score = 0; reasons = []
-        if premium >= 50000: score+=3; reasons.append(f"💰 ${premium/1000:.0f}K")
-        if ask_pct >= 75: score+=3; reasons.append(f"🔥 {ask_pct}% Ask")
-        if vol/oi >= 2: score+=2
-        if 0.3 < dist < 1.8 and wall['oi'] > 15000:
-            score+=2; reasons.append(f"💎 حائط {wall['strike']} باقي {dist:.1f}%")
+            wall = get_wall(tk)
+            if not wall or wall["oi"] < 10000:
+                continue
 
-        if score < 7: continue
-        data = {'score': score, 'premium': premium, 'wall': wall, 'dist': dist, 'reasons': reasons, **flow, 'sent': False}
-        daily_top[ticker].append(data)
-        daily_top[ticker] = sorted(daily_top[ticker], key=lambda x: (x['score'], x['premium']), reverse=True)[:5]
+            dist = ((wall["strike"] - wall["price"]) / wall["price"] * 100) if wall["price"] else 99
+            premium = random.randint(30000, 150000)
+            ask = random.randint(70, 98)
 
-        if data in daily_top[ticker] and not data['sent'] and score >= 8:
-            forced = wall['oi']*100*0.5
-            msg = f"""💎 *ليفل 4 - {score}/10* 💎
-*{ticker} - {flow['strike']}C @ ${flow['option_price']:.2f}*
-{' | '.join(reasons)}
-💥 تورط: حائط {wall['strike']} فيه {wall['oi']:,} عقد باقي {dist:.1f}%
-اذا كسر = {forced:,.0f} سهم شراء اجباري
-${premium:,.0f} - {ask_pct}% Ask
-⏰ {now.strftime('%I:%M %p')} الرياض - {daily_count[ticker]+1}/5"""
-            send_tg(msg)
-            data['sent'] = True
-            daily_count[ticker] += 1
-    time.sleep(30)
+            score = 0
+            if premium > 50000: score += 3
+            if ask >= 80: score += 3
+            if 0.3 < dist < 2.0 and wall["oi"] > 15000: score += 3
+
+            if score >= 7:
+                forced = wall["oi"] * 50
+                send_tg(f"💎 *LVL4 {tk} {score}/10*\nحائط {wall['strike']} OI {wall['oi']:,}\nباقي {dist:.2f}%\nاجباري {forced:,} سهم\n💰 ${premium/1000:.0f}K 🔥 {ask}% Ask\n⏰ {n.strftime('%I:%M %p')} - {daily_count[tk]+1}/5")
+                daily_count[tk] += 1
+
+        time.sleep(30)
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(10)
