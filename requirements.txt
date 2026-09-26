@@ -1,4 +1,6 @@
-flask
 yfinance
 requests
-pytz
+pandas
+flask
+
+
