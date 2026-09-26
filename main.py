@@ -1,335 +1,84 @@
-from flask import Flask
-import os, requests, threading, time
-from datetime import datetime
-import yfinance as yf
-from collections import deque
-import pytz
+import requests, time
+from datetime import datetime, date, timedelta, timezone
 
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "V29 ARABIC FIXED"
+TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
+BOT_TOKEN = "حط_التوكن_هنا"
+CHAT_ID = "حط_الايدي_هنا"
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CONFIG = {
+    "MIN_PREMIUM": 25000,
+    "MIN_VOL": 150,
+    "MIN_VOL_OI_RATIO": 1.5,
+    "MIN_SCORE": 5,
+    "MIN_DTE": 2,
+    "MAX_DTE": 14,
+    "MIN_DELTA": 0.45,
+}
 
-TICKERS = ["^GSPC","QQQ","IWM","DIA","AAPL","NVDA","MSFT","GOOGL","AMZN","TSLA","META","AMD","AVGO","MSTR","COIN","MU","SMCI","ARM","QCOM","RKLB","SNDK","NFLX","PLTR"]
-NAMES = {"^GSPC":"SPX"}
-INDEX_WAVE = ["SPX","QQQ","IWM","DIA"]
+KSA = timezone(timedelta(hours=3))
+def now_ksa(): return datetime.now(KSA)
 
-monster_memory = {"GOLDEN":{},"MEGA":{},"ULTRA":{},"MOMENTUM":{},"HERO":{},"EXPLOSIVE":{}}
-double_sent = {}
-message_queue = deque()
-rsi_cache = {}
-wave_cache = {}
-sent_today = set()
-active_trades = {}
-last_gex_time = 0
-last_reset_day = datetime.now().day
-
-KSA = pytz.timezone("Asia/Riyadh")
-ET = pytz.timezone("US/Eastern")
-
-def send_worker():
-    while True:
-        if message_queue:
-            t = message_queue.popleft()
-            try:
-                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML"}, timeout=15)
-            except Exception:
-                pass
-            time.sleep(1.2)
-        else:
-            time.sleep(0.2)
-
-def queue_send(t):
-    if len(message_queue) < 200:
-        message_queue.append(t)
-
-def get_rsi(sym):
+def calc_dte(expiry_str):
     try:
-        if sym in rsi_cache and time.time()-rsi_cache[sym]["t"] < 300:
-            return rsi_cache[sym]["v"]
-        hist=yf.Ticker(sym).history(period="14d")
-        if len(hist)<14:
-            return 50
-        delta=hist["Close"].diff()
-        gain=delta.where(delta>0,0).rolling(14).mean()
-        loss=-delta.where(delta<0,0).rolling(14).mean()
-        val=float(100-(100/(1+gain/loss)).iloc[-1])
-        rsi_cache[sym]={"v":val,"t":time.time()}
-        return val
-    except Exception:
-        return 50
+        exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        return (exp - now_ksa().date()).days
+    except: return 0
 
-def get_wave_state(sym):
-    try:
-        if sym in wave_cache and time.time()-wave_cache[sym]["t"] < 180:
-            return wave_cache[sym]["v"]
-        yf_sym = "^GSPC" if sym=="SPX" else sym
-        hist=yf.Ticker(yf_sym).history(period="5d", interval="5m")
-        if len(hist)<100:
-            return {"allow":True,"wave":"مومنتوم","fib":0}
-        high=hist["High"][-60:].max()
-        low=hist["Low"][-60:].min()
-        last=hist["Close"].iloc[-1]
-        swing=high-low
-        if swing==0:
-            return {"allow":True,"wave":"?","fib":0}
-        drop=(high-last)/swing*100
-        if 23 <= drop <= 50:
-            res={"allow":True,"wave":f"موجة 4 -> {drop:.0f}% جاهز","fib":drop}
-        elif drop < 23:
-            res={"allow":False,"wave":f"قمة موجة 3 ({drop:.0f}%) انتظار","fib":drop}
-        else:
-            res={"allow":True,"wave":f"تصحيح {drop:.0f}%","fib":drop}
-        wave_cache[sym]={"v":res,"t":time.time()}
-        return res
-    except Exception:
-        return {"allow":True,"wave":"?","fib":0}
+def send_tg(text):
+    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=5)
+    except: pass
 
-def get_above_ask(row):
-    try:
-        ask=float(row.get("ask",0))
-        last=float(row.get("lastPrice",0))
-        return 90 if ask>0 and last>=ask else 0
-    except Exception:
-        return 0
+def explosion_score(t):
+    s=0
+    r=t['volume']/max(t['openInterest'],1)
+    if r>=5: s+=4
+    elif r>=3: s+=3
+    elif r>=1.5: s+=1
+    if t['premium']>=100000: s+=3
+    elif t['premium']>=50000: s+=2
+    elif t['premium']>=25000: s+=1
+    if t.get('ask_pct',0)>=80: s+=2
+    elif t.get('ask_pct',0)>=50: s+=1
+    if t['openInterest']<1500 and t['volume']>150: s+=1
+    return min(s,10)
 
-def get_gex_report():
-    try:
-        tk=yf.Ticker("^GSPC")
-        if not tk.options:
-            return None
-        exp=tk.options[0]
-        chain=tk.option_chain(exp)
-        spot=tk.history(period="1d")["Close"].iloc[-1]
-        calls=chain.calls.fillna(0)
-        puts=chain.puts.fillna(0)
-        call_gex = (calls["openInterest"] * calls["lastPrice"] * 100).sum() / 1e9
-        put_gex = (puts["openInterest"] * puts["lastPrice"] * 100).sum() / 1e9
-        net_gex = call_gex - put_gex
-        call_wall = calls.loc[calls["openInterest"].idxmax()]["strike"] if not calls.empty else 0
-        put_wall = puts.loc[puts["openInterest"].idxmax()]["strike"] if not puts.empty else 0
-        flip = (call_wall + put_wall)/2
-        now=datetime.now(KSA).strftime("%d %b %Y • %I:%M %p KSA")
-        report = f"📈 <b>Gamma Exposure Report</b>\n\n🏷 Ticker : $SPX\n📅 Expiration : {exp}\n💰 Spot : ${spot:.2f}\n\nالسيولة:\n{'🟢' if net_gex>0 else '🔴'} Net GEX ${net_gex:.2f}B\n🟢 Call GEX ${call_gex:.2f}B\n🔴 Put GEX -${put_gex:.2f}B\n\nالجدران:\n🟢 Call Wall {call_wall:g}\n🔴 Put Wall {put_wall:g}\n\nالفاصل:\n⚖️ Gamma Flip {flip:.2f}\n\n🕒 {now}"
-        return report
-    except Exception as e:
-        print(f"GEX error {e}")
-        return None
+def is_valid(t):
+    if t['ticker'] not in TICKERS: return False
+    if not (CONFIG["MIN_DTE"] <= t.get('dte',0) <= CONFIG["MAX_DTE"]): return False
+    if t.get('delta',0) < CONFIG["MIN_DELTA"]: return False
+    if t['premium'] < CONFIG["MIN_PREMIUM"]: return False
+    if t['volume'] < CONFIG["MIN_VOL"]: return False
+    if t['volume']/max(t['openInterest'],1) < CONFIG["MIN_VOL_OI_RATIO"]: return False
+    if explosion_score(t) < CONFIG["MIN_SCORE"]: return False
+    return True
 
-def check_double_monster(ticker,typ,vol_k,strike,exp,price,opt_type,premium,row, above_ask=0):
-    global last_reset_day
-    if datetime.now().day!= last_reset_day:
-        sent_today.clear()
-        double_sent.clear()
-        active_trades.clear()
-        last_reset_day=datetime.now().day
+def build_msg(t):
+    score = explosion_score(t)
+    if score >= 9: icon, desc = "💎", "حوت كبير جدا - لا تفوته"
+    elif score >= 7: icon, desc = "🔥", "انفجار قوي"
+    else: icon, desc = "💥", "انفجار متوسط"
 
-    wave_text=""
-    if ticker in INDEX_WAVE:
-        wave=get_wave_state(ticker)
-        if not wave["allow"]:
-            return
-        wave_text=f"\n🌊 {wave['wave']}"
+    نوع = "شراء" if t['type']=="C" else "بيع"
+    return f"""{icon} *{desc} {score}/10*
+*الشركة:* `{t['ticker']}` - عقد {نوع}
+*السعر المستهدف:* `{t['strike']}` - ينتهي بعد `{t.get('dte',0)} يوم`
+*قوة العقد:* دلتا `{t.get('delta',0):.2f}` - ثابت ويرتفع
 
-    monster_memory[typ][ticker]={"time":time.time(),"vol":vol_k,"strike":strike,"exp":exp,"price":price,"type":opt_type,"premium":premium,"row":row,"above_ask":above_ask}
-    if above_ask<80:
-        return
+*💰 حجم السيولة:* `${t['premium']:,.0f}`
+*📊 الحجم:* `{t['volume']}` / المفتوح `{t['openInterest']}` = `{t['volume']/max(t['openInterest'],1):.1f} ضعف`
+*⚡ الشراء:* فوق سعر الطلب `{t.get('ask_pct',0)}%` - مستعجل
+*💵 سعر العقد الان:* `${t['price']:.2f}`
 
-    combos=[
-        (["GOLDEN","ULTRA"],"🏆 GOLDEN+ULTRA"),
-        (["ULTRA","MOMENTUM"],"🐳🚀 ULTRA+MOMENTUM"),
-        (["MEGA","MOMENTUM"],"🐋🔥 MEGA+MOMENTUM"),
-        (["GOLDEN","MOMENTUM"],"👑🔥 GOLDEN+MOMENTUM"),
-        (["EXPLOSIVE","MOMENTUM"],"💥 EXPLOSIVE+MOMENTUM"),
-        (["GOLDEN","HERO"],"⚡ GOLDEN+HERO")
-    ]
-    for combo,desc in combos:
-        if typ not in combo:
-            continue
-        if not all(ticker in monster_memory[c] for c in combo):
-            continue
-        times=[monster_memory[c][ticker]["time"] for c in combo]
-        if max(times)-min(times) > 600:
-            continue
-        ref=monster_memory[combo[0]][ticker]
-        for c in combo:
-            if monster_memory[c][ticker]["premium"]>ref["premium"]:
-                ref=monster_memory[c][ticker]
-        contract_key=f"{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}"
-        if contract_key in sent_today:
-            continue
-        base_key=f"DOUBLE_{ticker}_{ref['strike']}_{ref['exp']}_{ref['type']}_{'_'.join(combo)}"
-        if base_key in double_sent:
-            continue
-        if not (0.25 <= ref["price"] <= 10.0):
-            continue
-        try:
-            iv=float(ref["row"].get("impliedVolatility",0))*100
-            if not (10 <= iv <= 120):
-                continue
-        except Exception:
-            continue
-        rsi=get_rsi("^GSPC" if "SPX" in ticker else ticker)
-        if ref["type"]=="C" and rsi>55:
-            continue
-        if ref["type"]=="P" and rsi<65:
-            continue
-        double_sent[base_key]=time.time()
-        sent_today.add(contract_key)
-        active_trades[contract_key]={"entry":ref["price"],"strike":ref["strike"],"type":ref["type"],"ticker":ticker,"exp":ref["exp"],"high":ref["price"]}
-        entry=ref["price"]
-        if entry>3:
-            t1,t2,t3,stop = entry*1.3, entry*1.6, entry*2.2, entry*0.7
-        else:
-            t1,t2,t3,stop = entry*1.5, entry*2.0, entry*3.0, entry*0.65
-        total=sum(monster_memory[c][ticker]["vol"] for c in combo)
-        now_ksa=datetime.now(KSA)
-        display_strike = ref['strike']
-        if ticker=="SPX" and display_strike < 2000:
-            display_strike = display_strike*10
-        exp_occ = datetime.strptime(ref['exp'],"%Y-%m-%d").strftime("%y%m%d")
-        strike_occ = int(display_strike*1000)
-        occ_symbol = f"SPXW {exp_occ}{ref['type']}{strike_occ:08d}" if ticker=="SPX" else f"{ticker} {exp_occ}{ref['type']}{strike_occ:08d}"
-        queue_send(f"🚨 دخول حوت مزدوج 🚨\n\n🎯 {ticker} - {desc}{wave_text}\n💥 {float(display_strike):g}{ref['type']} - {ref['exp']}\n📋 عقد: <code>{occ_symbol}</code>\n✅ IV {iv:.0f}% | RSI {rsi:.0f} | فوق Ask {ref['above_ask']}% ✅\n💵 دخول: ${entry:.2f}\n🎯1: ${t1:.2f} 🎯2: ${t2:.2f} 🎯3: ${t3:.2f}\n🛑 وقف: ${stop:.2f}\n💰 ${total:,.0f}k\n⏰ {now_ksa.strftime('%H:%M:%S KSA')}")
+*⏰ {now_ksa().strftime('%I:%M:%S %p')} بتوقيت الرياض 🇸🇦*"""
 
-def check_whale_exit():
-    while True:
-        try:
-            time.sleep(60)
-            if not active_trades:
-                continue
-            for key, trade in list(active_trades.items()):
-                try:
-                    ticker=trade["ticker"]
-                    yf_sym="^GSPC" if ticker=="SPX" else ticker
-                    tk=yf.Ticker(yf_sym)
-                    if trade["exp"] not in tk.options:
-                        continue
-                    chain=getattr(tk.option_chain(trade["exp"]), "calls" if trade["type"]=="C" else "puts")
-                    row=chain[chain["strike"]==trade["strike"]]
-                    if row.empty:
-                        continue
-                    price=float(row.iloc[0]["lastPrice"])
-                    if price>trade["high"]:
-                        active_trades[key]["high"]=price
-                    if price <= trade["entry"]*0.7:
-                        queue_send(f"🔴 خروج حوت - وقف ضرب\n🎯 {ticker} {trade['strike']}{trade['type']} ${trade['entry']:.2f} → ${price:.2f} (-30%)")
-                        del active_trades[key]
-                    elif price <= trade["high"]*0.7 and price>trade["entry"]:
-                        profit=(price-trade["entry"])/trade["entry"]*100
-                        queue_send(f"🟡 خروج حوت - جني ربح\n🎯 {ticker} {trade['strike']}{trade['type']} ${trade['entry']:.2f} → ${price:.2f} (+{profit:.0f}%)\n💡 نزل 30% من القمة")
-                        del active_trades[key]
-                except Exception:
-                    continue
-        except Exception:
-            time.sleep(10)
+def handle_trade(raw):
+    raw['dte'] = calc_dte(raw.get('expiry',''))
+    if not is_valid(raw): return
+    msg = build_msg(raw)
+    print(msg)
+    send_tg(msg)
 
-def gex_loop():
-    global last_gex_time
-    while True:
-        try:
-            if time.time()-last_gex_time > 3600:
-                rep=get_gex_report()
-                if rep:
-                    queue_send(rep)
-                last_gex_time=time.time()
-            time.sleep(60)
-        except Exception:
-            time.sleep(60)
-
-def sniper_loop():
-    while True:
-        try:
-            today_et=datetime.now(ET).date()
-            for sym in TICKERS:
-                try:
-                    tk=yf.Ticker(sym)
-                    if not tk.options:
-                        continue
-                    dname=NAMES.get(sym,sym)
-                    for exp in tk.options[:2]:
-                        ed=datetime.strptime(exp,"%Y-%m-%d").date()
-                        if not (0 <= (ed-today_et).days <= 5):
-                            continue
-                        is_0dte=(ed==today_et)
-                        for otype in ["calls","puts"]:
-                            try:
-                                chain=getattr(tk.option_chain(exp),otype)
-                            except Exception:
-                                continue
-                            if chain is None or chain.empty:
-                                continue
-                            chain=chain.fillna(0)
-                            for _,r in chain.iterrows():
-                                vol=int(r["volume"]) if r["volume"] else 0
-                                price=float(r["lastPrice"]) if r["lastPrice"] else 0
-                                if price<=0 or vol<20:
-                                    continue
-                                if price>10.0:
-                                    continue
-                                oi=int(r["openInterest"]) if r["openInterest"] else 0
-                                prem_vol=float(vol*price*100)
-                                prem_oi=float(oi*price*100) if oi>0 else prem_vol
-                                opt_char="C" if otype=="calls" else "P"
-                                above_ask=get_above_ask(r)
-                                if prem_vol>1500000 and vol>200:
-                                    check_double_monster(dname,"ULTRA",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                                if prem_vol>500000 and vol>150:
-                                    check_double_monster(dname,"MEGA",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                                if prem_oi>100000 and vol>100:
-                                    check_double_monster(dname,"GOLDEN",prem_oi/1000,float(r["strike"]),exp,price,opt_char,prem_oi,r,above_ask)
-                                if vol/max(oi,1)>2.5 and vol>200:
-                                    check_double_monster(dname,"MOMENTUM",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                                if is_0dte and vol>30:
-                                    check_double_monster(dname,"HERO",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                                if price<=1.50 and vol>=max(oi*2.5,150) and above_ask>=80:
-                                    check_double_monster(dname,"EXPLOSIVE",prem_vol/1000,float(r["strike"]),exp,price,opt_char,prem_vol,r,above_ask)
-                except Exception:
-                    continue
-            time.sleep(45)
-        except Exception:
-            time.sleep(10)
-
-def main_loop():
-    time.sleep(2)
-    threading.Thread(target=send_worker,daemon=True).start()
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":"🏆 <b>V29 عربي - $10 + خروج + GEX شغال</b>","parse_mode":"HTML"}, timeout=15)
-    except Exception:
-        pass
-    threading.Thread(target=sniper_loop,daemon=True).start()
-    threading.Thread(target=check_whale_exit,daemon=True).start()
-    threading.Thread(target=gex_loop,daemon=True).start()
-    off=0
-    while True:
-        try:
-            res=requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={off+1}&timeout=30",timeout=35).json()
-            for u in res.get("result",[]):
-                off=u["update_id"]
-                msg=u.get("message",{})
-                if str(msg.get("chat",{}).get("id"))!=str(CHAT_ID):
-                    continue
-                txt=msg.get("text","").lower()
-                if "/test" in txt:
-                    queue_send("🏆 V29 عربي ✅ شغال")
-                if "/gex" in txt:
-                    rep=get_gex_report()
-                    if rep:
-                        queue_send(rep)
-                if "/status" in txt:
-                    w=get_wave_state("SPX")
-                    queue_send(f"✅ نشط {len(active_trades)} صفقات | ارسل اليوم {len(sent_today)} | موجة {w['wave']}")
-                if "/clear" in txt:
-                    double_sent.clear()
-                    sent_today.clear()
-                    active_trades.clear()
-                    message_queue.clear()
-                    queue_send("✅ تم المسح")
-        except Exception:
-            time.sleep(3)
-
-threading.Thread(target=main_loop,daemon=True).start()
-app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
+if __name__ == "__main__":
+    send_tg(f"✅ *البوت اشتغل - رسائل عربية*\nالوقت: {now_ksa().strftime('%I:%M %p')} الرياض\nالشركات: {', '.join(TICKERS)}\nبيجيك 15-20 انفجار بالساعة وتختار اللي يعجبك")
+    while True: time.sleep(1)
