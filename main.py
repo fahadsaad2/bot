@@ -5,156 +5,161 @@ import requests
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+import pandas as pd
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return f"V35 LIVE + Benzinga - {datetime.now(timezone(timedelta(hours=3))).strftime('%I:%M %p')} KSA"
+    return f"V35 FREE LVL4 - {datetime.now(timezone(timedelta(hours=3))).strftime('%I:%M %p')} KSA - 13 tickers"
 def run_flask():
     app.run(host='0.0.0.0', port=10000)
 threading.Thread(target=run_flask, daemon=True).start()
 
-# === Config ===
 BOT_TOKEN = "توكنك"
 CHAT_ID = "ايدك"
-BENZINGA_KEY = "حط مفتاح بنزنقا هنا" # تجيبه من benzinga.com/api
 KSA = timezone(timedelta(hours=3))
-
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
 
 daily_count = defaultdict(int)
 last_reset = datetime.now(KSA).day
-seen_ids = set() # عشان ما يكرر نفس الفلو
+sent_contracts = set()
 
 def now_ksa(): return datetime.now(KSA)
-
 def send_tg(text):
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
     except: pass
 
-def get_gamma_wall(ticker):
+def scan_ticker(tk):
     try:
-        stock = yf.Ticker(ticker)
-        price = float(stock.history(period="1d")['Close'].iloc[-1])
-        wall = None
+        stock = yf.Ticker(tk)
+        hist = stock.history(period="1d")
+        if hist.empty: return []
+        price = float(hist['Close'].iloc[-1])
+
+        # 1. جيب حائط Gamma
         max_oi = 0
+        wall_strike = 0
         for exp in stock.options[:2]:
             chain = stock.option_chain(exp)
             if chain.calls.empty: continue
             best = chain.calls.loc[chain.calls['openInterest'].idxmax()]
             if best['openInterest'] > max_oi:
-                max_oi = best['openInterest']
-                wall = best
-        if wall is None: return None
-        return {"strike": float(wall['strike']), "oi": int(wall['openInterest']), "price": price}
-    except:
-        return None
+                max_oi = int(best['openInterest'])
+                wall_strike = float(best['strike'])
 
-def get_benzinga_flow():
-    # Benzinga API - احدث فلو للشركات حقتك
-    try:
-        url = f"https://api.benzinga.com/api/v2/option_activity?token={BENZINGA_KEY}&tickers={','.join(TICKERS)}&limit=50"
-        r = requests.get(url, timeout=15).json()
-        flows = []
-        for item in r.get('option_activity', []):
-            # فلتر: بس Calls + Premium عالي
-            if item['put_call']!= 'call': continue
-            if item['cost_basis'] < 20000: continue
-            fid = item['id']
-            if fid in seen_ids: continue
-            seen_ids.add(fid)
-            # لو كبرت اللستة امسح القديم
-            if len(seen_ids) > 5000: seen_ids.clear()
-            flows.append({
-                'ticker': item['ticker'],
-                'strike': float(item['strike_price']),
-                'premium': float(item['cost_basis']),
-                'ask_pct': 95 if 'sweep' in item['description'].lower() or item['is_sweep'] else 80,
-                'vol': item['volume'],
-                'oi': item['open_interest'],
-                'option_price': float(item['price']),
-                'desc': item['description'],
-                'is_sweep': item.get('is_sweep', False),
-                'is_block': item.get('is_block', False)
-            })
-        return flows
+        if not max_oi: return []
+        dist_to_wall = ((wall_strike - price) / price * 100)
+
+        opportunities = []
+        # 2. افحص عقود الاسبوع هذا
+        for exp in stock.options[:2]:
+            chain = stock.option_chain(exp)
+            calls = chain.calls
+            if calls.empty: continue
+
+            # فلتر العقود الرخيصة والقريبة
+            calls = calls[(calls['strike'] >= price*0.95) & (calls['strike'] <= price*1.08)]
+
+            for _, c in calls.iterrows():
+                vol = int(c['volume']) if pd.notna(c['volume']) else 0
+                oi = int(c['openInterest']) if pd.notna(c['openInterest']) else 1
+                if oi == 0: oi = 1
+                if vol < 800: continue # حجم ضعيف تجاهله
+
+                vol_oi = vol / oi
+                contract_id = f"{tk}_{exp}_{c['strike']}"
+                if contract_id in sent_contracts: continue
+
+                score = 0
+                reasons = []
+
+                # Vol/OI انفجار = Sweep مجاني
+                if vol_oi >= 5:
+                    score += 4
+                    reasons.append(f"🧹 انفجار {vol_oi:.1f}x Vol/OI")
+                elif vol_oi >= 3:
+                    score += 3
+                    reasons.append(f"⚡ {vol_oi:.1f}x")
+                elif vol_oi >= 1.5:
+                    score += 1
+
+                # قرب من الحائط
+                dist_c = ((c['strike'] - price)/price*100)
+                if 0.1 < dist_c < 2.5 and max_oi > 15000:
+                    score += 4
+                    reasons.append(f"💎 حائط {wall_strike:.0f} باقي {dist_c:.1f}%")
+
+                # MU و SNDK نعطيها بوست لانها تتحرك بقوة
+                if tk in ["MU","SNDK","LITE"] and vol > 2000:
+                    score += 1
+                    reasons.append(f"🔥 {tk} مومنتوم")
+
+                if score >= 6: # 6 وفوق نرسل
+                    opportunities.append({
+                        "tk": tk,
+                        "strike": float(c['strike']),
+                        "price": float(c['lastPrice']) if pd.notna(c['lastPrice']) else 0,
+                        "vol": vol,
+                        "oi": oi,
+                        "vol_oi": vol_oi,
+                        "wall": wall_strike,
+                        "wall_oi": max_oi,
+                        "dist": dist_c,
+                        "score": score,
+                        "reasons": reasons,
+                        "id": contract_id,
+                        "stock_price": price
+                    })
+        return opportunities
     except Exception as e:
-        print(f"Benzinga error {e}")
+        print(f"{tk} err {e}")
         return []
 
-send_tg(f"🚀 *V35 + Benzinga اشتغل*\n📊 13 شركة - MU موجودة\n💰 فلو حقيقي\n⏰ {now_ksa().strftime('%I:%M %p')}")
+send_tg(f"🚀 *V35 المجاني اشتغل*\n📊 13 شركة MU موجودة\n🧠 سكانر Vol/OI + Gamma\n⏰ {now_ksa().strftime('%I:%M %p')}")
 
 while True:
     try:
         n = now_ksa()
-        if n.day!= last_reset and n.hour == 0:
+        if n.day!= last_reset and n.hour==0:
             daily_count.clear()
+            sent_contracts.clear()
             last_reset = n.day
-            seen_ids.clear()
 
-        if not (n.weekday() < 5 and 16 <= n.hour <= 23):
+        if not (n.weekday()<5 and 16 <= n.hour <= 23):
             time.sleep(60)
             continue
 
-        flows = get_benzinga_flow()
-        if not flows:
-            time.sleep(15)
-            continue
-
-        for flow in flows:
-            tk = flow['ticker']
+        for tk in TICKERS:
             if daily_count[tk] >= 5: continue
+            ops = scan_ticker(tk)
+            if not ops: continue
 
-            wall = get_gamma_wall(tk)
-            if not wall: continue
+            # خذ اقوى عقد فقط
+            best = sorted(ops, key=lambda x: x['score'], reverse=True)[0]
 
-            dist = ((wall["strike"] - wall["price"]) / wall["price"] * 100)
-            premium = flow['premium']
-            ask_pct = flow['ask_pct']
-
-            score = 0
-            reasons = []
-
-            # Benzinga scoring
-            if flow['is_sweep']:
-                score += 4
-                reasons.append(f"🧹 SWEEP حقيقي ${premium/1000:.0f}K")
-            elif flow['is_block']:
-                score += 3
-                reasons.append(f"🧱 BLOCK ${premium/1000:.0f}K")
-            else:
-                if premium >= 100000: score+=3
-                reasons.append(f"💰 ${premium/1000:.0f}K")
-
-            if ask_pct >= 90: score+=3; reasons.append(f"🔥 {ask_pct}% Ask ماركت")
-            if flow['vol']/flow['oi'] >= 3 if flow['oi'] else False: score+=2
-
-            # ليفل 4
-            if 0.2 < dist < 2.0 and wall["oi"] > 15000:
-                score+=3
-                reasons.append(f"💎 حائط {wall['strike']:.0f} باقي {dist:.1f}%")
-
-            if score >= 8:
-                forced = wall["oi"]*50
-                msg = f"""💎 *LVL4 {score}/10 - {tk} + BENZINGA* 💎
+            if best['score'] >= 7:
+                forced = best['wall_oi']*50
+                msg = f"""💎 *LVL4 {best['score']}/10 - {best['tk']} مجاني* 💎
 {'█'*10}
 
-*📊 فلو حقيقي:*
-{' | '.join(reasons)}
-Strike {flow['strike']} @ ${flow['option_price']:.2f}
-{flow['desc'][:100]}
+*📊 سكانر ذكي:*
+{' | '.join(best['reasons'])}
+Vol {best['vol']:,} | OI {best['oi']:,}
+عقد {best['strike']:.0f}C @ ${best['price']:.2f}
 
 *💥 تورط MM:*
-حائط {wall['strike']:.0f} OI {wall['oi']:,}
-باقي {dist:.2f}% - مجبور {forced:,} سهم
+حائط {best['wall']:.0f} فيه {best['wall_oi']:,} عقد
+سهم {best['tk']} سعره {best['stock_price']:.2f} باقي {best['dist']:.2f}%
+كسر = شراء {forced:,} سهم جبرا
 
 *⏰ {n.strftime('%I:%M %p')} - {daily_count[tk]+1}/5*"""
                 send_tg(msg)
                 daily_count[tk] += 1
+                sent_contracts.add(best['id'])
+                time.sleep(3)
 
-        time.sleep(20)
+        time.sleep(30)
     except Exception as e:
         print(e)
         time.sleep(10)
