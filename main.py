@@ -14,7 +14,7 @@ import pandas as pd
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "OPTIONS V4.1 - 7-30 DTE - 500 VOL - KSA"
+    return "OPTIONS V4.1 - FIXED - KSA"
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
@@ -23,16 +23,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 def send_tg(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        return False
+    if not BOT_TOKEN or not CHAT_ID: return False
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         r = requests.post(url, json=payload, timeout=15)
         return r.ok
     except Exception as e:
-        print(e)
-        return False
+        print(e); return False
 
 KSA = ZoneInfo("Asia/Riyadh")
 US_EASTERN = ZoneInfo("America/New_York")
@@ -41,7 +39,7 @@ def now_us(): return datetime.now(US_EASTERN)
 
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
 
-# ===== V4.1 FINAL =====
+# ===== V4.1 FINAL FIXED =====
 MAX_SIGNALS_PER_TICKER = 5
 MIN_VOLUME = 500
 MIN_OI = 100
@@ -55,7 +53,6 @@ MIN_SCORE = 70
 MIN_CONFIRMATIONS = 3
 SCAN_INTERVAL = 45
 MAX_EXPIRATIONS = 5
-# ======================
 
 STATE_FILE = "bot_state_v4.json"
 daily_count = defaultdict(int)
@@ -73,13 +70,11 @@ def load_state():
                 sent_contracts.update(data.get("sent_contracts", []))
                 last_state_date = now_ksa().date()
     except Exception as e: print(e)
-
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"date": str(now_ksa().date()), "daily_count": dict(daily_count), "sent_contracts": list(sent_contracts)}, f, ensure_ascii=False, indent=2)
     except Exception as e: print(e)
-
 load_state()
 
 def safe_float(v,d=0.0):
@@ -171,13 +166,21 @@ def calculate_walls(calls,puts):
     result={"call_wall":0,"call_wall_oi":0,"put_wall":0,"put_wall_oi":0}
     try:
         if not calls.empty:
-            c=calls.copy(); c["openInterest"]=pd.to_numeric(c["openInterest"],errors="coerce").fillna(0)
-            row=c.loc[c["openInterest"].idxmax(); result["call_wall"]=safe_float(row["strike"]); result["call_wall_oi"]=safe_int(row["openInterest"])
+            c=calls.copy()
+            c["openInterest"]=pd.to_numeric(c["openInterest"],errors="coerce").fillna(0)
+            idx = c["openInterest"].idxmax()
+            row = c.loc[idx]
+            result["call_wall"]=safe_float(row["strike"])
+            result["call_wall_oi"]=safe_int(row["openInterest"])
     except: pass
     try:
         if not puts.empty:
-            p=puts.copy(); p["openInterest"]=pd.to_numeric(p["openInterest"],errors="coerce").fillna(0)
-            row=p.loc[p["openInterest"].idxmax(); result["put_wall"]=safe_float(row["strike"]); result["put_wall_oi"]=safe_int(row["openInterest"])
+            p=puts.copy()
+            p["openInterest"]=pd.to_numeric(p["openInterest"],errors="coerce").fillna(0)
+            idx = p["openInterest"].idxmax()
+            row = p.loc[idx]
+            result["put_wall"]=safe_float(row["strike"])
+            result["put_wall_oi"]=safe_int(row["openInterest"])
     except: pass
     return result
 def normalize_iv(iv):
@@ -277,7 +280,7 @@ def scan_ticker(ticker):
     try:
         stock=yf.Ticker(ticker); hist=stock.history(period="3mo",interval="1d",auto_adjust=False)
         if hist.empty:
-            print(f"DEBUG {ticker}: hist empty - yfinance blocked"); return []
+            print(f"DEBUG {ticker}: hist empty"); return []
         stock_price=safe_float(hist["Close"].dropna().iloc[-1])
         if stock_price<=0: return []
         technical=technical_analysis(hist); expirations=stock.options
@@ -303,9 +306,9 @@ def scan_ticker(ticker):
             except Exception as e: print(f"Exp error {ticker} {expiration}: {e}")
         if results:
             best = sorted(results, key=lambda x: x["score"], reverse=True)[0]
-            print(f"DEBUG {ticker}: found {len(results)} - best {best['ticker']} {best['type']} {best['strike']} score {best['score']}")
+            print(f"DEBUG {ticker}: found {len(results)} - best score {best['score']}")
         else:
-            print(f"DEBUG {ticker}: found 0 contracts that pass filters")
+            print(f"DEBUG {ticker}: found 0")
         return results
     except Exception as e: print(f"Scan error {ticker}: {e}"); return []
 
@@ -314,7 +317,7 @@ def format_signal(x):
     breakeven=x["strike"]+x["premium"] if is_call else x["strike"]-x["premium"]
     reasons="\n".join(f"• {r}" for r in x["reasons"]); warnings=""
     if x["warnings"]: warnings="\n\n⚠️ ملاحظات:\n"+"\n".join(f"• {w}" for w in x["warnings"])
-    text=(f"{emoji} <b>OPTIONS V4.1 — {option_name}</b>\n\n📌 السهم: <b>{x['ticker']}</b>\n💰 سعر السهم: ${x['stock_price']:.2f}\n\n🎯 العقد: <b>{x['strike']:g}{'C' if is_call else 'P'}</b>\n📅 الانتهاء: {x['expiration']}\n⏳ DTE: {x['dte']} يوم (7-30)\n\n💵 Premium: ${x['premium']:.2f}\n↔️ Bid/Ask: ${x['bid']:.2f} / ${x['ask']:.2f}\n📐 Spread: {x['spread_pct']:.1f}%\n\n📊 Volume: {x['volume']:,}\n📦 OI: {x['oi']:,}\n🔥 Volume/OI: {x['vol_oi']:.1f}x\n🌡️ IV: {x['iv']*100:.1f}%\n\n📈 الاتجاه: {x['trend']}\n⚡ الزخم: {x['momentum']}\nRSI: {x['rsi']:.1f}\n📊 Volume Ratio: {x['volume_ratio']:.1f}x\n\n🧮 <b>Greeks</b>\nDelta: {x['delta']:.2f}\nGamma: {x['gamma']:.4f}\nTheta: {x['theta']:.4f}\nVega: {x['vega']:.4f}\n\n🧱 Call Wall: {x['call_wall']:g} ({x['call_wall_oi']:,})\n🧱 Put Wall: {x['put_wall']:g} ({x['put_wall_oi']:,})\n\n🟦 Support: ${x['support']:.2f}\n🟥 Resistance: ${x['resistance']:.2f}\n\n🎯 Break-even: ${breakeven:.2f}\n\n⭐ <b>قوة الإشارة: {x['score']}/100</b>\n✅ التأكيدات: {x['confirmations']}/{MIN_CONFIRMATIONS}\n\n🔎 <b>أسباب الإشارة:</b>\n{reasons}{warnings}\n\n🕐 السعودية: {now_ksa().strftime('%Y-%m-%d %H:%M:%S')}\n🇺🇸 السوق: {now_us().strftime('%H:%M ET')}\n\n⚠️ <i>تنبيه آلي تعليمي، وليس توصية استثمارية.</i>")
+    text=(f"{emoji} <b>OPTIONS V4.1 — {option_name}</b>\n\n📌 السهم: <b>{x['ticker']}</b>\n💰 سعر السهم: ${x['stock_price']:.2f}\n\n🎯 العقد: <b>{x['strike']:g}{'C' if is_call else 'P'}</b>\n📅 الانتهاء: {x['expiration']}\n⏳ DTE: {x['dte']} يوم\n\n💵 Premium: ${x['premium']:.2f}\n↔️ Bid/Ask: ${x['bid']:.2f} / ${x['ask']:.2f}\n📐 Spread: {x['spread_pct']:.1f}%\n\n📊 Volume: {x['volume']:,}\n📦 OI: {x['oi']:,}\n🔥 Volume/OI: {x['vol_oi']:.1f}x\n🌡️ IV: {x['iv']*100:.1f}%\n\n📈 الاتجاه: {x['trend']}\n⚡ الزخم: {x['momentum']}\nRSI: {x['rsi']:.1f}\n📊 Volume Ratio: {x['volume_ratio']:.1f}x\n\n🧮 <b>Greeks</b>\nDelta: {x['delta']:.2f}\nGamma: {x['gamma']:.4f}\nTheta: {x['theta']:.4f}\nVega: {x['vega']:.4f}\n\n🧱 Call Wall: {x['call_wall']:g} ({x['call_wall_oi']:,})\n🧱 Put Wall: {x['put_wall']:g} ({x['put_wall_oi']:,})\n\n🟦 Support: ${x['support']:.2f}\n🟥 Resistance: ${x['resistance']:.2f}\n\n🎯 Break-even: ${breakeven:.2f}\n\n⭐ <b>قوة الإشارة: {x['score']}/100</b>\n✅ التأكيدات: {x['confirmations']}/{MIN_CONFIRMATIONS}\n\n🔎 <b>أسباب الإشارة:</b>\n{reasons}{warnings}\n\n🕐 السعودية: {now_ksa().strftime('%Y-%m-%d %H:%M:%S')}\n🇺🇸 السوق: {now_us().strftime('%H:%M ET')}\n\n⚠️ <i>تنبيه آلي تعليمي، وليس توصية.</i>")
     return text
 
 def process_ticker(ticker):
@@ -333,7 +336,7 @@ def process_ticker(ticker):
         time.sleep(2); break
 
 def startup_message():
-    text=(f"🚀 <b>OPTIONS V4.1 اشتغل - 500 VOL - 70 SCORE</b>\n\n🇸🇦 التوقيت: السعودية\n🇺🇸 السوق: الولايات المتحدة\n\n{market_time_message()}\n\n🧠 <b>V4.1 FILTERS</b>\n📊 Volume: {MIN_VOLUME}+\n⭐ الحد الأدنى: {MIN_SCORE}/100\n✅ التأكيدات: {MIN_CONFIRMATIONS}\n⏳ DTE: {MIN_DTE}-{MAX_DTE} يوم\n\n⚠️ Scanner فقط.")
+    text=(f"🚀 <b>OPTIONS V4.1 FIXED</b>\n\n🇸🇦 السعودية\n🇺🇸 السوق: US\n\n{market_time_message()}\n\n📊 Volume: {MIN_VOLUME}+\n⭐ Score: {MIN_SCORE}+\n✅ Conf: {MIN_CONFIRMATIONS}\n⏳ DTE: {MIN_DTE}-{MAX_DTE}")
     send_tg(text)
 
 last_market_status=None
@@ -353,15 +356,3 @@ def reset_daily():
 startup_message()
 while True:
     try:
-        reset_daily(); send_market_status_if_changed()
-        if not is_us_market_open():
-            time.sleep(60); continue
-        print(f"\nOPTIONS V4.1 SCAN 7-30 500VOL - {now_ksa()}")
-        for ticker in TICKERS:
-            try:
-                if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: continue
-                process_ticker(ticker); time.sleep(2)
-            except Exception as e: print(f"خطأ {ticker}: {e}")
-        time.sleep(SCAN_INTERVAL)
-    except Exception as e:
-        print("MAIN ERROR:",e); time.sleep(15)
