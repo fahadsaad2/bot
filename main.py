@@ -14,7 +14,7 @@ import pandas as pd
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "OPTIONS V4.1 - VWAP EDITION"
+    return "OPTIONS V4.4 HYBRID - VOL 500 - SNDK LITE INCLUDED"
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
@@ -37,21 +37,21 @@ US_EASTERN = ZoneInfo("America/New_York")
 def now_ksa(): return datetime.now(KSA)
 def now_us(): return datetime.now(US_EASTERN)
 
-TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","APP","MU","QCOM","LITE"]
+TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","LITE","MU","QCOM","APP"]
 
-MAX_SIGNALS_PER_TICKER = 5
+MAX_SIGNALS_PER_TICKER = 3
 MIN_VOLUME = 500
-MIN_OI = 100
+MIN_OI = 500
 MIN_DTE = 7
-MAX_DTE = 30
-MAX_SPREAD_PCT = 15.0
-MIN_OPTION_PRICE = 0.10
-MIN_STRIKE_DISTANCE = -0.10
-MAX_STRIKE_DISTANCE = 0.10
-MIN_SCORE = 70
-MIN_CONFIRMATIONS = 3
+MAX_DTE = 21
+MAX_SPREAD_PCT = 8.0
+MIN_OPTION_PRICE = 0.40
+MIN_STRIKE_DISTANCE = -0.06
+MAX_STRIKE_DISTANCE = 0.06
+MIN_SCORE = 72
 SCAN_INTERVAL = 45
-MAX_EXPIRATIONS = 5
+MAX_EXPIRATIONS = 4
+EARNINGS_BUFFER_DAYS = 3
 
 STATE_FILE = "bot_state_v4.json"
 daily_count = defaultdict(int)
@@ -68,12 +68,12 @@ def load_state():
                 daily_count.update(data.get("daily_count", {}))
                 sent_contracts.update(data.get("sent_contracts", []))
                 last_state_date = now_ksa().date()
-    except Exception as e: print(e)
+    except: pass
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"date": str(now_ksa().date()), "daily_count": dict(daily_count), "sent_contracts": list(sent_contracts)}, f, ensure_ascii=False, indent=2)
-    except Exception as e: print(e)
+    except: pass
 load_state()
 
 def safe_float(v,d=0.0):
@@ -87,44 +87,68 @@ def safe_int(v,d=0):
         return int(float(v))
     except: return d
 def clamp(v,l,h): return max(l, min(h, v))
-def nth_weekday(year,month,weekday,n):
-    d=date(year,month,1); offset=(weekday-d.weekday())%7
+
+def nth_weekday(y,m,wd,n):
+    d=date(y,m,1); offset=(wd-d.weekday())%7
     return d+timedelta(days=offset+(n-1)*7)
-def last_weekday(year,month,weekday):
-    d=date(year+1,1,1)-timedelta(days=1) if month==12 else date(year,month+1,1)-timedelta(days=1)
-    offset=(d.weekday()-weekday)%7
+def last_weekday(y,m,wd):
+    d=date(y+1,1,1)-timedelta(days=1) if m==12 else date(y,m+1,1)-timedelta(days=1)
+    offset=(d.weekday()-wd)%7
     return d-timedelta(days=offset)
-def easter_sunday(year):
-    a=year%19; b=year//100; c=year%100; d=b//4; e=b%4; f=(b+8)//25; g=(b-f+1)//3
+def easter_sunday(y):
+    a=y%19; b=y//100; c=y%100; d=b//4; e=b%4; f=(b+8)//25; g=(b-f+1)//3
     h=(19*a+b-d-g+15)%30; i=c//4; k=c%4; l=(32+2*e+2*i-h-k)%7; m=(a+11*h+22*l)//451
     month=(h+l-7*m+114)//31; day=((h+l-7*m+114)%31)+1
-    return date(year,month,day)
+    return date(y,month,day)
 def observed_date(d):
     if d.weekday()==5: return d-timedelta(days=1)
     if d.weekday()==6: return d+timedelta(days=1)
     return d
-def us_market_holidays(year):
+def us_market_holidays(y):
     holidays=set()
-    holidays.add(observed_date(date(year,1,1))); holidays.add(nth_weekday(year,1,0,3))
-    holidays.add(nth_weekday(year,2,0,3)); easter=easter_sunday(year)
-    holidays.add(easter-timedelta(days=2)); holidays.add(last_weekday(year,5,0))
-    holidays.add(observed_date(date(year,6,19))); holidays.add(observed_date(date(year,7,4)))
-    holidays.add(nth_weekday(year,9,0,1)); holidays.add(nth_weekday(year,11,3,4))
-    holidays.add(observed_date(date(year,12,25)))
+    holidays.add(observed_date(date(y,1,1))); holidays.add(nth_weekday(y,1,0,3))
+    holidays.add(nth_weekday(y,2,0,3))
+    easter=easter_sunday(y); holidays.add(easter-timedelta(days=2))
+    holidays.add(last_weekday(y,5,0)); holidays.add(observed_date(date(y,6,19)))
+    holidays.add(observed_date(date(y,7,4))); holidays.add(nth_weekday(y,9,0,1))
+    holidays.add(nth_weekday(y,11,3,4)); holidays.add(observed_date(date(y,12,25)))
     return holidays
 def is_us_market_open():
-    current=now_us()
-    if current.weekday()>=5: return False
-    if current.date() in us_market_holidays(current.year): return False
-    start=datetime(current.year,current.month,current.day,9,30,tzinfo=US_EASTERN).time()
-    end=datetime(current.year,current.month,current.day,16,0,tzinfo=US_EASTERN).time()
-    return start <= current.time() < end
+    cur=now_us()
+    if cur.weekday()>=5: return False
+    if cur.date() in us_market_holidays(cur.year): return False
+    start=datetime(cur.year,cur.month,cur.day,9,30,tzinfo=US_EASTERN).time()
+    end=datetime(cur.year,cur.month,cur.day,16,0,tzinfo=US_EASTERN).time()
+    return start <= cur.time() < end
 def market_time_message():
     us=now_us(); ksa=now_ksa()
     return f"US: {us.strftime('%H:%M')} ET | KSA: {ksa.strftime('%H:%M')}"
-def calculate_dte(expiration):
-    try: exp_date=datetime.strptime(expiration,"%Y-%m-%d").date(); return (exp_date-now_us().date()).days
+def calculate_dte(exp):
+    try: return (datetime.strptime(exp,"%Y-%m-%d").date()-now_us().date()).days
     except: return 0
+
+def is_near_earnings(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        cal = stock.calendar
+        if cal is not None and not cal.empty and 'Earnings Date' in cal:
+            for edate in cal['Earnings Date']:
+                if isinstance(edate, date):
+                    diff=(edate-now_us().date()).days
+                    if 0 <= diff <= EARNINGS_BUFFER_DAYS: return True, diff
+    except: pass
+    return False, 0
+
+def calculate_atr(hist, period=14):
+    try:
+        df=hist.copy()
+        df['H-L']=df['High']-df['Low']
+        df['H-PC']=abs(df['High']-df['Close'].shift(1))
+        df['L-PC']=abs(df['Low']-df['Close'].shift(1))
+        df['TR']=df[['H-L','H-PC','L-PC']].max(axis=1)
+        return safe_float(df['TR'].rolling(period).mean().iloc[-1],1.0)
+    except: return 1.0
+
 def calculate_rsi(series,period=14):
     try:
         delta=series.diff(); gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
@@ -132,317 +156,184 @@ def calculate_rsi(series,period=14):
         rs=avg_gain/avg_loss.replace(0,math.nan); return 100-(100/(1+rs))
     except: return pd.Series(index=series.index,dtype=float)
 
-# ===== الجديد: VWAP + انتراداي =====
 def get_intraday_levels(ticker):
     try:
         df = yf.Ticker(ticker).history(period="1d", interval="1m", auto_adjust=False)
-        if df.empty or len(df) < 20: return None
-        df['PV'] = df['Close'] * df['Volume']
-        vwap = (df['PV'].cumsum() / df['Volume'].cumsum()).iloc[-1]
-        return {
-            "vwap": safe_float(vwap),
-            "day_low": safe_float(df['Low'].min()),
-            "day_high": safe_float(df['High'].max()),
-            "current": safe_float(df['Close'].iloc[-1])
-        }
+        if df.empty or len(df) < 5: return None
+        pv=df['Close']*df['Volume']
+        vwap=(pv.cumsum()/df['Volume'].cumsum()).iloc[-1]
+        return {"vwap":safe_float(vwap),"day_low":safe_float(df['Low'].min()),"day_high":safe_float(df['High'].max()),"current":safe_float(df['Close'].iloc[-1])}
     except: return None
 
 def technical_analysis(hist):
-    result={"trend":"NEUTRAL","momentum":"NEUTRAL","rsi":50.0,"ema20":0,"ema50":0,"support":0,"resistance":0,"volume_ratio":1.0}
+    result={"trend":"NEUTRAL","momentum":"NEUTRAL","rsi":50.0,"support":0,"resistance":0,"volume_ratio":1.0,"atr":1.0}
     try:
         close=hist["Close"].dropna(); volume=hist["Volume"].fillna(0)
-        if len(close)<50: return result
-        ema20=close.ewm(span=20,adjust=False).mean(); ema50=close.ewm(span=50,adjust=False).mean()
-        rsi=calculate_rsi(close,14); current=safe_float(close.iloc[-1]); e20=safe_float(ema20.iloc[-1]); e50=safe_float(ema50.iloc[-1])
-        current_rsi=safe_float(rsi.iloc[-1],50); recent=close.tail(20)
-        support=safe_float(recent.min()); resistance=safe_float(recent.max())
-        avg_volume=safe_float(volume.tail(20).mean()); current_volume=safe_float(volume.iloc[-1])
-        volume_ratio=current_volume/avg_volume if avg_volume>0 else 1
+        if len(close)<20: return result
+        ema20=close.ewm(span=20,adjust=False).mean(); ema50=close.ewm(span=min(50,len(close)),adjust=False).mean()
+        delta=close.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
+        rs=gain/loss.replace(0,math.nan); rsi=100-(100/(1+rs))
+        current=safe_float(close.iloc[-1]); e20=safe_float(ema20.iloc[-1]); e50=safe_float(ema50.iloc[-1]); crsi=safe_float(rsi.iloc[-1],50)
+        recent=close.tail(20)
+        avg_vol=safe_float(volume.tail(20).mean()); cur_vol=safe_float(volume.iloc[-1])
         trend="BULLISH" if current>e20>e50 else "BEARISH" if current<e20<e50 else "NEUTRAL"
-        momentum="BULLISH" if current_rsi>=55 and current>e20 else "BEARISH" if current_rsi<=45 and current<e20 else "NEUTRAL"
-        result={"trend":trend,"momentum":momentum,"rsi":current_rsi,"ema20":e20,"ema50":e50,"support":support,"resistance":resistance,"volume_ratio":volume_ratio}
-    except Exception as e: print(e)
+        momentum="BULLISH" if crsi>=52 and current>e20 else "BEARISH" if crsi<=48 and current<e20 else "NEUTRAL"
+        result={"trend":trend,"momentum":momentum,"rsi":crsi,"support":safe_float(recent.min()),"resistance":safe_float(recent.max()),"volume_ratio":cur_vol/avg_vol if avg_vol>0 else 1,"atr":calculate_atr(hist)}
+    except: pass
     return result
 
 def norm_cdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
 def norm_pdf(x): return math.exp(-0.5*x*x)/math.sqrt(2*math.pi)
-def calculate_greeks(stock_price,strike,iv,dte,option_type):
+def calculate_greeks(S,K,iv,dte,typ):
     try:
-        if stock_price<=0 or strike<=0 or iv<=0 or dte<=0: return {}
-        S=stock_price; K=strike; sigma=iv; T=dte/365; r=0.04; sqrt_t=math.sqrt(T)
-        d1=(math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*sqrt_t); d2=d1-sigma*sqrt_t
-        gamma=norm_pdf(d1)/(S*sigma*sqrt_t); vega=S*norm_pdf(d1)*sqrt_t/100
-        if option_type=="CALL":
-            delta=norm_cdf(d1); theta=(-(S*norm_pdf(d1)*sigma/(2*sqrt_t))-r*K*math.exp(-r*T)*norm_cdf(d2))/365
+        if S<=0 or K<=0 or iv<=0 or dte<=0: return {}
+        T=dte/365; r=0.04; sqrt_t=math.sqrt(T)
+        d1=(math.log(S/K)+(r+0.5*iv*iv)*T)/(iv*sqrt_t); d2=d1-iv*sqrt_t
+        gamma=norm_pdf(d1)/(S*iv*sqrt_t); vega=S*norm_pdf(d1)*sqrt_t/100
+        if typ=="CALL":
+            delta=norm_cdf(d1); theta=(-(S*norm_pdf(d1)*iv/(2*sqrt_t))-r*K*math.exp(-r*T)*norm_cdf(d2))/365
         else:
-            delta=norm_cdf(d1)-1; theta=(-(S*norm_pdf(d1)*sigma/(2*sqrt_t))+r*K*math.exp(-r*T)*norm_cdf(-d2))/365
+            delta=norm_cdf(d1)-1; theta=(-(S*norm_pdf(d1)*iv/(2*sqrt_t))+r*K*math.exp(-r*T)*norm_cdf(-d2))/365
         return {"delta":delta,"gamma":gamma,"theta":theta,"vega":vega}
     except: return {}
-def calculate_walls(calls, puts):
-    result = {"call_wall": 0, "call_wall_oi": 0, "put_wall": 0, "put_wall_oi": 0}
-    try:
-        if not calls.empty:
-            c = calls.copy()
-            c["openInterest"] = pd.to_numeric(c["openInterest"], errors="coerce").fillna(0)
-            idx = c["openInterest"].idxmax()
-            row = c.loc[idx]
-            result["call_wall"] = safe_float(row["strike"])
-            result["call_wall_oi"] = safe_int(row["openInterest"])
-    except Exception as e: print(f"wall call error {e}")
-    try:
-        if not puts.empty:
-            p = puts.copy()
-            p["openInterest"] = pd.to_numeric(p["openInterest"], errors="coerce").fillna(0)
-            idx = p["openInterest"].idxmax()
-            row = p.loc[idx]
-            result["put_wall"] = safe_float(row["strike"])
-            result["put_wall_oi"] = safe_int(row["openInterest"])
-    except Exception as e: print(f"wall put error {e}")
-    return result
 def normalize_iv(iv):
     iv=safe_float(iv)
-    if iv<=0: return 0
     if iv>5: iv/=100
     return iv
 def iv_score(iv):
-    iv_pct=iv*100
-    if 15<=iv_pct<=55: return 10
-    if 10<=iv_pct<=70: return 6
-    if iv_pct<=90: return 2
+    p=iv*100
+    if 15<=p<=55: return 10
+    if 10<=p<=70: return 6
+    if p<=90: return 2
     return 0
 
-def analyze_contract(ticker,stock_price,row,expiration,option_type,walls,technical,intraday):
+def analyze_contract(ticker,stock_price,row,expiration,option_type,technical,intraday):
     try:
         strike=safe_float(row.get("strike")); volume=safe_int(row.get("volume")); oi=safe_int(row.get("openInterest"))
         if strike<=0 or volume<MIN_VOLUME or oi<MIN_OI: return None
-        bid=safe_float(row.get("bid")); ask=safe_float(row.get("ask")); last_price=safe_float(row.get("lastPrice"))
-        premium=(bid+ask)/2 if bid>0 and ask>0 and ask>=bid else last_price
+        bid=safe_float(row.get("bid")); ask=safe_float(row.get("ask")); last=safe_float(row.get("lastPrice"))
+        premium=(bid+ask)/2 if bid>0 and ask>0 and ask>=bid else last
         if premium<MIN_OPTION_PRICE: return None
-        spread_pct=((ask-bid)/premium)*100 if bid>0 and ask>0 else 999
-        if spread_pct>MAX_SPREAD_PCT: return None
+        spread=((ask-bid)/premium*100) if bid>0 and ask>0 else 999
+        if spread>MAX_SPREAD_PCT: return None
         dte=calculate_dte(expiration)
         if dte<MIN_DTE or dte>MAX_DTE: return None
-        strike_distance=(strike-stock_price)/stock_price
-        if strike_distance<MIN_STRIKE_DISTANCE or strike_distance>MAX_STRIKE_DISTANCE: return None
+        dist=(strike-stock_price)/stock_price
+        if dist<MIN_STRIKE_DISTANCE or dist>MAX_STRIKE_DISTANCE: return None
         iv=normalize_iv(row.get("impliedVolatility"))
         if iv<=0: return None
-
-        # ===== فلتر VWAP الجديد =====
-        vwap = intraday["vwap"] if intraday else 0
-        if vwap > 0:
-            if option_type=="CALL" and stock_price < vwap: return None # CALL لازم فوق VWAP
-            if option_type=="PUT" and stock_price > vwap: return None # PUT لازم تحت VWAP
-
-        vol_oi=volume/max(oi,1); greeks=calculate_greeks(stock_price,strike,iv,dte,option_type)
-        delta=abs(safe_float(greeks.get("delta"))); score=0; confirmations=0; reasons=[]; warnings=[]
-
-        # VWAP bonus
-        if vwap > 0:
-            if option_type=="CALL" and stock_price > vwap:
-                score+=12; confirmations+=1; reasons.append(f"فوق VWAP ${vwap:.2f} ✅")
-            if option_type=="PUT" and stock_price < vwap:
-                score+=12; confirmations+=1; reasons.append(f"تحت VWAP ${vwap:.2f} ✅")
-
-        if option_type=="CALL":
-            if technical["trend"]=="BULLISH": score+=15; confirmations+=1; reasons.append("اتجاه صاعد")
-            elif technical["trend"]=="BEARISH": score-=15; warnings.append("الاتجاه ضد CALL")
-            if technical["momentum"]=="BULLISH": score+=10; confirmations+=1; reasons.append("زخم صاعد")
-            elif technical["momentum"]=="BEARISH": score-=10; warnings.append("الزخم ضد CALL")
-        else:
-            if technical["trend"]=="BEARISH": score+=15; confirmations+=1; reasons.append("اتجاه هابط")
-            elif technical["trend"]=="BULLISH": score-=15; warnings.append("الاتجاه ضد PUT")
-            if technical["momentum"]=="BEARISH": score+=10; confirmations+=1; reasons.append("زخم هابط")
-            elif technical["momentum"]=="BULLISH": score-=10; warnings.append("الزخم ضد PUT")
+        vwap=intraday["vwap"] if intraday else 0
+        if vwap>0:
+            if option_type=="CALL" and stock_price < vwap: return None
+            if option_type=="PUT" and stock_price > vwap: return None
+        greeks=calculate_greeks(stock_price,strike,iv,dte,option_type)
+        delta=abs(safe_float(greeks.get("delta")))
+        score=0; conf=0; reasons=[]
+        if vwap>0:
+            score+=15; conf+=1; reasons.append(f"{'فوق' if option_type=='CALL' else 'تحت'} VWAP ${vwap:.2f} ✅")
+        if technical["trend"]=="BULLISH" and option_type=="CALL": score+=15; conf+=1; reasons.append("اتجاه صاعد")
+        if technical["trend"]=="BEARISH" and option_type=="PUT": score+=15; conf+=1; reasons.append("اتجاه هابط")
+        if technical["momentum"]==("BULLISH" if option_type=="CALL" else "BEARISH"): score+=10; conf+=1; reasons.append(f"زخم {'صاعد' if option_type=='CALL' else 'هابط'}")
         rsi=technical["rsi"]
-        if option_type=="CALL":
-            if 50<=rsi<=68: score+=8; reasons.append(f"RSI مناسب {rsi:.0f}")
-            elif rsi>75: score-=5; warnings.append("RSI مرتفع")
-        else:
-            if 32<=rsi<=50: score+=8; reasons.append(f"RSI مناسب {rsi:.0f}")
-            elif rsi<25: score-=5; warnings.append("RSI منخفض جدا")
-        volume_ratio=technical["volume_ratio"]
-        if volume_ratio>=2: score+=10; confirmations+=1; reasons.append(f"Volume قوي {volume_ratio:.1f}x")
-        elif volume_ratio>=1.3: score+=6
-        if vol_oi>=5: score+=12; confirmations+=1; reasons.append(f"Volume/OI {vol_oi:.1f}x")
-        elif vol_oi>=3: score+=9
-        elif vol_oi>=2: score+=5
-        if volume>=10000: score+=10
-        elif volume>=5000: score+=7
-        elif volume>=1500: score+=4
-        if oi>=10000: score+=8
-        elif oi>=5000: score+=6
-        elif oi>=2000: score+=4
-        if spread_pct<=3: score+=12; confirmations+=1; reasons.append("سيولة ممتازة")
-        elif spread_pct<=6: score+=8
-        elif spread_pct<=10: score+=4
-        abs_distance=abs(strike_distance)
-        if abs_distance<=0.02: score+=10; reasons.append("Strike قريب من السعر")
-        elif abs_distance<=0.04: score+=7
-        elif abs_distance<=0.06: score+=4
-        if 10<=dte<=30: score+=8
-        elif 7<=dte<=30: score+=5
-        if 0.35<=delta<=0.65: score+=10; confirmations+=1; reasons.append(f"Delta مناسب {delta:.2f}")
-        elif 0.25<=delta<=0.75: score+=5
-        else: warnings.append(f"Delta بعيد {delta:.2f}")
-        iv_points=iv_score(iv); score+=iv_points
-        if iv_points>=6: reasons.append(f"IV مناسب {iv*100:.1f}%")
-        support=technical["support"]; resistance=technical["resistance"]
-        if option_type=="CALL" and resistance>0:
-            distance=(resistance-stock_price)/stock_price
-            if 0<=distance<=0.03: score+=5; reasons.append("قريب من مقاومة")
-        if option_type=="PUT" and support>0:
-            distance=(stock_price-support)/stock_price
-            if 0<=distance<=0.03: score+=5; reasons.append("قريب من دعم")
-
+        if 48<=rsi<=68 and option_type=="CALL": score+=8; reasons.append(f"RSI {rsi:.0f}")
+        if 32<=rsi<=52 and option_type=="PUT": score+=8; reasons.append(f"RSI {rsi:.0f}")
+        if technical["volume_ratio"]>=1.8: score+=8; reasons.append(f"Vol {technical['volume_ratio']:.1f}x")
+        vol_oi=volume/max(oi,1)
+        if vol_oi>=3: score+=10; conf+=1; reasons.append(f"Vol/OI {vol_oi:.1f}x")
+        if spread<=4: score+=8; conf+=1; reasons.append("سبريد ضيق")
+        if 0.35<=delta<=0.65: score+=10; conf+=1; reasons.append(f"Delta {delta:.2f}")
+        score+=iv_score(iv)
         score=int(clamp(score,0,100))
-        if score<MIN_SCORE or confirmations<MIN_CONFIRMATIONS: return None
-
-        # ===== حساب دخول / هدف / وقف =====
-        day_low = intraday["day_low"] if intraday else technical["support"]
-        day_high = intraday["day_high"] if intraday else technical["resistance"]
-
+        if score<MIN_SCORE or conf<3: return None
+        atr=technical["atr"]
         if option_type=="CALL":
-            stop_stock = day_low - 0.50
-            target_stock_1 = day_high
-            target_stock_2 = stock_price * 1.03
+            stop_stock=stock_price-atr*1.2
+            target_stock=stock_price+atr*1.8
         else:
-            stop_stock = day_high + 0.50
-            target_stock_1 = day_low
-            target_stock_2 = stock_price * 0.97
-
-        risk_pct = abs((stock_price - stop_stock)/stock_price*100) if stop_stock else 0
-        # فلتر: الوقف لازم اكبر من 0.8% عشان ما يكون ضيق زي $1
-        if risk_pct < 0.8: return None
-
+            stop_stock=stock_price+atr*1.2
+            target_stock=stock_price-atr*1.8
+        risk=abs((stock_price-stop_stock)/stock_price*100)
+        if risk<0.9: return None
         cid=f"{ticker}_{expiration}_{option_type}_{strike}"
-        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread_pct":spread_pct,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"confirmations":confirmations,"delta":greeks.get("delta",0),"gamma":greeks.get("gamma",0),"theta":greeks.get("theta",0),"vega":greeks.get("vega",0),"rsi":rsi,"trend":technical["trend"],"momentum":technical["momentum"],"volume_ratio":volume_ratio,"call_wall":walls["call_wall"],"call_wall_oi":walls["call_wall_oi"],"put_wall":walls["put_wall"],"put_wall_oi":walls["put_wall_oi"],"support":support,"resistance":resistance,"reasons":reasons,"warnings":warnings,
-                "vwap": vwap, "day_low": day_low, "day_high": day_high, "stop_stock": stop_stock, "target_stock_1": target_stock_1, "target_stock_2": target_stock_2, "risk_pct": risk_pct}
-    except Exception as e:
-        print(f"Contract error {ticker}: {e}"); return None
+        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread":spread,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"conf":conf,"delta":greeks.get("delta",0),"rsi":rsi,"vwap":vwap,"stop_stock":stop_stock,"target_stock":target_stock,"risk":risk,"reasons":reasons,"atr":atr}
+    except: return None
 
 def scan_ticker(ticker):
     try:
-        stock=yf.Ticker(ticker); hist=stock.history(period="3mo",interval="1d",auto_adjust=False)
+        has_earn,days=is_near_earnings(ticker)
+        if has_earn:
+            print(f"⚠️ {ticker} ارباح بعد {days} يوم - تخطي")
+            return []
+        stock=yf.Ticker(ticker)
+        hist=stock.history(period="1mo",interval="1d",auto_adjust=False)
         if hist.empty: return []
-        stock_price=safe_float(hist["Close"].dropna().iloc[-1])
-        if stock_price<=0: return []
-        technical=technical_analysis(hist)
-        intraday = get_intraday_levels(ticker) # جديد
-        expirations=stock.options
-        if not expirations: return []
-        valid_expirations=[]
-        for exp in expirations:
-            dte=calculate_dte(exp)
-            if MIN_DTE<=dte<=MAX_DTE: valid_expirations.append(exp)
-        valid_expirations=valid_expirations[:MAX_EXPIRATIONS]; results=[]
-        for expiration in valid_expirations:
+        price=safe_float(hist["Close"].dropna().iloc[-1])
+        tech=technical_analysis(hist); intra=get_intraday_levels(ticker)
+        if not intra: return []
+        results=[]
+        for exp in stock.options[:MAX_EXPIRATIONS]:
+            if calculate_dte(exp)<MIN_DTE or calculate_dte(exp)>MAX_DTE: continue
             try:
-                chain=stock.option_chain(expiration); calls=chain.calls; puts=chain.puts
-                if calls.empty and puts.empty: continue
-                walls=calculate_walls(calls,puts)
-                if not calls.empty:
-                    for _,row in calls.iterrows():
-                        r=analyze_contract(ticker,stock_price,row,expiration,"CALL",walls,technical,intraday)
-                        if r: results.append(r)
-                if not puts.empty:
-                    for _,row in puts.iterrows():
-                        r=analyze_contract(ticker,stock_price,row,expiration,"PUT",walls,technical,intraday)
-                        if r: results.append(r)
-            except Exception as e: print(f"Exp error {ticker} {expiration}: {e}")
+                chain=stock.option_chain(exp)
+                for _,row in chain.calls.iterrows():
+                    r=analyze_contract(ticker,price,row,exp,"CALL",tech,intra)
+                    if r: results.append(r)
+                for _,row in chain.puts.iterrows():
+                    r=analyze_contract(ticker,price,row,exp,"PUT",tech,intra)
+                    if r: results.append(r)
+            except: pass
         return results
-    except Exception as e: print(f"Scan error {ticker}: {e}"); return []
+    except: return []
 
 def format_signal(x):
-    is_call=x["type"]=="CALL"; emoji="🟢" if is_call else "🔴"; option_name="CALL" if is_call else "PUT"
-    breakeven=x["strike"]+x["premium"] if is_call else x["strike"]-x["premium"]
-    reasons="\n".join(f"• {r}" for r in x["reasons"]); warnings=""
-    if x["warnings"]: warnings="\n\n⚠️ ملاحظات:\n"+"\n".join(f"• {w}" for w in x["warnings"])
-
-    # دخول / هدف / وقف
-    entry_premium = x['premium']
-    stop_premium = round(entry_premium*0.65,2)
-    target_premium = round(entry_premium*1.80,2)
-    entry_stock = x['stock_price']
-
-    text=(f"{emoji} <b>OPTIONS V4.1 VWAP — {option_name}</b>\n\n"
-          f"📌 السهم: <b>{x['ticker']}</b> - ${entry_stock:.2f}\n"
-          f"📊 VWAP: ${x['vwap']:.2f} {'✅ فوق' if is_call else '✅ تحت'}\n"
-          f"📉 لو اليوم: ${x['day_low']:.2f} | هاي: ${x['day_high']:.2f}\n\n"
-          f"🎯 العقد: <b>{x['strike']:g}{'C' if is_call else 'P'}</b>\n"
-          f"📅 الانتهاء: {x['expiration']} | ⏳ DTE: {x['dte']}\n\n"
-          f"💰 <b>دخول السهم: ${entry_stock:.2f}</b>\n"
-          f"🎯 هدف سهم 1: ${x['target_stock_1']:.2f}\n"
-          f"🎯 هدف سهم 2: ${x['target_stock_2']:.2f} ({'+3%' if is_call else '-3%'})\n"
-          f"🛑 وقف سهم: كسر ${x['stop_stock']:.2f} ({x['risk_pct']:.1f}%)\n\n"
-          f"💵 دخول عقد: ${entry_premium:.2f}\n"
-          f"🛑 وقف عقد: ${stop_premium:.2f} (-35%)\n"
-          f"🎯 هدف عقد: ${target_premium:.2f} (+80%)\n"
-          f"🎯 Break-even: ${breakeven:.2f}\n\n"
-          f"💵 Premium: ${x['premium']:.2f} | Spread: {x['spread_pct']:.1f}%\n"
-          f"📊 Vol: {x['volume']:,} | OI: {x['oi']:,} | Vol/OI: {x['vol_oi']:.1f}x\n"
-          f"🌡️ IV: {x['iv']*100:.1f}% | Delta: {x['delta']:.2f}\n\n"
-          f"⭐ <b>سكور: {x['score']}/100</b> | ✅ {x['confirmations']}/{MIN_CONFIRMATIONS}\n\n"
-          f"🔎 <b>أسباب:</b>\n{reasons}{warnings}\n\n"
-          f"🕐 KSA: {now_ksa().strftime('%H:%M:%S')}\n"
-          f"⚠️ <i>تعليمي فقط</i>")
+    is_call=x["type"]=="CALL"
+    entry=x['premium']; stop_o=round(entry*0.60,2); target_o=round(entry*1.80,2)
+    be=x['strike']+entry if is_call else x['strike']-entry
+    reasons="\n".join(f"• {r}" for r in x['reasons'])
+    text=(f"{'🟢' if is_call else '🔴'} <b>HYBRID V4.4 — {x['type']}</b>\n\n"
+          f"📌 <b>{x['ticker']}</b> ${x['stock_price']:.2f}\n"
+          f"📊 VWAP ${x['vwap']:.2f} {'✅ فوق' if is_call else '✅ تحت'} | ATR ${x['atr']:.2f}\n\n"
+          f"🎯 <b>{x['strike']:g}{'C' if is_call else 'P'}</b> | {x['expiration']} DTE {x['dte']}\n\n"
+          f"💰 <b>دخول سهم ${x['stock_price']:.2f}</b>\n"
+          f"🎯 هدف سهم ${x['target_stock']:.2f}\n"
+          f"🛑 وقف سهم ${x['stop_stock']:.2f} ({x['risk']:.1f}%)\n\n"
+          f"💵 عقد ${entry:.2f} | وقف ${stop_o} (-40%) | هدف ${target_o} (+80%)\n"
+          f"🎯 Break-even ${be:.2f}\n\n"
+          f"📊 Vol {x['volume']:,} | OI {x['oi']:,} | Spread {x['spread']:.1f}%\n"
+          f"🌡️ IV {x['iv']*100:.1f}% | Delta {x['delta']:.2f} | RSI {x['rsi']:.0f}\n\n"
+          f"⭐ <b>سكور {x['score']}/100</b> ✅{x['conf']}\n"
+          f"{reasons}\n\n"
+          f"🕐 {now_ksa().strftime('%H:%M KSA')}")
     return text
 
 def process_ticker(ticker):
     if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: return
-    results=scan_ticker(ticker)
-    if not results:
-        # رسالة debug عشان تعرف ليش مافي اشارة
-        intra = get_intraday_levels(ticker)
-        if intra:
-            print(f"DEBUG {ticker}: ${intra['current']:.2f} vs VWAP ${intra['vwap']:.2f} - 0 signals")
-        return
-    results.sort(key=lambda x: (x["score"],x["confirmations"],x["vol_oi"],x["volume"]), reverse=True)
-    for result in results:
-        if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: break
-        cid=result["id"]
-        if cid in sent_contracts: continue
-        message=format_signal(result)
-        if not send_tg(message): continue
-        sent_contracts.add(cid); daily_count[ticker]+=1; save_state()
-        print(f"✅ ارسل {ticker} {result['type']} {result['strike']} سكور {result['score']} وقف ${result['stop_stock']:.2f} ({result['risk_pct']:.1f}%)")
-        time.sleep(2); break
+    res=scan_ticker(ticker)
+    if not res: return
+    res.sort(key=lambda x: (x["score"],x["volume"]), reverse=True)
+    for r in res:
+        if r["id"] in sent_contracts: continue
+        if send_tg(format_signal(r)):
+            sent_contracts.add(r["id"]); daily_count[ticker]+=1; save_state()
+            print(f"✅ {ticker} {r['type']} {r['strike']} سكور {r['score']} وقف {r['risk']:.1f}%")
+            break
 
 def startup_message():
-    text=(f"🚀 <b>OPTIONS V4.1 VWAP FIXED</b>\n\n"
-          f"🇸🇦 السعودية | {market_time_message()}\n\n"
-          f"📊 Volume: {MIN_VOLUME}+ | Score: {MIN_SCORE}+\n"
-          f"📈 VWAP فلتر مفعل ✅\n"
-          f"🛑 وقف: لو اليوم -0.50 (1%+)\n"
-          f"💰 دخول/هدف/وقف عقد وسهم\n"
-          f"⏳ DTE: {MIN_DTE}-{MAX_DTE}")
-    send_tg(text)
-
-last_market_status=None
-def send_market_status_if_changed():
-    global last_market_status
-    status=is_us_market_open()
-    if status==last_market_status: return
-    last_market_status=status
-    send_tg(f"{'🟢 <b>السوق مفتوح</b>' if status else '🔴 <b>السوق مغلق</b>'}\n\n{market_time_message()}")
-
-def reset_daily():
-    global last_state_date
-    today=now_ksa().date()
-    if today!=last_state_date:
-        daily_count.clear(); sent_contracts.clear(); last_state_date=today; save_state()
+    send_tg(f"🚀 <b>HYBRID V4.4 VOL 500 READY</b>\n📋 {', '.join(TICKERS)}\n\nVol {MIN_VOLUME}+ | OI {MIN_OI}+ | Score {MIN_SCORE}+\nDTE {MIN_DTE}-{MAX_DTE} | Strike ±6%\nATR وقف ✅ | VWAP ✅ | ارباح ✅\n\n{market_time_message()}")
 
 startup_message()
 while True:
     try:
-        reset_daily(); send_market_status_if_changed()
+        if now_ksa().date()!=last_state_date:
+            daily_count.clear(); sent_contracts.clear(); last_state_date=now_ksa().date(); save_state()
         if not is_us_market_open():
             time.sleep(60); continue
-        print(f"\nSCAN V4.1 VWAP - {now_ksa()}")
-        for ticker in TICKERS:
+        print(f"\nSCAN HYBRID {now_ksa().strftime('%H:%M:%S')}")
+        for t in TICKERS:
             try:
-                if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: continue
-                process_ticker(ticker); time.sleep(2)
-            except Exception as e: print(f"خطأ {ticker}: {e}")
+                if daily_count[t]<MAX_SIGNALS_PER_TICKER:
+                    process_ticker(t); time.sleep(1.5)
+            except Exception as e: print(e)
         time.sleep(SCAN_INTERVAL)
     except Exception as e:
-        print("MAIN ERROR:",e); time.sleep(15)
+        print("MAIN",e); time.sleep(15)
