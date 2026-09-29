@@ -15,8 +15,10 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "البوت الهجين V4.5 شغال - فوليوم 500 - فلتر SPY"
+
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
 threading.Thread(target=run_flask, daemon=True).start()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -36,8 +38,10 @@ def send_tg(text):
 
 KSA = ZoneInfo("Asia/Riyadh")
 US_EASTERN = ZoneInfo("America/New_York")
+
 def now_ksa():
     return datetime.now(KSA)
+
 def now_us():
     return datetime.now(US_EASTERN)
 
@@ -117,9 +121,20 @@ def last_weekday(y,m,wd):
     return d-timedelta(days=offset)
 
 def easter_sunday(y):
-    a=y%19; b=y//100; c=y%100; d=b//4; e=b%4; f=(b+8)//25; g=(b-f+1)//3
-    h=(19*a+b-d-g+15)%30; i=c//4; k=c%4; l=(32+2*e+2*i-h-k)%7; m=(a+11*h+22*l)//451
-    month=(h+l-7*m+114)//31; day=((h+l-7*m+114)%31)+1
+    a=y%19
+    b=y//100
+    c=y%100
+    d=b//4
+    e=b%4
+    f=(b+8)//25
+    g=(b-f+1)//3
+    h=(19*a+b-d-g+15)%30
+    i=c//4
+    k=c%4
+    l=(32+2*e+2*i-h-k)%7
+    m=(a+11*h+22*l)//451
+    month=(h+l-7*m+114)//31
+    day=((h+l-7*m+114)%31)+1
     return date(y,month,day)
 
 def observed_date(d):
@@ -155,7 +170,8 @@ def is_us_market_open():
     return start <= cur.time() < end
 
 def market_time_message():
-    us=now_us(); ksa=now_ksa()
+    us=now_us()
+    ksa=now_ksa()
     return f"توقيت امريكا: {us.strftime('%H:%M')} | السعودية: {ksa.strftime('%H:%M')}"
 
 def calculate_dte(exp):
@@ -181,8 +197,8 @@ def get_spy_trend():
         if price < v and price < e:
             return "BEARISH"
         return "NEUTRAL"
-    except Exception as e:
-        print(f"SPY Error {e}")
+    except Exception as ex:
+        print(f"SPY Error {ex}")
         return "NEUTRAL"
 
 def is_near_earnings(ticker):
@@ -259,7 +275,9 @@ def calculate_greeks(S,K,iv,dte,typ):
     try:
         if S<=0 or K<=0 or iv<=0 or dte<=0:
             return {}
-        T=dte/365; r=0.04; sqrt_t=math.sqrt(T)
+        T=dte/365
+        r=0.04
+        sqrt_t=math.sqrt(T)
         d1=(math.log(S/K)+(r+0.5*iv*iv)*T)/(iv*sqrt_t)
         d2=d1-iv*sqrt_t
         gamma=norm_pdf(d1)/(S*iv*sqrt_t)
@@ -296,39 +314,163 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,technical,int
             return None
         if spy_trend == "BULLISH" and option_type == "PUT":
             return None
+
         strike=safe_float(row.get("strike"))
         volume=safe_int(row.get("volume"))
         oi=safe_int(row.get("openInterest"))
+
         if strike<=0 or volume<MIN_VOLUME or oi<MIN_OI:
             return None
+
         bid=safe_float(row.get("bid"))
         ask=safe_float(row.get("ask"))
         last=safe_float(row.get("lastPrice"))
-        premium=(bid+ask)/2 if bid>0 and ask>0 and ask>=bid else last
+
+        if bid>0 and ask>0 and ask>=bid:
+            premium=(bid+ask)/2
+        else:
+            premium=last
+
         if premium<MIN_OPTION_PRICE:
             return None
-        spread=((ask-bid)/premium*100) if bid>0 and ask>0 else 999
+
+        if bid>0 and ask>0:
+            spread=(ask-bid)/premium*100
+        else:
+            spread=999
+
         if spread>MAX_SPREAD_PCT:
             return None
+
         dte=calculate_dte(expiration)
         if dte<MIN_DTE or dte>MAX_DTE:
             return None
+
         dist=(strike-stock_price)/stock_price
         if dist<MIN_STRIKE_DISTANCE or dist>MAX_STRIKE_DISTANCE:
             return None
+
         iv=normalize_iv(row.get("impliedVolatility"))
         if iv<=0:
             return None
+
         vwap=intraday["vwap"] if intraday else 0
         if vwap>0:
             if option_type=="CALL" and stock_price < vwap:
                 return None
             if option_type=="PUT" and stock_price > vwap:
                 return None
+
         greeks=calculate_greeks(stock_price,strike,iv,dte,option_type)
         delta=abs(safe_float(greeks.get("delta")))
-        score=0; conf=0; reasons=[]
+        
+        score=0
+        conf=0
+        reasons=[]
+
         if spy_trend!="NEUTRAL":
-            score+=10; conf+=1; reasons.append(f"اتجاه السوق {spy_trend} متوافق ✅")
+            score+=10
+            conf+=1
+            reasons.append(f"اتجاه السوق {spy_trend} متوافق")
+
         if vwap>0:
-            score+=15; conf+=1;
+            score+=15
+            conf+=1
+            if option_type=="CALL":
+                reasons.append(f"فوق VWAP ${vwap:.2f}")
+            else:
+                reasons.append(f"تحت VWAP ${vwap:.2f}")
+
+        if technical["trend"]=="BULLISH" and option_type=="CALL":
+            score+=15
+            conf+=1
+            reasons.append("اتجاه صاعد قوي")
+
+        if technical["trend"]=="BEARISH" and option_type=="PUT":
+            score+=15
+            conf+=1
+            reasons.append("اتجاه هابط قوي")
+
+        if technical["momentum"]==("BULLISH" if option_type=="CALL" else "BEARISH"):
+            score+=10
+            conf+=1
+            if option_type=="CALL":
+                reasons.append("زخم صاعد")
+            else:
+                reasons.append("زخم هابط")
+
+        rsi=technical["rsi"]
+        if 48<=rsi<=68 and option_type=="CALL":
+            score+=8
+            reasons.append(f"RSI {rsi:.0f}")
+        if 32<=rsi<=52 and option_type=="PUT":
+            score+=8
+            reasons.append(f"RSI {rsi:.0f}")
+
+        if technical["volume_ratio"]>=1.8:
+            score+=8
+            reasons.append(f"فوليوم عالي {technical['volume_ratio']:.1f}x")
+
+        vol_oi=volume/max(oi,1)
+        if vol_oi>=3:
+            score+=10
+            conf+=1
+            reasons.append(f"فوليوم/عقود {vol_oi:.1f}x")
+
+        if spread<=4:
+            score+=8
+            conf+=1
+            reasons.append("سبريد ضيق")
+
+        if 0.35<=delta<=0.65:
+            score+=10
+            conf+=1
+            reasons.append(f"دلتا {delta:.2f}")
+
+        score+=iv_score(iv)
+        score=int(clamp(score,0,100))
+
+        if score<MIN_SCORE or conf<3:
+            return None
+
+        atr=technical["atr"]
+        if option_type=="CALL":
+            stop_stock=stock_price-atr*1.2
+            target_stock=stock_price+atr*1.8
+        else:
+            stop_stock=stock_price+atr*1.2
+            target_stock=stock_price-atr*1.8
+
+        risk=abs((stock_price-stop_stock)/stock_price*100)
+        if risk<0.9:
+            return None
+
+        cid=f"{ticker}_{expiration}_{option_type}_{strike}"
+        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread":spread,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"conf":conf,"delta":greeks.get("delta",0),"rsi":rsi,"vwap":vwap,"stop_stock":stop_stock,"target_stock":target_stock,"risk":risk,"reasons":reasons,"atr":atr,"spy":spy_trend}
+
+    except Exception as ex:
+        print(f"analyze error {ex}")
+        return None
+
+def scan_ticker(ticker, spy_trend):
+    try:
+        has_earn,days=is_near_earnings(ticker)
+        if has_earn:
+            return []
+        stock=yf.Ticker(ticker)
+        hist=stock.history(period="1mo",interval="1d",auto_adjust=False)
+        if hist.empty:
+            return []
+        price=safe_float(hist["Close"].dropna().iloc[-1])
+        tech=technical_analysis(hist)
+        intra=get_intraday_levels(ticker)
+        if not intra:
+            return []
+        results=[]
+        for exp in stock.options[:MAX_EXPIRATIONS]:
+            if calculate_dte(exp)<MIN_DTE or calculate_dte(exp)>MAX_DTE:
+                continue
+            try:
+                chain=stock.option_chain(exp)
+                for _,row in chain.calls.iterrows():
+                   
