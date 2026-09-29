@@ -14,11 +14,9 @@ import pandas as pd
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "البوت الهجين V4.5 شغال - فوليوم 500 - فلتر SPY"
-
+    return "Bot V4.5 Running"
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
 threading.Thread(target=run_flask, daemon=True).start()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -41,12 +39,10 @@ US_EASTERN = ZoneInfo("America/New_York")
 
 def now_ksa():
     return datetime.now(KSA)
-
 def now_us():
     return datetime.now(US_EASTERN)
 
 TICKERS = ["NVDA","TSLA","META","AMD","AMZN","MSFT","PLTR","AVGO","SNDK","LITE","MU","QCOM","APP"]
-
 MAX_SIGNALS_PER_TICKER = 3
 MIN_VOLUME = 500
 MIN_OI = 500
@@ -198,7 +194,7 @@ def get_spy_trend():
             return "BEARISH"
         return "NEUTRAL"
     except Exception as ex:
-        print(f"SPY Error {ex}")
+        print(ex)
         return "NEUTRAL"
 
 def is_near_earnings(ticker):
@@ -249,7 +245,7 @@ def technical_analysis(hist):
         delta=close.diff()
         gain=delta.clip(lower=0).rolling(14).mean()
         loss=(-delta.clip(upper=0)).rolling(14).mean()
-        rs=gain/loss.replace(0,math.nan)
+        rs=gain/loss.replace(0, float("nan"))
         rsi=100-(100/(1+rs))
         current=safe_float(close.iloc[-1])
         e20=safe_float(ema20.iloc[-1])
@@ -258,9 +254,20 @@ def technical_analysis(hist):
         recent=close.tail(20)
         avg_vol=safe_float(volume.tail(20).mean())
         cur_vol=safe_float(volume.iloc[-1])
-        trend="BULLISH" if current>e20>e50 else "BEARISH" if current<e20<e50 else "NEUTRAL"
-        momentum="BULLISH" if crsi>=52 and current>e20 else "BEARISH" if crsi<=48 and current<e20 else "NEUTRAL"
-        result={"trend":trend,"momentum":momentum,"rsi":crsi,"support":safe_float(recent.min()),"resistance":safe_float(recent.max()),"volume_ratio":cur_vol/avg_vol if avg_vol>0 else 1,"atr":calculate_atr(hist)}
+        if current>e20 and e20>e50:
+            trend="BULLISH"
+        elif current<e20 and e20<e50:
+            trend="BEARISH"
+        else:
+            trend="NEUTRAL"
+        if crsi>=52 and current>e20:
+            momentum="BULLISH"
+        elif crsi<=48 and current<e20:
+            momentum="BEARISH"
+        else:
+            momentum="NEUTRAL"
+        vr=cur_vol/avg_vol if avg_vol>0 else 1
+        result={"trend":trend,"momentum":momentum,"rsi":crsi,"support":safe_float(recent.min()),"resistance":safe_float(recent.max()),"volume_ratio":vr,"atr":calculate_atr(hist)}
     except:
         pass
     return result
@@ -284,18 +291,16 @@ def calculate_greeks(S,K,iv,dte,typ):
         vega=S*norm_pdf(d1)*sqrt_t/100
         if typ=="CALL":
             delta=norm_cdf(d1)
-            theta=(-(S*norm_pdf(d1)*iv/(2*sqrt_t))-r*K*math.exp(-r*T)*norm_cdf(d2))/365
         else:
             delta=norm_cdf(d1)-1
-            theta=(-(S*norm_pdf(d1)*iv/(2*sqrt_t))+r*K*math.exp(-r*T)*norm_cdf(-d2))/365
-        return {"delta":delta,"gamma":gamma,"theta":theta,"vega":vega}
+        return {"delta":delta,"gamma":gamma,"vega":vega}
     except:
         return {}
 
 def normalize_iv(iv):
     iv=safe_float(iv)
     if iv>5:
-        iv/=100
+        iv=iv/100
     return iv
 
 def iv_score(iv):
@@ -314,125 +319,99 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,technical,int
             return None
         if spy_trend == "BULLISH" and option_type == "PUT":
             return None
-
         strike=safe_float(row.get("strike"))
         volume=safe_int(row.get("volume"))
         oi=safe_int(row.get("openInterest"))
-
         if strike<=0 or volume<MIN_VOLUME or oi<MIN_OI:
             return None
-
         bid=safe_float(row.get("bid"))
         ask=safe_float(row.get("ask"))
         last=safe_float(row.get("lastPrice"))
-
         if bid>0 and ask>0 and ask>=bid:
             premium=(bid+ask)/2
         else:
             premium=last
-
         if premium<MIN_OPTION_PRICE:
             return None
-
         if bid>0 and ask>0:
             spread=(ask-bid)/premium*100
         else:
             spread=999
-
         if spread>MAX_SPREAD_PCT:
             return None
-
         dte=calculate_dte(expiration)
         if dte<MIN_DTE or dte>MAX_DTE:
             return None
-
         dist=(strike-stock_price)/stock_price
         if dist<MIN_STRIKE_DISTANCE or dist>MAX_STRIKE_DISTANCE:
             return None
-
         iv=normalize_iv(row.get("impliedVolatility"))
         if iv<=0:
             return None
-
         vwap=intraday["vwap"] if intraday else 0
         if vwap>0:
             if option_type=="CALL" and stock_price < vwap:
                 return None
             if option_type=="PUT" and stock_price > vwap:
                 return None
-
         greeks=calculate_greeks(stock_price,strike,iv,dte,option_type)
         delta=abs(safe_float(greeks.get("delta")))
-        
         score=0
         conf=0
         reasons=[]
-
         if spy_trend!="NEUTRAL":
-            score+=10
-            conf+=1
-            reasons.append(f"اتجاه السوق {spy_trend} متوافق")
-
+            score=score+10
+            conf=conf+1
+            reasons.append("سوق متوافق " + spy_trend)
         if vwap>0:
-            score+=15
-            conf+=1
+            score=score+15
+            conf=conf+1
             if option_type=="CALL":
-                reasons.append(f"فوق VWAP ${vwap:.2f}")
+                reasons.append("فوق VWAP")
             else:
-                reasons.append(f"تحت VWAP ${vwap:.2f}")
-
+                reasons.append("تحت VWAP")
         if technical["trend"]=="BULLISH" and option_type=="CALL":
-            score+=15
-            conf+=1
+            score=score+15
+            conf=conf+1
             reasons.append("اتجاه صاعد قوي")
-
         if technical["trend"]=="BEARISH" and option_type=="PUT":
-            score+=15
-            conf+=1
+            score=score+15
+            conf=conf+1
             reasons.append("اتجاه هابط قوي")
-
         if technical["momentum"]==("BULLISH" if option_type=="CALL" else "BEARISH"):
-            score+=10
-            conf+=1
+            score=score+10
+            conf=conf+1
             if option_type=="CALL":
                 reasons.append("زخم صاعد")
             else:
                 reasons.append("زخم هابط")
-
         rsi=technical["rsi"]
         if 48<=rsi<=68 and option_type=="CALL":
-            score+=8
-            reasons.append(f"RSI {rsi:.0f}")
+            score=score+8
+            reasons.append("RSI مناسب")
         if 32<=rsi<=52 and option_type=="PUT":
-            score+=8
-            reasons.append(f"RSI {rsi:.0f}")
-
+            score=score+8
+            reasons.append("RSI مناسب")
         if technical["volume_ratio"]>=1.8:
-            score+=8
-            reasons.append(f"فوليوم عالي {technical['volume_ratio']:.1f}x")
-
+            score=score+8
+            reasons.append("فوليوم عالي")
         vol_oi=volume/max(oi,1)
         if vol_oi>=3:
-            score+=10
-            conf+=1
-            reasons.append(f"فوليوم/عقود {vol_oi:.1f}x")
-
+            score=score+10
+            conf=conf+1
+            reasons.append("فوليوم قوي")
         if spread<=4:
-            score+=8
-            conf+=1
+            score=score+8
+            conf=conf+1
             reasons.append("سبريد ضيق")
-
         if 0.35<=delta<=0.65:
-            score+=10
-            conf+=1
-            reasons.append(f"دلتا {delta:.2f}")
-
-        score+=iv_score(iv)
+            score=score+10
+            conf=conf+1
+            reasons.append("دلتا ممتازة")
+        score=score+iv_score(iv)
         score=int(clamp(score,0,100))
-
         if score<MIN_SCORE or conf<3:
             return None
-
         atr=technical["atr"]
         if option_type=="CALL":
             stop_stock=stock_price-atr*1.2
@@ -440,16 +419,13 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,technical,int
         else:
             stop_stock=stock_price+atr*1.2
             target_stock=stock_price-atr*1.8
-
         risk=abs((stock_price-stop_stock)/stock_price*100)
         if risk<0.9:
             return None
-
         cid=f"{ticker}_{expiration}_{option_type}_{strike}"
-        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread":spread,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"conf":conf,"delta":greeks.get("delta",0),"rsi":rsi,"vwap":vwap,"stop_stock":stop_stock,"target_stock":target_stock,"risk":risk,"reasons":reasons,"atr":atr,"spy":spy_trend}
-
+        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"spread":spread,"volume":volume,"oi":oi,"iv":iv,"dte":dte,"score":score,"conf":conf,"delta":greeks.get("delta",0),"rsi":rsi,"vwap":vwap,"stop_stock":stop_stock,"target_stock":target_stock,"risk":risk,"reasons":reasons,"atr":atr,"spy":spy_trend}
     except Exception as ex:
-        print(f"analyze error {ex}")
+        print(ex)
         return None
 
 def scan_ticker(ticker, spy_trend):
@@ -472,5 +448,100 @@ def scan_ticker(ticker, spy_trend):
                 continue
             try:
                 chain=stock.option_chain(exp)
-                for _,row in chain.calls.iterrows():
-                   
+                for _, row in chain.calls.iterrows():
+                    r=analyze_contract(ticker,price,row,exp,"CALL",tech,intra,spy_trend)
+                    if r:
+                        results.append(r)
+                for _, row in chain.puts.iterrows():
+                    r=analyze_contract(ticker,price,row,exp,"PUT",tech,intra,spy_trend)
+                    if r:
+                        results.append(r)
+            except:
+                pass
+        return results
+    except:
+        return []
+
+def format_signal(x):
+    is_call = x["type"]=="CALL"
+    if is_call:
+        tipo = "شراء"
+        icon = "🟢"
+        vwap_txt = "فوق"
+        cp = "C"
+    else:
+        tipo = "بيع"
+        icon = "🔴"
+        vwap_txt = "تحت"
+        cp = "P"
+    entry=x['premium']
+    stop_o=round(entry*0.60,2)
+    target_o=round(entry*1.80,2)
+    if is_call:
+        be=x['strike']+entry
+    else:
+        be=x['strike']-entry
+    txt_reasons = ""
+    for rr in x['reasons']:
+        txt_reasons = txt_reasons + "• " + rr + "\n"
+    text=(
+        f"{icon} <b>صفقة {tipo} قوية</b> | سوق {x['spy']}\n\n"
+        f"📌 <b>{x['ticker']}</b> ${x['stock_price']:.2f}\n"
+        f"📊 VWAP ${x['vwap']:.2f} {vwap_txt} | ATR ${x['atr']:.2f}\n\n"
+        f"🎯 <b>{x['strike']:g}{cp}</b> | ينتهي {x['expiration']} متبقي {x['dte']} يوم\n\n"
+        f"💰 دخول ${x['stock_price']:.2f} هدف ${x['target_stock']:.2f} وقف ${x['stop_stock']:.2f}\n"
+        f"💵 عقد ${entry:.2f} وقف ${stop_o} هدف ${target_o}\n"
+        f"🎯 تعادل ${be:.2f}\n\n"
+        f"📊 فوليوم {x['volume']:,} عقود {x['oi']:,} سبريد {x['spread']:.1f}%\n"
+        f"⭐ قوة {x['score']}/100 ثقة {x['conf']}\n"
+        f"{txt_reasons}\n"
+        f"🕐 {now_ksa().strftime('%H:%M')}"
+    )
+    return text
+
+def process_ticker(ticker, spy_trend):
+    if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER:
+        return
+    res=scan_ticker(ticker, spy_trend)
+    if not res:
+        return
+    res.sort(key=lambda xx: (xx["score"],xx["volume"]), reverse=True)
+    for r_item in res:
+        if r_item["id"] in sent_contracts:
+            continue
+        if send_tg(format_signal(r_item)):
+            sent_contracts.add(r_item["id"])
+            daily_count[ticker]=daily_count[ticker]+1
+            save_state()
+            print(f"OK {ticker} {r_item['type']} {r_item['strike']} {r_item['score']}")
+            break
+
+def startup_message(spy):
+    send_tg(f"🚀 <b>البوت V4.5 جاهز</b>\n📋 {', '.join(TICKERS)}\n📈 SPY: {spy}\n\n{market_time_message()}")
+
+spy_now = get_spy_trend()
+startup_message(spy_now)
+
+while True:
+    try:
+        if now_ksa().date()!=last_state_date:
+            daily_count.clear()
+            sent_contracts.clear()
+            last_state_date=now_ksa().date()
+            save_state()
+        if not is_us_market_open():
+            time.sleep(60)
+            continue
+        spy_trend = get_spy_trend()
+        print(f"SCAN SPY {spy_trend} {now_ksa().strftime('%H:%M:%S')}")
+        for t in TICKERS:
+            try:
+                if daily_count[t]<MAX_SIGNALS_PER_TICKER:
+                    process_ticker(t, spy_trend)
+                    time.sleep(1.5)
+            except Exception as e:
+                print(e)
+        time.sleep(SCAN_INTERVAL)
+    except Exception as e:
+        print(e)
+        time.sleep(15)
