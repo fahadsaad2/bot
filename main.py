@@ -14,7 +14,7 @@ import pandas as pd
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "OPTIONS V4.4 HYBRID - VOL 500 - SNDK LITE INCLUDED"
+    return "البوت الهجين V4.4 شغال - فوليوم 500 - SNDK و LITE مضافة"
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
@@ -122,7 +122,7 @@ def is_us_market_open():
     return start <= cur.time() < end
 def market_time_message():
     us=now_us(); ksa=now_ksa()
-    return f"US: {us.strftime('%H:%M')} ET | KSA: {ksa.strftime('%H:%M')}"
+    return f"توقيت امريكا: {us.strftime('%H:%M')} | السعودية: {ksa.strftime('%H:%M')}"
 def calculate_dte(exp):
     try: return (datetime.strptime(exp,"%Y-%m-%d").date()-now_us().date()).days
     except: return 0
@@ -148,13 +148,6 @@ def calculate_atr(hist, period=14):
         df['TR']=df[['H-L','H-PC','L-PC']].max(axis=1)
         return safe_float(df['TR'].rolling(period).mean().iloc[-1],1.0)
     except: return 1.0
-
-def calculate_rsi(series,period=14):
-    try:
-        delta=series.diff(); gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
-        avg_gain=gain.rolling(period).mean(); avg_loss=loss.rolling(period).mean()
-        rs=avg_gain/avg_loss.replace(0,math.nan); return 100-(100/(1+rs))
-    except: return pd.Series(index=series.index,dtype=float)
 
 def get_intraday_levels(ticker):
     try:
@@ -231,17 +224,17 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,technical,int
         score=0; conf=0; reasons=[]
         if vwap>0:
             score+=15; conf+=1; reasons.append(f"{'فوق' if option_type=='CALL' else 'تحت'} VWAP ${vwap:.2f} ✅")
-        if technical["trend"]=="BULLISH" and option_type=="CALL": score+=15; conf+=1; reasons.append("اتجاه صاعد")
-        if technical["trend"]=="BEARISH" and option_type=="PUT": score+=15; conf+=1; reasons.append("اتجاه هابط")
+        if technical["trend"]=="BULLISH" and option_type=="CALL": score+=15; conf+=1; reasons.append("اتجاه صاعد قوي")
+        if technical["trend"]=="BEARISH" and option_type=="PUT": score+=15; conf+=1; reasons.append("اتجاه هابط قوي")
         if technical["momentum"]==("BULLISH" if option_type=="CALL" else "BEARISH"): score+=10; conf+=1; reasons.append(f"زخم {'صاعد' if option_type=='CALL' else 'هابط'}")
         rsi=technical["rsi"]
         if 48<=rsi<=68 and option_type=="CALL": score+=8; reasons.append(f"RSI {rsi:.0f}")
         if 32<=rsi<=52 and option_type=="PUT": score+=8; reasons.append(f"RSI {rsi:.0f}")
-        if technical["volume_ratio"]>=1.8: score+=8; reasons.append(f"Vol {technical['volume_ratio']:.1f}x")
+        if technical["volume_ratio"]>=1.8: score+=8; reasons.append(f"فوليوم سهم عالي {technical['volume_ratio']:.1f}x")
         vol_oi=volume/max(oi,1)
-        if vol_oi>=3: score+=10; conf+=1; reasons.append(f"Vol/OI {vol_oi:.1f}x")
+        if vol_oi>=3: score+=10; conf+=1; reasons.append(f"فوليوم/عقود مفتوحة {vol_oi:.1f}x")
         if spread<=4: score+=8; conf+=1; reasons.append("سبريد ضيق")
-        if 0.35<=delta<=0.65: score+=10; conf+=1; reasons.append(f"Delta {delta:.2f}")
+        if 0.35<=delta<=0.65: score+=10; conf+=1; reasons.append(f"دلتا {delta:.2f}")
         score+=iv_score(iv)
         score=int(clamp(score,0,100))
         if score<MIN_SCORE or conf<3: return None
@@ -287,23 +280,24 @@ def scan_ticker(ticker):
 
 def format_signal(x):
     is_call=x["type"]=="CALL"
+    نوع = "شراء" if is_call else "بيع"
     entry=x['premium']; stop_o=round(entry*0.60,2); target_o=round(entry*1.80,2)
     be=x['strike']+entry if is_call else x['strike']-entry
     reasons="\n".join(f"• {r}" for r in x['reasons'])
-    text=(f"{'🟢' if is_call else '🔴'} <b>HYBRID V4.4 — {x['type']}</b>\n\n"
+    text=(f"{'🟢' if is_call else '🔴'} <b>صفقة {نوع} قوية</b>\n\n"
           f"📌 <b>{x['ticker']}</b> ${x['stock_price']:.2f}\n"
-          f"📊 VWAP ${x['vwap']:.2f} {'✅ فوق' if is_call else '✅ تحت'} | ATR ${x['atr']:.2f}\n\n"
-          f"🎯 <b>{x['strike']:g}{'C' if is_call else 'P'}</b> | {x['expiration']} DTE {x['dte']}\n\n"
-          f"💰 <b>دخول سهم ${x['stock_price']:.2f}</b>\n"
-          f"🎯 هدف سهم ${x['target_stock']:.2f}\n"
-          f"🛑 وقف سهم ${x['stop_stock']:.2f} ({x['risk']:.1f}%)\n\n"
-          f"💵 عقد ${entry:.2f} | وقف ${stop_o} (-40%) | هدف ${target_o} (+80%)\n"
-          f"🎯 Break-even ${be:.2f}\n\n"
-          f"📊 Vol {x['volume']:,} | OI {x['oi']:,} | Spread {x['spread']:.1f}%\n"
-          f"🌡️ IV {x['iv']*100:.1f}% | Delta {x['delta']:.2f} | RSI {x['rsi']:.0f}\n\n"
-          f"⭐ <b>سكور {x['score']}/100</b> ✅{x['conf']}\n"
+          f"📊 متوسط VWAP ${x['vwap']:.2f} {'✅ فوق' if is_call else '✅ تحت'} | ATR ${x['atr']:.2f}\n\n"
+          f"🎯 <b>{x['strike']:g}{'C' if is_call else 'P'}</b> | ينتهي {x['expiration']} متبقي {x['dte']} يوم\n\n"
+          f"💰 <b>دخول السهم ${x['stock_price']:.2f}</b>\n"
+          f"🎯 هدف السهم ${x['target_stock']:.2f}\n"
+          f"🛑 وقف السهم ${x['stop_stock']:.2f} ({x['risk']:.1f}%)\n\n"
+          f"💵 سعر العقد ${entry:.2f} | وقف ${stop_o} (-40%) | هدف ${target_o} (+80%)\n"
+          f"🎯 نقطة تعادل ${be:.2f}\n\n"
+          f"📊 فوليوم {x['volume']:,} | عقود مفتوحة {x['oi']:,} | سبريد {x['spread']:.1f}%\n"
+          f"🌡️ تذبذب {x['iv']*100:.1f}% | دلتا {x['delta']:.2f} | RSI {x['rsi']:.0f}\n\n"
+          f"⭐ <b>قوة الاشارة {x['score']}/100</b> ثقة ✅{x['conf']}\n"
           f"{reasons}\n\n"
-          f"🕐 {now_ksa().strftime('%H:%M KSA')}")
+          f"🕐 {now_ksa().strftime('%H:%M بتوقيت السعودية')}")
     return text
 
 def process_ticker(ticker):
@@ -315,11 +309,11 @@ def process_ticker(ticker):
         if r["id"] in sent_contracts: continue
         if send_tg(format_signal(r)):
             sent_contracts.add(r["id"]); daily_count[ticker]+=1; save_state()
-            print(f"✅ {ticker} {r['type']} {r['strike']} سكور {r['score']} وقف {r['risk']:.1f}%")
+            print(f"✅ {ticker} {r['type']} {r['strike']} سكور {r['score']}")
             break
 
 def startup_message():
-    send_tg(f"🚀 <b>HYBRID V4.4 VOL 500 READY</b>\n📋 {', '.join(TICKERS)}\n\nVol {MIN_VOLUME}+ | OI {MIN_OI}+ | Score {MIN_SCORE}+\nDTE {MIN_DTE}-{MAX_DTE} | Strike ±6%\nATR وقف ✅ | VWAP ✅ | ارباح ✅\n\n{market_time_message()}")
+    send_tg(f"🚀 <b>البوت الهجين V4.4 جاهز - فوليوم 500</b>\n📋 {', '.join(TICKERS)}\n\nفوليوم {MIN_VOLUME}+ | عقود مفتوحة {MIN_OI}+ | قوة اشارة {MIN_SCORE}+\nالمدة {MIN_DTE}-{MAX_DTE} يوم | سترايك ±6%\nوقف ATR ✅ | متوسط VWAP ✅ | فلتر ارباح ✅\n\n{market_time_message()}")
 
 startup_message()
 while True:
@@ -328,7 +322,7 @@ while True:
             daily_count.clear(); sent_contracts.clear(); last_state_date=now_ksa().date(); save_state()
         if not is_us_market_open():
             time.sleep(60); continue
-        print(f"\nSCAN HYBRID {now_ksa().strftime('%H:%M:%S')}")
+        print(f"\nفحص هجين {now_ksa().strftime('%H:%M:%S')}")
         for t in TICKERS:
             try:
                 if daily_count[t]<MAX_SIGNALS_PER_TICKER:
