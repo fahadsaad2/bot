@@ -14,7 +14,7 @@ import pandas as pd
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "OPTIONS V4.1 - FIXED 7-30 500VOL"
+    return "OPTIONS V4.1 - VWAP EDITION"
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
@@ -131,6 +131,22 @@ def calculate_rsi(series,period=14):
         avg_gain=gain.rolling(period).mean(); avg_loss=loss.rolling(period).mean()
         rs=avg_gain/avg_loss.replace(0,math.nan); return 100-(100/(1+rs))
     except: return pd.Series(index=series.index,dtype=float)
+
+# ===== الجديد: VWAP + انتراداي =====
+def get_intraday_levels(ticker):
+    try:
+        df = yf.Ticker(ticker).history(period="1d", interval="1m", auto_adjust=False)
+        if df.empty or len(df) < 20: return None
+        df['PV'] = df['Close'] * df['Volume']
+        vwap = (df['PV'].cumsum() / df['Volume'].cumsum()).iloc[-1]
+        return {
+            "vwap": safe_float(vwap),
+            "day_low": safe_float(df['Low'].min()),
+            "day_high": safe_float(df['High'].max()),
+            "current": safe_float(df['Close'].iloc[-1])
+        }
+    except: return None
+
 def technical_analysis(hist):
     result={"trend":"NEUTRAL","momentum":"NEUTRAL","rsi":50.0,"ema20":0,"ema50":0,"support":0,"resistance":0,"volume_ratio":1.0}
     try:
@@ -147,6 +163,7 @@ def technical_analysis(hist):
         result={"trend":trend,"momentum":momentum,"rsi":current_rsi,"ema20":e20,"ema50":e50,"support":support,"resistance":resistance,"volume_ratio":volume_ratio}
     except Exception as e: print(e)
     return result
+
 def norm_cdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
 def norm_pdf(x): return math.exp(-0.5*x*x)/math.sqrt(2*math.pi)
 def calculate_greeks(stock_price,strike,iv,dte,option_type):
@@ -161,7 +178,6 @@ def calculate_greeks(stock_price,strike,iv,dte,option_type):
             delta=norm_cdf(d1)-1; theta=(-(S*norm_pdf(d1)*sigma/(2*sqrt_t))+r*K*math.exp(-r*T)*norm_cdf(-d2))/365
         return {"delta":delta,"gamma":gamma,"theta":theta,"vega":vega}
     except: return {}
-
 def calculate_walls(calls, puts):
     result = {"call_wall": 0, "call_wall_oi": 0, "put_wall": 0, "put_wall_oi": 0}
     try:
@@ -172,8 +188,7 @@ def calculate_walls(calls, puts):
             row = c.loc[idx]
             result["call_wall"] = safe_float(row["strike"])
             result["call_wall_oi"] = safe_int(row["openInterest"])
-    except Exception as e:
-        print(f"wall call error {e}")
+    except Exception as e: print(f"wall call error {e}")
     try:
         if not puts.empty:
             p = puts.copy()
@@ -182,10 +197,8 @@ def calculate_walls(calls, puts):
             row = p.loc[idx]
             result["put_wall"] = safe_float(row["strike"])
             result["put_wall_oi"] = safe_int(row["openInterest"])
-    except Exception as e:
-        print(f"wall put error {e}")
+    except Exception as e: print(f"wall put error {e}")
     return result
-
 def normalize_iv(iv):
     iv=safe_float(iv)
     if iv<=0: return 0
@@ -198,7 +211,7 @@ def iv_score(iv):
     if iv_pct<=90: return 2
     return 0
 
-def analyze_contract(ticker,stock_price,row,expiration,option_type,walls,technical):
+def analyze_contract(ticker,stock_price,row,expiration,option_type,walls,technical,intraday):
     try:
         strike=safe_float(row.get("strike")); volume=safe_int(row.get("volume")); oi=safe_int(row.get("openInterest"))
         if strike<=0 or volume<MIN_VOLUME or oi<MIN_OI: return None
@@ -213,8 +226,23 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,walls,technic
         if strike_distance<MIN_STRIKE_DISTANCE or strike_distance>MAX_STRIKE_DISTANCE: return None
         iv=normalize_iv(row.get("impliedVolatility"))
         if iv<=0: return None
+
+        # ===== فلتر VWAP الجديد =====
+        vwap = intraday["vwap"] if intraday else 0
+        if vwap > 0:
+            if option_type=="CALL" and stock_price < vwap: return None # CALL لازم فوق VWAP
+            if option_type=="PUT" and stock_price > vwap: return None # PUT لازم تحت VWAP
+
         vol_oi=volume/max(oi,1); greeks=calculate_greeks(stock_price,strike,iv,dte,option_type)
         delta=abs(safe_float(greeks.get("delta"))); score=0; confirmations=0; reasons=[]; warnings=[]
+
+        # VWAP bonus
+        if vwap > 0:
+            if option_type=="CALL" and stock_price > vwap:
+                score+=12; confirmations+=1; reasons.append(f"فوق VWAP ${vwap:.2f} ✅")
+            if option_type=="PUT" and stock_price < vwap:
+                score+=12; confirmations+=1; reasons.append(f"تحت VWAP ${vwap:.2f} ✅")
+
         if option_type=="CALL":
             if technical["trend"]=="BULLISH": score+=15; confirmations+=1; reasons.append("اتجاه صاعد")
             elif technical["trend"]=="BEARISH": score-=15; warnings.append("الاتجاه ضد CALL")
@@ -265,28 +293,42 @@ def analyze_contract(ticker,stock_price,row,expiration,option_type,walls,technic
         if option_type=="PUT" and support>0:
             distance=(stock_price-support)/stock_price
             if 0<=distance<=0.03: score+=5; reasons.append("قريب من دعم")
-        if option_type=="CALL":
-            wall=walls["call_wall"]
-            if wall>0 and abs(strike-wall)/stock_price<=0.03: score+=5; reasons.append(f"قرب Call Wall {wall:g}")
-        else:
-            wall=walls["put_wall"]
-            if wall>0 and abs(strike-wall)/stock_price<=0.03: score+=5; reasons.append(f"قرب Put Wall {wall:g}")
-        if option_type=="CALL" and technical["trend"]=="BEARISH" and technical["momentum"]=="BEARISH": return None
-        if option_type=="PUT" and technical["trend"]=="BULLISH" and technical["momentum"]=="BULLISH": return None
+
         score=int(clamp(score,0,100))
         if score<MIN_SCORE or confirmations<MIN_CONFIRMATIONS: return None
+
+        # ===== حساب دخول / هدف / وقف =====
+        day_low = intraday["day_low"] if intraday else technical["support"]
+        day_high = intraday["day_high"] if intraday else technical["resistance"]
+
+        if option_type=="CALL":
+            stop_stock = day_low - 0.50
+            target_stock_1 = day_high
+            target_stock_2 = stock_price * 1.03
+        else:
+            stop_stock = day_high + 0.50
+            target_stock_1 = day_low
+            target_stock_2 = stock_price * 0.97
+
+        risk_pct = abs((stock_price - stop_stock)/stock_price*100) if stop_stock else 0
+        # فلتر: الوقف لازم اكبر من 0.8% عشان ما يكون ضيق زي $1
+        if risk_pct < 0.8: return None
+
         cid=f"{ticker}_{expiration}_{option_type}_{strike}"
-        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread_pct":spread_pct,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"confirmations":confirmations,"delta":greeks.get("delta",0),"gamma":greeks.get("gamma",0),"theta":greeks.get("theta",0),"vega":greeks.get("vega",0),"rsi":rsi,"trend":technical["trend"],"momentum":technical["momentum"],"volume_ratio":volume_ratio,"call_wall":walls["call_wall"],"call_wall_oi":walls["call_wall_oi"],"put_wall":walls["put_wall"],"put_wall_oi":walls["put_wall_oi"],"support":support,"resistance":resistance,"reasons":reasons,"warnings":warnings}
+        return {"id":cid,"ticker":ticker,"type":option_type,"expiration":expiration,"strike":strike,"stock_price":stock_price,"premium":premium,"bid":bid,"ask":ask,"spread_pct":spread_pct,"volume":volume,"oi":oi,"vol_oi":vol_oi,"iv":iv,"dte":dte,"score":score,"confirmations":confirmations,"delta":greeks.get("delta",0),"gamma":greeks.get("gamma",0),"theta":greeks.get("theta",0),"vega":greeks.get("vega",0),"rsi":rsi,"trend":technical["trend"],"momentum":technical["momentum"],"volume_ratio":volume_ratio,"call_wall":walls["call_wall"],"call_wall_oi":walls["call_wall_oi"],"put_wall":walls["put_wall"],"put_wall_oi":walls["put_wall_oi"],"support":support,"resistance":resistance,"reasons":reasons,"warnings":warnings,
+                "vwap": vwap, "day_low": day_low, "day_high": day_high, "stop_stock": stop_stock, "target_stock_1": target_stock_1, "target_stock_2": target_stock_2, "risk_pct": risk_pct}
     except Exception as e:
         print(f"Contract error {ticker}: {e}"); return None
 
 def scan_ticker(ticker):
     try:
         stock=yf.Ticker(ticker); hist=stock.history(period="3mo",interval="1d",auto_adjust=False)
-        if hist.empty: print(f"DEBUG {ticker}: hist empty"); return []
+        if hist.empty: return []
         stock_price=safe_float(hist["Close"].dropna().iloc[-1])
         if stock_price<=0: return []
-        technical=technical_analysis(hist); expirations=stock.options
+        technical=technical_analysis(hist)
+        intraday = get_intraday_levels(ticker) # جديد
+        expirations=stock.options
         if not expirations: return []
         valid_expirations=[]
         for exp in expirations:
@@ -300,18 +342,13 @@ def scan_ticker(ticker):
                 walls=calculate_walls(calls,puts)
                 if not calls.empty:
                     for _,row in calls.iterrows():
-                        r=analyze_contract(ticker,stock_price,row,expiration,"CALL",walls,technical)
+                        r=analyze_contract(ticker,stock_price,row,expiration,"CALL",walls,technical,intraday)
                         if r: results.append(r)
                 if not puts.empty:
                     for _,row in puts.iterrows():
-                        r=analyze_contract(ticker,stock_price,row,expiration,"PUT",walls,technical)
+                        r=analyze_contract(ticker,stock_price,row,expiration,"PUT",walls,technical,intraday)
                         if r: results.append(r)
             except Exception as e: print(f"Exp error {ticker} {expiration}: {e}")
-        if results:
-            best = sorted(results, key=lambda x: x["score"], reverse=True)[0]
-            print(f"DEBUG {ticker}: found {len(results)} - best score {best['score']}")
-        else:
-            print(f"DEBUG {ticker}: found 0")
         return results
     except Exception as e: print(f"Scan error {ticker}: {e}"); return []
 
@@ -320,13 +357,45 @@ def format_signal(x):
     breakeven=x["strike"]+x["premium"] if is_call else x["strike"]-x["premium"]
     reasons="\n".join(f"• {r}" for r in x["reasons"]); warnings=""
     if x["warnings"]: warnings="\n\n⚠️ ملاحظات:\n"+"\n".join(f"• {w}" for w in x["warnings"])
-    text=(f"{emoji} <b>OPTIONS V4.1 — {option_name}</b>\n\n📌 السهم: <b>{x['ticker']}</b>\n💰 سعر السهم: ${x['stock_price']:.2f}\n\n🎯 العقد: <b>{x['strike']:g}{'C' if is_call else 'P'}</b>\n📅 الانتهاء: {x['expiration']}\n⏳ DTE: {x['dte']} يوم (7-30)\n\n💵 Premium: ${x['premium']:.2f}\n↔️ Bid/Ask: ${x['bid']:.2f} / ${x['ask']:.2f}\n📐 Spread: {x['spread_pct']:.1f}%\n\n📊 Volume: {x['volume']:,}\n📦 OI: {x['oi']:,}\n🔥 Volume/OI: {x['vol_oi']:.1f}x\n🌡️ IV: {x['iv']*100:.1f}%\n\n📈 الاتجاه: {x['trend']}\n⚡ الزخم: {x['momentum']}\nRSI: {x['rsi']:.1f}\n📊 Volume Ratio: {x['volume_ratio']:.1f}x\n\n🧮 <b>Greeks</b>\nDelta: {x['delta']:.2f}\nGamma: {x['gamma']:.4f}\nTheta: {x['theta']:.4f}\nVega: {x['vega']:.4f}\n\n🧱 Call Wall: {x['call_wall']:g} ({x['call_wall_oi']:,})\n🧱 Put Wall: {x['put_wall']:g} ({x['put_wall_oi']:,})\n\n🟦 Support: ${x['support']:.2f}\n🟥 Resistance: ${x['resistance']:.2f}\n\n🎯 Break-even: ${breakeven:.2f}\n\n⭐ <b>قوة الإشارة: {x['score']}/100</b>\n✅ التأكيدات: {x['confirmations']}/{MIN_CONFIRMATIONS}\n\n🔎 <b>أسباب الإشارة:</b>\n{reasons}{warnings}\n\n🕐 السعودية: {now_ksa().strftime('%Y-%m-%d %H:%M:%S')}\n🇺🇸 السوق: {now_us().strftime('%H:%M ET')}\n\n⚠️ <i>تنبيه آلي تعليمي، وليس توصية.</i>")
+
+    # دخول / هدف / وقف
+    entry_premium = x['premium']
+    stop_premium = round(entry_premium*0.65,2)
+    target_premium = round(entry_premium*1.80,2)
+    entry_stock = x['stock_price']
+
+    text=(f"{emoji} <b>OPTIONS V4.1 VWAP — {option_name}</b>\n\n"
+          f"📌 السهم: <b>{x['ticker']}</b> - ${entry_stock:.2f}\n"
+          f"📊 VWAP: ${x['vwap']:.2f} {'✅ فوق' if is_call else '✅ تحت'}\n"
+          f"📉 لو اليوم: ${x['day_low']:.2f} | هاي: ${x['day_high']:.2f}\n\n"
+          f"🎯 العقد: <b>{x['strike']:g}{'C' if is_call else 'P'}</b>\n"
+          f"📅 الانتهاء: {x['expiration']} | ⏳ DTE: {x['dte']}\n\n"
+          f"💰 <b>دخول السهم: ${entry_stock:.2f}</b>\n"
+          f"🎯 هدف سهم 1: ${x['target_stock_1']:.2f}\n"
+          f"🎯 هدف سهم 2: ${x['target_stock_2']:.2f} ({'+3%' if is_call else '-3%'})\n"
+          f"🛑 وقف سهم: كسر ${x['stop_stock']:.2f} ({x['risk_pct']:.1f}%)\n\n"
+          f"💵 دخول عقد: ${entry_premium:.2f}\n"
+          f"🛑 وقف عقد: ${stop_premium:.2f} (-35%)\n"
+          f"🎯 هدف عقد: ${target_premium:.2f} (+80%)\n"
+          f"🎯 Break-even: ${breakeven:.2f}\n\n"
+          f"💵 Premium: ${x['premium']:.2f} | Spread: {x['spread_pct']:.1f}%\n"
+          f"📊 Vol: {x['volume']:,} | OI: {x['oi']:,} | Vol/OI: {x['vol_oi']:.1f}x\n"
+          f"🌡️ IV: {x['iv']*100:.1f}% | Delta: {x['delta']:.2f}\n\n"
+          f"⭐ <b>سكور: {x['score']}/100</b> | ✅ {x['confirmations']}/{MIN_CONFIRMATIONS}\n\n"
+          f"🔎 <b>أسباب:</b>\n{reasons}{warnings}\n\n"
+          f"🕐 KSA: {now_ksa().strftime('%H:%M:%S')}\n"
+          f"⚠️ <i>تعليمي فقط</i>")
     return text
 
 def process_ticker(ticker):
     if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: return
     results=scan_ticker(ticker)
-    if not results: return
+    if not results:
+        # رسالة debug عشان تعرف ليش مافي اشارة
+        intra = get_intraday_levels(ticker)
+        if intra:
+            print(f"DEBUG {ticker}: ${intra['current']:.2f} vs VWAP ${intra['vwap']:.2f} - 0 signals")
+        return
     results.sort(key=lambda x: (x["score"],x["confirmations"],x["vol_oi"],x["volume"]), reverse=True)
     for result in results:
         if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: break
@@ -335,11 +404,17 @@ def process_ticker(ticker):
         message=format_signal(result)
         if not send_tg(message): continue
         sent_contracts.add(cid); daily_count[ticker]+=1; save_state()
-        print("تم إرسال:",ticker,result["type"],result["strike"],result["score"])
+        print(f"✅ ارسل {ticker} {result['type']} {result['strike']} سكور {result['score']} وقف ${result['stop_stock']:.2f} ({result['risk_pct']:.1f}%)")
         time.sleep(2); break
 
 def startup_message():
-    text=(f"🚀 <b>OPTIONS V4.1 FIXED 7-30 500VOL</b>\n\n🇸🇦 السعودية\n🇺🇸 السوق: US\n\n{market_time_message()}\n\n📊 Volume: {MIN_VOLUME}+\n⭐ Score: {MIN_SCORE}+\n✅ Conf: {MIN_CONFIRMATIONS}\n⏳ DTE: {MIN_DTE}-{MAX_DTE}")
+    text=(f"🚀 <b>OPTIONS V4.1 VWAP FIXED</b>\n\n"
+          f"🇸🇦 السعودية | {market_time_message()}\n\n"
+          f"📊 Volume: {MIN_VOLUME}+ | Score: {MIN_SCORE}+\n"
+          f"📈 VWAP فلتر مفعل ✅\n"
+          f"🛑 وقف: لو اليوم -0.50 (1%+)\n"
+          f"💰 دخول/هدف/وقف عقد وسهم\n"
+          f"⏳ DTE: {MIN_DTE}-{MAX_DTE}")
     send_tg(text)
 
 last_market_status=None
@@ -362,7 +437,7 @@ while True:
         reset_daily(); send_market_status_if_changed()
         if not is_us_market_open():
             time.sleep(60); continue
-        print(f"\nSCAN V4.1 - {now_ksa()}")
+        print(f"\nSCAN V4.1 VWAP - {now_ksa()}")
         for ticker in TICKERS:
             try:
                 if daily_count[ticker]>=MAX_SIGNALS_PER_TICKER: continue
