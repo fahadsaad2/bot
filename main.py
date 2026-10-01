@@ -47,15 +47,15 @@ def now_us():
 
 TICKERS = ['NVDA','TSLA','META','AMD','AMZN','MSFT','PLTR','AVGO','SNDK','LITE','MU','QCOM','APP']
 MAX_SIGNALS_PER_TICKER = 3
-MIN_VOLUME = 150       # تم تخفيضه قليلاً لضمان التقاط العقود النشطة
-MIN_OI = 100           # تم تخفيضه قليلاً
-MIN_DTE = 3            # توسيع نطاق الأيام المتاحة
+MIN_VOLUME = 150
+MIN_OI = 100
+MIN_DTE = 3
 MAX_DTE = 30
-MAX_SPREAD_PCT = 15.0  # السماح بسبريد أوسع لتجنب استبعاد العقود الجيدة
+MAX_SPREAD_PCT = 15.0
 MIN_OPTION_PRICE = 0.20
 MIN_STRIKE_DISTANCE = -0.10
 MAX_STRIKE_DISTANCE = 0.10
-MIN_SCORE = 55         # تخفيض السكور الأدنى عشان البوت يرسل صفقات أكثر
+MIN_SCORE = 55
 SCAN_INTERVAL = 60
 MAX_EXPIRATIONS = 5
 
@@ -156,7 +156,6 @@ def get_intraday_levels(ticker):
     try:
         df = yf.Ticker(ticker).history(period='1d', interval='5m', auto_adjust=False)
         if df.empty or len(df) < 3:
-            # بديل لو بيانات الـ 5 دقائق مو متوفرة نأخذ اليومي
             hist_d = yf.Ticker(ticker).history(period='5d', interval='1d', auto_adjust=False)
             if not hist_d.empty:
                 c = safe_float(hist_d['Close'].iloc[-1])
@@ -262,12 +261,12 @@ def analyze_contract(ticker, stock_price, row, expiration, option_type, technica
             
         iv = normalize_iv(row.get('impliedVolatility'))
         if iv <= 0:
-            iv = 0.50 # قيمة افتراضية في حال كانت الـ IV غير متوفرة لكي لا يتم استبعاد العقد
+            iv = 0.50
             
         greeks = calculate_greeks(stock_price, strike, iv, dte, option_type)
         delta = abs(safe_float(greeks.get('delta'), 0.5))
         
-        score = 60 # نقاط أساسية لضمان تجاوز الحد الأدنى
+        score = 60
         reasons = ['حجم تداول نشط', 'سيولة جيدة']
         
         if technical['trend'] == option_type:
@@ -399,7 +398,7 @@ while True:
         print(f'SCAN SPY {spy_trend} {now_ksa().strftime("%H:%M:%S")}')
         for t in TICKERS:
             try:
-                if daily_count[t] < MAX_SIGNALS_PER_TICK_if := MAX_SIGNALS_PER_TICKER:
+                if daily_count[t] < MAX_SIGNALS_PER_TICKER:
                     process_ticker(t, spy_trend)
                     time.sleep(1.0)
             except Exception as ex:
