@@ -7,7 +7,7 @@ import pandas as pd
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V4.9 14 Tickers Arabic - FIXED'
+def home(): return 'Bot V4.9 14 Tickers FIXED v2'
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -68,34 +68,25 @@ def is_us_market_open():
         return s <= cur.time() < e
     except: return True
 
-# --- هذا الفيكس الجديد ---
 def get_session():
     sess = requests.Session()
     sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     })
     return sess
 
 def get_price_safe(ticker):
-    # اهم نقطة: session واحد لكل شركة
     for i in range(5):
         try:
             sess = get_session()
             stock = yf.Ticker(ticker, session=sess)
-            # جرب fast_info اول لانه ما ينحظر بسرعة
-            try:
-                # لو فشل لا يوقف
-                pass
-            except: pass
-            
             hist = stock.history(period='5d', interval='1d', auto_adjust=False)
             if not hist.empty:
                 return stock, hist
             print(f"{ticker} empty retry {i}")
         except Exception as ex:
             print(f"{ticker} retry {i} {ex}")
-        time.sleep(8 + i*2) # 8,10,12,14,16 ثانية
+        time.sleep(8 + i*2)
     return None, pd.DataFrame()
 
 def get_spy_trend():
@@ -134,13 +125,11 @@ def scan_one(ticker, spy):
             return False
         price = safe_float(hist['Close'].iloc[-1])
         if price==0: return False
-
         try:
             exps = stock.options[:2]
         except:
             print(f"{ticker}: no options")
             return False
-            
         best = None
         for exp in exps:
             dte = calculate_dte(exp)
@@ -167,5 +156,16 @@ def scan_one(ticker, spy):
             except Exception as ex:
                 print(f"{ticker} {exp} err {ex}")
                 time.sleep(6)
+        if best and best['score'] >= MIN_SCORE:
+            if send_tg(format_signal(best)):
+                sent_contracts.add(f"{best['ticker']}_{best['exp']}_{best['strike']}_{best['cp']}_{best['dte']}")
+                daily_count[ticker]+=1
+                print(f"OK {ticker} {best['cp']} {best['strike']} score {best['score']}")
+                return True
+        return False
+    except Exception as ex:
+        print(f"{ticker} failed {ex}")
+        return False
 
-       
+spy_now = get_spy_trend()
+send_tg(f"🚀 <b>البوت V4.9 شغال - FIXED v2</b>\n📋 {
