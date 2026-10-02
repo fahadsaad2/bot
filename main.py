@@ -4,13 +4,11 @@ from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
-
-# الفيكس الجديد
 from curl_cffi import requests as crequests
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V4.9 14 Tickers FIXED v4 curl_cffi'
+def home(): return 'Bot V5 $1-10 7-30d'
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -31,13 +29,19 @@ def now_ksa(): return datetime.now(KSA)
 def now_us(): return datetime.now(US_EASTERN)
 
 TICKERS = ['NVDA','TSLA','META','AMD','AMZN','MSFT','PLTR','AVGO','SNDK','LITE','MU','QCOM','APP','SPY']
+
+# ==== تعديلك الجديد ====
 MIN_VOLUME = 10
 MIN_OI = 10
 MIN_SCORE = 20
 MAX_SPREAD_PCT = 40
-MIN_OPTION_PRICE = 0.20
+MIN_OPTION_PRICE = 1.00
+MAX_OPTION_PRICE = 10.00
+MIN_DTE = 7
+MAX_DTE = 30
 SCAN_INTERVAL = 180
 MAX_SIGNALS_PER_TICKER = 3
+# =======================
 
 daily_count = defaultdict(int)
 sent_contracts = set()
@@ -68,32 +72,23 @@ def is_us_market_open():
 def get_price_safe(ticker):
     for i in range(4):
         try:
-            # هذا السطر هو اللي يفك الحظر
             sess = crequests.Session(impersonate="chrome")
             stock = yf.Ticker(ticker, session=sess)
             hist = stock.history(period='5d', interval='1d', auto_adjust=False)
             if not hist.empty:
-                print(ticker + " OK price " + str(hist['Close'].iloc[-1]))
                 return stock, hist
         except Exception as ex:
             print(ticker + " retry " + str(i) + " " + str(ex))
         time.sleep(5)
-    print(ticker + ": No data skip - yahoo blocked")
     return None, pd.DataFrame()
 
 def get_spy_trend():
-    # لو SPY فشل لا يوقف البوت - يرجع NEUTRAL مؤقتا
     try:
         _, df = get_price_safe('SPY')
-        if df.empty:
-            print("SPY trend NEUTRAL (fallback)")
-            return 'NEUTRAL'
+        if df.empty: return 'NEUTRAL'
         close = df['Close']
-        trend = 'BULLISH' if close.iloc[-1] > close.ewm(20).mean().iloc[-1] else 'BEARISH'
-        print("SPY trend " + trend)
-        return trend
-    except:
-        return 'NEUTRAL'
+        return 'BULLISH' if close.iloc[-1] > close.ewm(20).mean().iloc[-1] else 'BEARISH'
+    except: return 'NEUTRAL'
 
 def format_signal(best):
     entry = best['prem']
@@ -105,7 +100,8 @@ def format_signal(best):
     msg = icon + " <b>🐋 حوت دخل - " + best['ticker'] + " " + tipo + "</b> | " + best['spy'] + "\n\n"
     msg += "📌 <b>" + best['ticker'] + "</b> $" + str(round(best['price'],2)) + "\n"
     msg += "🎯 <b>" + str(best['strike']) + best['cp'] + "</b> ينتهي " + best['exp'] + " (" + str(best['dte']) + " يوم)\n"
-    msg += "💵 دخول: $" + str(entry) + " | وقف: $" + str(stop_o) + " (-40%)\n"
+    msg += "💵 دخول: $" + str(entry) + " (" + str(int(entry*100)) + "$ للعقد)\n"
+    msg += "🛑 وقف: $" + str(stop_o) + " (-40%)\n"
     msg += "🎯 هدف1: $" + str(target_o) + " (+80%)\n"
     msg += "🚀 هدف2: $" + str(target2_o) + " (+150%)\n"
     msg += "📊 فوليوم " + str(best['vol']) + " | OI " + str(best['oi']) + "\n"
@@ -119,12 +115,12 @@ def scan_one(ticker, spy):
         if hist.empty or stock is None: return False
         price = safe_float(hist['Close'].iloc[-1])
         if price==0: return False
-        try: exps = stock.options[:2]
+        try: exps = stock.options
         except: return False
         best = None
         for exp in exps:
             dte = calculate_dte(exp)
-            if dte<4 or dte>25: continue
+            if dte < MIN_DTE or dte > MAX_DTE: continue
             try:
                 chain = stock.option_chain(exp)
                 all_rows = [(r,'C') for _,r in chain.calls.iterrows()] + [(r,'P') for _,r in chain.puts.iterrows()]
@@ -132,7 +128,12 @@ def scan_one(ticker, spy):
                     vol = safe_int(row.get('volume')); oi = safe_int(row.get('openInterest'))
                     if vol < MIN_VOLUME or oi < MIN_OI: continue
                     prem = safe_float(row.get('lastPrice'))
-                    if prem < MIN_OPTION_PRICE: continue
+                    if prem < MIN_OPTION_PRICE or prem > MAX_OPTION_PRICE: continue
+                    try:
+                        bid = safe_float(row.get('bid')); ask = safe_float(row.get('ask'))
+                        if bid>0 and ask>0 and prem>0:
+                            if (ask-bid)/prem*100 > MAX_SPREAD_PCT: continue
+                    except: pass
                     score = 35 + min(vol/5, 35) + min(oi/10, 20)
                     cid = ticker + "_" + exp + "_" + str(row.get('strike')) + "_" + cp
                     if cid in sent_contracts: continue
@@ -145,7 +146,6 @@ def scan_one(ticker, spy):
             if send_tg(format_signal(best)):
                 sent_contracts.add(best['ticker'] + "_" + best['exp'] + "_" + str(best['strike']) + "_" + best['cp'])
                 daily_count[ticker]+=1
-                print("SENT " + ticker + " " + best['cp'])
                 return True
         return False
     except Exception as ex:
@@ -154,7 +154,7 @@ def scan_one(ticker, spy):
 
 tickers_text = ", ".join(TICKERS)
 spy_now = get_spy_trend()
-start_msg = "🚀 <b>البوت V4.9 شغال v4 curl_cffi</b>\n📋 " + tickers_text + "\n📈 SPY: " + spy_now + "\n⚙️ فوليوم 10+ | سكور 20+\n🕐 " + now_ksa().strftime('%H:%M')
+start_msg = "🚀 <b>البوت V5 شغال</b>\n💵 عقود $" + str(MIN_OPTION_PRICE) + "-$" + str(MAX_OPTION_PRICE) + "\n📅 مدة " + str(MIN_DTE) + "-" + str(MAX_DTE) + " يوم\n📋 " + tickers_text + "\n📈 SPY: " + spy_now + "\n🕐 " + now_ksa().strftime('%H:%M')
 send_tg(start_msg)
 
 no_signal = 0
@@ -174,10 +174,4 @@ while True:
         if not found:
             no_signal+=1
             if no_signal >= 10:
-                send_tg("ℹ️ <b>فحص مستمر - 14 شركة</b> | SPY: " + spy + "\nلا يوجد حيتان حاليا - السوق هادي ✅\n🕐 " + now_ksa().strftime('%H:%M'))
-                no_signal=0
-        else: no_signal=0
-        time.sleep(SCAN_INTERVAL)
-    except Exception as ex:
-        print("main loop " + str(ex))
-        time.sleep(30)
+                send_tg("ℹ️ <b>فحص مستمر</b> | $" + str(MIN_OPTION_PRICE) +
