@@ -1,5 +1,5 @@
 from flask import Flask
-import threading, yfinance as yf, requests, time, os, json, math
+import threading, yfinance as yf, requests, time, os
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -7,7 +7,7 @@ import pandas as pd
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V4.9 14 Tickers FIXED v2'
+def home(): return 'Bot V4.9 14 Tickers FIXED v3'
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -17,11 +17,11 @@ CHAT_ID = os.environ.get('CHAT_ID')
 def send_tg(text):
     try:
         if not BOT_TOKEN or not CHAT_ID: return False
-        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
+        url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage'
         r = requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}, timeout=15)
         return r.ok
     except Exception as ex:
-        print(f"tg error {ex}")
+        print("tg error", ex)
         return False
 
 KSA = ZoneInfo('Asia/Riyadh')
@@ -68,25 +68,18 @@ def is_us_market_open():
         return s <= cur.time() < e
     except: return True
 
-def get_session():
-    sess = requests.Session()
-    sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    })
-    return sess
-
 def get_price_safe(ticker):
     for i in range(5):
         try:
-            sess = get_session()
+            sess = requests.Session()
+            sess.headers.update({'User-Agent': 'Mozilla/5.0'})
             stock = yf.Ticker(ticker, session=sess)
             hist = stock.history(period='5d', interval='1d', auto_adjust=False)
             if not hist.empty:
                 return stock, hist
-            print(f"{ticker} empty retry {i}")
         except Exception as ex:
-            print(f"{ticker} retry {i} {ex}")
-        time.sleep(8 + i*2)
+            print(ticker, "retry", i, ex)
+        time.sleep(10)
     return None, pd.DataFrame()
 
 def get_spy_trend():
@@ -105,30 +98,26 @@ def format_signal(best):
     icon = '🟢' if best['cp']=='C' else '🔴'
     tipo = 'شراء' if best['cp']=='C' else 'بيع'
     be = best['strike'] + entry if best['cp']=='C' else best['strike'] - entry
-    return (f"{icon} <b>🐋 حوت دخل - {best['ticker']} {tipo}</b> | {best['spy']}\n\n"
-            f"📌 <b>{best['ticker']}</b> ${best['price']:.2f}\n"
-            f"🎯 <b>{best['strike']:g}{best['cp']}</b> ينتهي {best['exp']} ({best['dte']} يوم)\n\n"
-            f"💵 <b>دخول العقد:</b> ${entry:.2f} ({entry*100:.0f}$ للعقد)\n"
-            f"🛑 <b>وقف خسارة:</b> ${stop_o} (-40%)\n"
-            f"🎯 <b>هدف 1:</b> ${target_o} (+80%)\n"
-            f"🚀 <b>هدف 2:</b> ${target2_o} (+150%)\n"
-            f"💰 تعادل ${be:.2f}\n\n"
-            f"📊 فوليوم {best['vol']:,} | OI {best['oi']:,}\n"
-            f"⭐ قوة {best['score']}/100\n"
-            f"🕐 {now_ksa().strftime('%H:%M')} KSA")
+    msg = icon + " <b>🐋 حوت دخل - " + best['ticker'] + " " + tipo + "</b> | " + best['spy'] + "\n\n"
+    msg += "📌 <b>" + best['ticker'] + "</b> $" + str(round(best['price'],2)) + "\n"
+    msg += "🎯 <b>" + str(best['strike']) + best['cp'] + "</b> ينتهي " + best['exp'] + "\n"
+    msg += "💵 دخول: $" + str(entry) + " | وقف: $" + str(stop_o) + "\n"
+    msg += "🎯 هدف1: $" + str(target_o) + " | هدف2: $" + str(target2_o) + "\n"
+    msg += "📊 فوليوم " + str(best['vol']) + " | OI " + str(best['oi']) + "\n"
+    msg += "⭐ قوة " + str(best['score']) + "/100"
+    return msg
 
 def scan_one(ticker, spy):
     try:
         stock, hist = get_price_safe(ticker)
         if hist.empty or stock is None:
-            print(f"{ticker}: No data skip")
+            print(ticker + ": No data skip")
             return False
         price = safe_float(hist['Close'].iloc[-1])
         if price==0: return False
         try:
             exps = stock.options[:2]
         except:
-            print(f"{ticker}: no options")
             return False
         best = None
         for exp in exps:
@@ -136,36 +125,61 @@ def scan_one(ticker, spy):
             if dte<4 or dte>25: continue
             try:
                 chain = stock.option_chain(exp)
-                rows = [(r,'C') for _,r in chain.calls.iterrows()] + [(r,'P') for _,r in chain.puts.iterrows()]
-                for row, cp in rows:
+                all_rows = [(r,'C') for _,r in chain.calls.iterrows()] + [(r,'P') for _,r in chain.puts.iterrows()]
+                for row, cp in all_rows:
                     vol = safe_int(row.get('volume')); oi = safe_int(row.get('openInterest'))
                     if vol < MIN_VOLUME or oi < MIN_OI: continue
                     prem = safe_float(row.get('lastPrice'))
                     if prem < MIN_OPTION_PRICE: continue
-                    try:
-                        bid = safe_float(row.get('bid')); ask = safe_float(row.get('ask'))
-                        if bid>0 and ask>0 and prem>0:
-                            spr = (ask-bid)/prem*100
-                            if spr > MAX_SPREAD_PCT: continue
-                    except: pass
                     score = 35 + min(vol/5, 35) + min(oi/10, 20)
-                    cid = f"{ticker}_{exp}_{row.get('strike')}_{cp}_{dte}"
+                    cid = ticker + "_" + exp + "_" + str(row.get('strike')) + "_" + cp + "_" + str(dte)
                     if cid in sent_contracts: continue
                     if best is None or score > best['score']:
                         best = {'ticker':ticker,'price':price,'strike':safe_float(row.get('strike')),'cp':cp,'exp':exp,'dte':dte,'prem':prem,'vol':vol,'oi':oi,'score':int(min(score,100)),'spy':spy}
             except Exception as ex:
-                print(f"{ticker} {exp} err {ex}")
-                time.sleep(6)
+                print(ticker, exp, "err", ex)
+                time.sleep(5)
         if best and best['score'] >= MIN_SCORE:
             if send_tg(format_signal(best)):
-                sent_contracts.add(f"{best['ticker']}_{best['exp']}_{best['strike']}_{best['cp']}_{best['dte']}")
+                sent_contracts.add(best['ticker'] + "_" + best['exp'] + "_" + str(best['strike']) + "_" + best['cp'] + "_" + str(best['dte']))
                 daily_count[ticker]+=1
-                print(f"OK {ticker} {best['cp']} {best['strike']} score {best['score']}")
                 return True
         return False
     except Exception as ex:
-        print(f"{ticker} failed {ex}")
+        print(ticker, "failed", ex)
         return False
 
 spy_now = get_spy_trend()
-send_tg(f"🚀 <b>البوت V4.9 شغال - FIXED v2</b>\n📋 {
+tickers_text = ", ".join(TICKERS)
+start_msg = "🚀 <b>البوت V4.9 شغال FIXED v3</b>\n📋 " + tickers_text + "\n📈 SPY: " + spy_now + "\n🕐 " + now_ksa().strftime('%H:%M')
+send_tg(start_msg)
+
+no_signal = 0
+while True:
+    try:
+        if now_ksa().date()!= last_date:
+            daily_count.clear()
+            sent_contracts.clear()
+            last_date = now_ksa().date()
+        if not is_us_market_open():
+            time.sleep(60)
+            continue
+        spy = get_spy_trend()
+        print("SCAN", spy, now_ksa().strftime('%H:%M:%S'))
+        found = False
+        for t in TICKERS:
+            if daily_count[t] >= MAX_SIGNALS_PER_TICKER: continue
+            if scan_one(t, spy): found = True
+            time.sleep(15)
+        if not found:
+            no_signal+=1
+            if no_signal >= 6:
+                send_tg("ℹ️ <b>فحص مستمر - 14 شركة</b> | SPY: " + spy + "\nلا يوجد حيتان حاليا ✅")
+                no_signal=0
+                if len(sent_contracts) > 150: sent_contracts.clear()
+        else:
+            no_signal=0
+        time.sleep(SCAN_INTERVAL)
+    except Exception as ex:
+        print("main loop", ex)
+        time.sleep(30)
