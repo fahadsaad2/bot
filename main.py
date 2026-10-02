@@ -8,7 +8,7 @@ from curl_cffi import requests as crequests
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V5 $1-10 7-30d'
+def home(): return 'Bot V5.2 Arabic Fixed'
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -33,7 +33,6 @@ TICKERS = ['NVDA','TSLA','META','AMD','AMZN','MSFT','PLTR','AVGO','SNDK','LITE',
 MIN_VOLUME = 10
 MIN_OI = 10
 MIN_SCORE = 20
-MAX_SPREAD_PCT = 40
 MIN_OPTION_PRICE = 1.0
 MAX_OPTION_PRICE = 10.0
 MIN_DTE = 7
@@ -50,17 +49,14 @@ def safe_float(v,d=0.0):
         if pd.isna(v): return d
         return float(v)
     except: return d
-
 def safe_int(v,d=0):
     try:
         if pd.isna(v): return d
         return int(float(v))
     except: return d
-
 def calculate_dte(exp):
     try: return (datetime.strptime(exp, '%Y-%m-%d').date() - now_us().date()).days
     except: return 0
-
 def is_us_market_open():
     try:
         cur = now_us()
@@ -76,10 +72,8 @@ def get_price_safe(ticker):
             sess = crequests.Session(impersonate="chrome")
             stock = yf.Ticker(ticker, session=sess)
             hist = stock.history(period='5d', interval='1d', auto_adjust=False)
-            if not hist.empty:
-                return stock, hist
-        except Exception as ex:
-            print(ticker + " retry " + str(i) + " " + str(ex))
+            if not hist.empty: return stock, hist
+        except: pass
         time.sleep(5)
     return None, pd.DataFrame()
 
@@ -98,12 +92,16 @@ def format_signal(best):
     target2_o = round(entry*2.5,2)
     icon = '🟢' if best['cp']=='C' else '🔴'
     tipo = 'شراء' if best['cp']=='C' else 'بيع'
-    msg = icon + " WHALE " + best['ticker'] + " " + tipo + " | " + best['spy'] + "\n"
-    msg += best['ticker'] + " $" + str(round(best['price'],2)) + "\n"
-    msg += str(best['strike']) + best['cp'] + " exp " + best['exp'] + " (" + str(best['dte']) + "d)\n"
-    msg += "Entry: $" + str(entry) + " Stop: $" + str(stop_o) + "\n"
-    msg += "T1: $" + str(target_o) + " T2: $" + str(target2_o) + "\n"
-    msg += "Vol " + str(best['vol']) + " OI " + str(best['oi']) + " Score " + str(best['score'])
+    # هنا رجعت العربي المفصل
+    msg = f"{icon} <b>حوت دخل - {best['ticker']} {tipo} | {best['spy']}</b>\n\n"
+    msg += f"📌 <b>{best['ticker']}</b> ${round(best['price'],2)}\n"
+    msg += f"🎯 <b>{best['strike']}{best['cp']}</b> ينتهي {best['exp']} ({best['dte']} يوم)\n"
+    msg += f"💵 دخول: ${entry} | وقف: ${stop_o} (-40%)\n"
+    msg += f"🎯 هدف1: ${target_o} (+80%)\n"
+    msg += f"🚀 هدف2: ${target2_o} (+150%)\n"
+    msg += f"📊 فوليوم {best['vol']} | OI {best['oi']}\n"
+    msg += f"⭐ قوة {best['score']}/100\n"
+    msg += f"🕐 {now_ksa().strftime('%H:%M')} KSA"
     return msg
 
 def scan_one(ticker, spy):
@@ -131,9 +129,7 @@ def scan_one(ticker, spy):
                     if cid in sent_contracts: continue
                     if best is None or score > best['score']:
                         best = {'ticker':ticker,'price':price,'strike':safe_float(row.get('strike')),'cp':cp,'exp':exp,'dte':dte,'prem':prem,'vol':vol,'oi':oi,'score':int(min(score,100)),'spy':spy}
-            except Exception as ex:
-                print(ticker + " " + exp + " err " + str(ex))
-                time.sleep(3)
+            except: time.sleep(2)
         if best and best['score'] >= MIN_SCORE:
             if send_tg(format_signal(best)):
                 sent_contracts.add(best['ticker'] + "_" + best['exp'] + "_" + str(best['strike']) + "_" + best['cp'])
@@ -144,23 +140,20 @@ def scan_one(ticker, spy):
         print(ticker + " failed " + str(ex))
         return False
 
-tickers_text = ", ".join(TICKERS)
+# رسالة البداية عربي مفصل - مصلحة بدون رموز تخرب
 spy_now = get_spy_trend()
-start_msg = "Bot V5 ON | $" + str(MIN_OPTION_PRICE) + "-" + str(MAX_OPTION_PRICE) + " | " + str(MIN_DTE) + "-" + str(MAX_DTE) + "d | " + tickers_text + " | SPY " + spy_now
+tickers_text = ", ".join(TICKERS)
+start_msg = f"🚀 <b>البوت V5.2 شغال</b>\n💵 عقود ${MIN_OPTION_PRICE}-${MAX_OPTION_PRICE}\n📅 مدة {MIN_DTE}-{MAX_DTE} يوم\n📋 {tickers_text}\n📈 SPY: {spy_now}\n🕐 {now_ksa().strftime('%H:%M')}"
 send_tg(start_msg)
 
 no_signal = 0
 while True:
     try:
         if now_ksa().date()!= last_date:
-            daily_count.clear()
-            sent_contracts.clear()
-            last_date = now_ksa().date()
+            daily_count.clear(); sent_contracts.clear(); last_date = now_ksa().date()
         if not is_us_market_open():
-            time.sleep(60)
-            continue
+            time.sleep(60); continue
         spy = get_spy_trend()
-        print("SCAN " + spy)
         found = False
         for t in TICKERS:
             if daily_count[t] >= MAX_SIGNALS_PER_TICKER: continue
@@ -169,12 +162,11 @@ while True:
         if not found:
             no_signal+=1
             if no_signal >= 10:
-                # سطر مصلح - بدون $ كثير
-                msg2 = "Scanning - No whales - SPY " + spy
+                # مصلح بدون $
+                msg2 = f"فحص مستمر - 14 شركة | SPY: {spy} - لا يوجد حيتان حاليا - السوق هادي"
                 send_tg(msg2)
                 no_signal=0
-        else:
-            no_signal=0
+        else: no_signal=0
         time.sleep(SCAN_INTERVAL)
     except Exception as ex:
         print("main loop " + str(ex))
