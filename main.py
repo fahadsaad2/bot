@@ -1,100 +1,92 @@
-import yfinance as yf
-import requests
-import time
-from datetime import datetime, timedelta
+from flask import Flask
+from threading import Thread
+import os, time, requests, finnhub, yfinance as yf
+from datetime import datetime
+import pandas as pd
 
-TELEGRAM_BOT_TOKEN = "حط توكنك هنا"
-TELEGRAM_CHAT_ID = "حط ايديك هنا"
-FINNHUB_API_KEY = "db070i9r01qn6m7vpb90db070i9r01qn6m7vpb9g"
+app = Flask(__name__)
+@app.route('/')
+def home(): return "البوت شغال"
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+Thread(target=run_web, daemon=True).start()
 
-شركاتي = ["NVDA","TSLA","SMCI","MSTR","COIN","AAPL","GOOGL","META","AMD","AMZN","MSFT","PLTR","APP","ARM","AVGO","MU","LITE","SNDK","RDDT"]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-المرسل = set()
+SYMBOLS = ["NVDA","TSLA","SMCI","MSTR","COIN","AAPL","GOOGL","META","AMD","AMZN","MSFT","PLTR","APP","ARM","AVGO","MU","LITE","SNDK","RDDT"]
+sent = set()
 
-def سعر_لحظي(رمز):
+def send(msg):
     try:
-        r = requests.get(f"https://finnhub.io/api/v1/quote?symbol={رمز}&token={FINNHUB_API_KEY}", timeout=5).json()
-        return r['c']
-    except:
-        return None
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
+    except: pass
 
-def فحص(رمز):
+def get_levels(sym):
     try:
-        حالي = سعر_لحظي(رمز)
-        if not حالي: return
-        سهم = yf.Ticker(رمز)
-        شمعات = سهم.history(period="1mo")
-        if len(شمعات) < 20: return
-        مقاومة = شمعات['High'].rolling(20).max().iloc[-1]
-        دعم = شمعات['Low'].rolling(20).min().iloc[-1]
+        now = int(time.time())
+        frm = now - 60*60*24*30
+        c = finnhub_client.stock_candles(sym, 'D', frm, now)
+        if c['s']!='ok': return None,None,None
+        return c['c'][-1], max(c['h'][-20:]), min(c['l'][-20:])
+    except: return None,None,None
 
-        نوع = None; دخول = 0
-        if abs(حالي - مقاومة)/مقاومة < 0.015:
-            نوع = "CALL"; دخول = مقاومة; ايموجي = "🟢 اختراق مقاومة"
-        elif abs(حالي - دعم)/دعم < 0.015:
-            نوع = "PUT"; دخول = دعم; ايموجي = "🔴 كسر دعم"
-        else: return
+def get_opt(sym, price, mode):
+    try:
+        t = yf.Ticker(sym)
+        exps = t.options
+        if not exps: return None
+        exp = exps[0] if mode=="daily" else exps[min(2, len(exps)-1)]
+        chain = t.option_chain(exp).calls
+        filt = chain[(chain['strike']>=price*0.98) & (chain['strike']<=price*1.08)]
+        if filt.empty: filt = chain
+        best = filt.sort_values('volume', ascending=False).iloc[0]
+        return {"strike":best['strike'],"last":best['lastPrice'],"vol":int(best['volume'] or 0),"oi":int(best['openInterest'] or 0),"exp":exp}
+    except: return None
 
-        تواريخ = سهم.options
-        if not تواريخ: return
-        اليوم = datetime.now().date()
-        يومي = None; اسبوعي = None
-        for d in تواريخ:
-            dt = datetime.strptime(d, "%Y-%m-%d").date()
-            if not يومي and dt >= اليوم: يومي = d
-            if dt >= اليوم + timedelta(days=5): اسبوعي = d; break
-        if not يومي: يومي = تواريخ[0]
-        if not اسبوعي: اسبوعي = تواريخ[1] if len(تواريخ)>1 else تواريخ[0]
+def loop():
+    while True:
+        for s in SYMBOLS:
+            p,r,su = get_levels(s)
+            if not p: continue
+            key = f"{s}_{datetime.now().date()}"
+            if p >= r*0.995 and key not in sent:
+                d = get_opt(s,p,"daily")
+                w = get_opt(s,p,"weekly")
 
-        for انتهاء, تاغ, ح1, ح2 in [(يومي, "يومي 0DTE 🔥", 0.3, 6), (اسبوعي, "اسبوعي 🛡️", 1, 15)]:
-            try:
-                سلسلة = سهم.option_chain(انتهاء)
-                عقود = سلسلة.calls if نوع == "CALL" else سلسلة.puts
-                عقود = عقود[(عقود['lastPrice'] >= ح1) & (عقود['lastPrice'] <= ح2)]
-                عقود = عقود[(عقود['strike'] >= حالي*0.85) & (عقود['strike'] <= حالي*1.15)]
-                عقود = عقود.sort_values(['volume','openInterest'], ascending=False)
-                if عقود.empty: continue
-                عقد = عقود.iloc[0]
-                مفتاح = f"{رمز}-{انتهاء}-{عقد['strike']}-{نوع}"
-                if مفتاح in المرسل: continue
-                المرسل.add(مفتاح)
-                if نوع == "CALL":
-                    ه1=دخول*1.015; ه2=دخول*1.03; ه3=دخول*1.05; وقف=دخول*0.97
-                    دخول_نص=f"فوق {دخول:.2f}$"
-                else:
-                    ه1=دخول*0.985; ه2=دخول*0.97; ه3=دخول*0.95; وقف=دخول*1.03
-                    دخول_نص=f"تحت {دخول:.2f}$"
+                msg = f"🟢 *اختراق مقاومة*\n"
+                msg += f"🏢 الشركة: {s}\n"
+                msg += f"💰 السعر الحالي: {p:.2f}$\n"
+                msg += f"📊 المقاومة: {r:.2f}$\n"
+                msg += f"⏰ الوقت: {datetime.now().strftime('%H:%M')}\n"
 
-                فوليوم = int(عقد['volume']) if عقد['volume'] else 0
-                اوبن = int(عقد['openInterest']) if عقد['openInterest'] else 0
+                if d:
+                    msg += f"\n━━━━━━━━━━━━━━\n"
+                    msg += f"🔥 *عقد يومي 0DTE*\n"
+                    msg += f"🎯 سترايك: {d['strike']}$\n"
+                    msg += f"💵 سعر العقد: {d['last']}$\n"
+                    msg += f"📈 الفوليوم: {d['vol']:,}\n"
+                    msg += f"📊 الـ OI: {d['oi']:,}\n"
+                    msg += f"📅 الانتهاء: {d['exp']}\n"
 
-                رسالة = f"""{ايموجي}
-📈 السهم: {رمز}
-📊 النوع: {نوع}
-💵 لحظي: {حالي:.2f}$
-📍 الدخول: {دخول_نص}
+                if w:
+                    msg += f"\n━━━━━━━━━━━━━━\n"
+                    msg += f"🛡️ *عقد اسبوعي*\n"
+                    msg += f"🎯 سترايك: {w['strike']}$\n"
+                    msg += f"💵 سعر العقد: {w['last']}$\n"
+                    msg += f"📈 الفوليوم: {w['vol']:,}\n"
+                    msg += f"📊 الـ OI: {w['oi']:,}\n"
+                    msg += f"📅 الانتهاء: {w['exp']}\n"
 
-💰 العقد ({تاغ}):
-- استرايك: {عقد['strike']}$
-- ينتهي: {انتهاء}
-- سعر العقد: {عقد['lastPrice']:.2f}$
-- فوليوم: {فوليوم:,}
-- اوبن انترست: {اوبن:,}
+                send(msg)
+                sent.add(key)
+            time.sleep(4)
+        time.sleep(60)
 
-🎯 اهداف: {ه1:.2f} / {ه2:.2f} / {ه3:.2f}
-🛑 وقف: {وقف:.2f}
-⚡ لحظي
-"""
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": رسالة})
-                print(f"ارسل {رمز} {تاغ} VOL:{فوليوم}")
-            except: continue
-    except Exception as e:
-        print(f"خطأ {رمز}: {e}")
-
-print("🚀 V9.2 مع VOL+OI شغال - 19 شركة ثابتة")
-while True:
-    for ر in شركاتي:
-        فحص(ر)
-        time.sleep(2)
-    print(f"خلص فحص - {datetime.now().strftime('%H:%M:%S')}")
-    time.sleep(20)
+send("✅ *البوت اشتغل*\nعربي - يومي واسبوعي - فوليوم و OI\nالشركات: NVDA TSLA SMCI MSTR COIN AAPL GOOGL META AMD AMZN MSFT PLTR APP ARM AVGO MU LITE SNDK RDDT")
+Thread(target=loop, daemon=True).start()
+while True: time.sleep(3600)
