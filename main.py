@@ -8,7 +8,7 @@ from curl_cffi import requests as crequests
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V5.2 Arabic Fixed'
+def home(): return 'Bot V5.4 - Final + Entry/Stop'
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -28,7 +28,8 @@ US_EASTERN = ZoneInfo('America/New_York')
 def now_ksa(): return datetime.now(KSA)
 def now_us(): return datetime.now(US_EASTERN)
 
-TICKERS = ['NVDA','TSLA','META','AMD','AMZN','MSFT','PLTR','AVGO','SNDK','LITE','MU','QCOM','APP','SPY']
+# قائمتك النهائية 20 شركة
+TICKERS = ['NVDA','TSLA','SMCI','MSTR','COIN','AAPL','GOOGL','META','AMD','AMZN','MSFT','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT','SPY']
 
 MIN_VOLUME = 10
 MIN_OI = 10
@@ -86,22 +87,38 @@ def get_spy_trend():
     except: return 'NEUTRAL'
 
 def format_signal(best):
-    entry = best['prem']
-    stop_o = round(entry*0.60,2)
-    target_o = round(entry*1.80,2)
-    target2_o = round(entry*2.5,2)
+    # === ميزة الدخول والوقف والهدف ===
+    entry_stock = best['price']
+    entry_option = best['prem']
+
+    # وقف على السهم -2.5%
+    stop_stock = round(entry_stock * 0.975, 2)
+    # اهداف السهم
+    target_stock_1 = round(best['strike'] * 1.02, 2)
+    target_stock_2 = round(best['strike'] * 1.05, 2)
+
+    # للعقد
+    stop_o = round(entry_option*0.60,2)
+    target_o = round(entry_option*1.80,2)
+    target2_o = round(entry_option*2.5,2)
+
     icon = '🟢' if best['cp']=='C' else '🔴'
     tipo = 'شراء' if best['cp']=='C' else 'بيع'
-    # هنا رجعت العربي المفصل
+    time_ksa = now_ksa().strftime('%H:%M %p')
+    time_us = now_us().strftime('%I:%M %p')
+
     msg = f"{icon} <b>حوت دخل - {best['ticker']} {tipo} | {best['spy']}</b>\n\n"
-    msg += f"📌 <b>{best['ticker']}</b> ${round(best['price'],2)}\n"
-    msg += f"🎯 <b>{best['strike']}{best['cp']}</b> ينتهي {best['exp']} ({best['dte']} يوم)\n"
-    msg += f"💵 دخول: ${entry} | وقف: ${stop_o} (-40%)\n"
-    msg += f"🎯 هدف1: ${target_o} (+80%)\n"
-    msg += f"🚀 هدف2: ${target2_o} (+150%)\n"
-    msg += f"📊 فوليوم {best['vol']} | OI {best['oi']}\n"
-    msg += f"⭐ قوة {best['score']}/100\n"
-    msg += f"🕐 {now_ksa().strftime('%H:%M')} KSA"
+    msg += f"📌 <b>{best['ticker']}</b> {tipo}\n\n"
+    msg += f"⏰ <b>وقت الدخول:</b> {time_ksa} KSA\n"
+    msg += f"💰 <b>سعر السهم وقت الدخول:</b> ${round(entry_stock,2)}\n"
+    msg += f"💵 <b>سعر العقد وقت الدخول:</b> ${entry_option}\n\n"
+    msg += f"🛑 <b>وقف خروج:</b> اذا نزل السهم تحت ${stop_stock}\n"
+    msg += f"🎯 <b>هدف السهم 1:</b> ${target_stock_1}\n"
+    msg += f"🚀 <b>هدف السهم 2:</b> ${target_stock_2}\n\n"
+    msg += f"📊 <b>العقد:</b> {best['strike']}{best['cp']} ينتهي {best['exp']} ({best['dte']} يوم)\n"
+    msg += f"💸 هدف العقد: ${target_o} (+80%) | ${target2_o} (+150%)\n"
+    msg += f"⛔ وقف العقد: ${stop_o} (-40%)\n"
+    msg += f"🐋 فوليوم {best['vol']} | OI {best['oi']} | قوة {best['score']}/100"
     return msg
 
 def scan_one(ticker, spy):
@@ -140,10 +157,9 @@ def scan_one(ticker, spy):
         print(ticker + " failed " + str(ex))
         return False
 
-# رسالة البداية عربي مفصل - مصلحة بدون رموز تخرب
 spy_now = get_spy_trend()
 tickers_text = ", ".join(TICKERS)
-start_msg = f"🚀 <b>البوت V5.2 شغال</b>\n💵 عقود ${MIN_OPTION_PRICE}-${MAX_OPTION_PRICE}\n📅 مدة {MIN_DTE}-{MAX_DTE} يوم\n📋 {tickers_text}\n📈 SPY: {spy_now}\n🕐 {now_ksa().strftime('%H:%M')}"
+start_msg = f"🚀 <b>البوت V5.4 النهائي شغال</b>\n💵 عقود ${MIN_OPTION_PRICE}-${MAX_OPTION_PRICE}\n📋 20 شركة: {tickers_text}\n📈 SPY: {spy_now}\n✅ مع الدخول والوقف والهدف\n🕐 {now_ksa().strftime('%H:%M')}"
 send_tg(start_msg)
 
 no_signal = 0
@@ -162,8 +178,7 @@ while True:
         if not found:
             no_signal+=1
             if no_signal >= 10:
-                # مصلح بدون $
-                msg2 = f"فحص مستمر - 14 شركة | SPY: {spy} - لا يوجد حيتان حاليا - السوق هادي"
+                msg2 = f"فحص مستمر - 20 شركة | SPY: {spy} - لا يوجد حيتان"
                 send_tg(msg2)
                 no_signal=0
         else: no_signal=0
