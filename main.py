@@ -1,188 +1,108 @@
-from flask import Flask
-import threading, yfinance as yf, requests, time, os
-from collections import defaultdict
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import pandas as pd
-from curl_cffi import requests as crequests
+import os
+import time
+import requests
+import yfinance as yf
 
-app = Flask(__name__)
-@app.route('/')
-def home(): return 'Bot V5.4 - Final + Entry/Stop'
-def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
-threading.Thread(target=run_flask, daemon=True).start()
+# يقرأ التوكن من الصورة اللي انت حطيتها في Render
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHAT_ID = os.environ.get('CHAT_ID')
+# قائمة شركاتك الـ 19
+الشركات = ["NVDA","TSLA","SMCI","MSTR","COIN","AAPL","GOOGL","META","AMD","AMZN","MSFT","PLTR","APP","ARM","AVGO","MU","LITE","SNDK","RDDT"]
 
-def send_tg(text):
+# عشان ما يكرر نفس التوصية
+تم_الارسال = {}
+
+def ارسل_تيليجرام(نص):
     try:
-        if not BOT_TOKEN or not CHAT_ID: return False
-        url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage'
-        r = requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}, timeout=15)
-        return r.ok
-    except: return False
+        رابط = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(رابط, data={"chat_id": TELEGRAM_CHAT_ID, "text": نص})
+    except:
+        pass
 
-KSA = ZoneInfo('Asia/Riyadh')
-US_EASTERN = ZoneInfo('America/New_York')
-def now_ksa(): return datetime.now(KSA)
-def now_us(): return datetime.now(US_EASTERN)
-
-# قائمتك النهائية 20 شركة
-TICKERS = ['NVDA','TSLA','SMCI','MSTR','COIN','AAPL','GOOGL','META','AMD','AMZN','MSFT','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT','SPY']
-
-MIN_VOLUME = 10
-MIN_OI = 10
-MIN_SCORE = 20
-MIN_OPTION_PRICE = 1.0
-MAX_OPTION_PRICE = 10.0
-MIN_DTE = 7
-MAX_DTE = 30
-SCAN_INTERVAL = 180
-MAX_SIGNALS_PER_TICKER = 3
-
-daily_count = defaultdict(int)
-sent_contracts = set()
-last_date = now_ksa().date()
-
-def safe_float(v,d=0.0):
+def افحص_الشركة(الشركة):
     try:
-        if pd.isna(v): return d
-        return float(v)
-    except: return d
-def safe_int(v,d=0):
-    try:
-        if pd.isna(v): return d
-        return int(float(v))
-    except: return d
-def calculate_dte(exp):
-    try: return (datetime.strptime(exp, '%Y-%m-%d').date() - now_us().date()).days
-    except: return 0
-def is_us_market_open():
-    try:
-        cur = now_us()
-        if cur.weekday()>=5: return False
-        s = datetime(cur.year,cur.month,cur.day,9,30,tzinfo=US_EASTERN).time()
-        e = datetime(cur.year,cur.month,cur.day,16,0,tzinfo=US_EASTERN).time()
-        return s <= cur.time() < e
-    except: return True
+        السهم = yf.Ticker(الشركة)
+        البيانات = السهم.history(period="1mo")
+        if len(البيانات) < 20:
+            return
 
-def get_price_safe(ticker):
-    for i in range(4):
-        try:
-            sess = crequests.Session(impersonate="chrome")
-            stock = yf.Ticker(ticker, session=sess)
-            hist = stock.history(period='5d', interval='1d', auto_adjust=False)
-            if not hist.empty: return stock, hist
-        except: pass
-        time.sleep(5)
-    return None, pd.DataFrame()
+        السعر_الحالي = البيانات['Close'].iloc[-1]
+        المقاومة = البيانات['High'].iloc[:-1].rolling(20).max().iloc[-1]
+        الدعم = البيانات['Low'].iloc[:-1].rolling(20).min().iloc[-1]
 
-def get_spy_trend():
-    try:
-        _, df = get_price_safe('SPY')
-        if df.empty: return 'NEUTRAL'
-        close = df['Close']
-        return 'BULLISH' if close.iloc[-1] > close.ewm(20).mean().iloc[-1] else 'BEARISH'
-    except: return 'NEUTRAL'
+        النوع = None
+        سعر_الدخول = 0
 
-def format_signal(best):
-    # === ميزة الدخول والوقف والهدف ===
-    entry_stock = best['price']
-    entry_option = best['prem']
+        # اذا قرب من المقاومة = CALL
+        if abs(السعر_الحالي - المقاومة) / المقاومة < 0.02:
+            النوع = "CALL"
+            سعر_الدخول = المقاومة
+        # اذا قرب من الدعم = PUT
+        elif abs(السعر_الحالي - الدعم) / الدعم < 0.02:
+            النوع = "PUT"
+            سعر_الدخول = الدعم
+        else:
+            return
 
-    # وقف على السهم -2.5%
-    stop_stock = round(entry_stock * 0.975, 2)
-    # اهداف السهم
-    target_stock_1 = round(best['strike'] * 1.02, 2)
-    target_stock_2 = round(best['strike'] * 1.05, 2)
-
-    # للعقد
-    stop_o = round(entry_option*0.60,2)
-    target_o = round(entry_option*1.80,2)
-    target2_o = round(entry_option*2.5,2)
-
-    icon = '🟢' if best['cp']=='C' else '🔴'
-    tipo = 'شراء' if best['cp']=='C' else 'بيع'
-    time_ksa = now_ksa().strftime('%H:%M %p')
-    time_us = now_us().strftime('%I:%M %p')
-
-    msg = f"{icon} <b>حوت دخل - {best['ticker']} {tipo} | {best['spy']}</b>\n\n"
-    msg += f"📌 <b>{best['ticker']}</b> {tipo}\n\n"
-    msg += f"⏰ <b>وقت الدخول:</b> {time_ksa} KSA\n"
-    msg += f"💰 <b>سعر السهم وقت الدخول:</b> ${round(entry_stock,2)}\n"
-    msg += f"💵 <b>سعر العقد وقت الدخول:</b> ${entry_option}\n\n"
-    msg += f"🛑 <b>وقف خروج:</b> اذا نزل السهم تحت ${stop_stock}\n"
-    msg += f"🎯 <b>هدف السهم 1:</b> ${target_stock_1}\n"
-    msg += f"🚀 <b>هدف السهم 2:</b> ${target_stock_2}\n\n"
-    msg += f"📊 <b>العقد:</b> {best['strike']}{best['cp']} ينتهي {best['exp']} ({best['dte']} يوم)\n"
-    msg += f"💸 هدف العقد: ${target_o} (+80%) | ${target2_o} (+150%)\n"
-    msg += f"⛔ وقف العقد: ${stop_o} (-40%)\n"
-    msg += f"🐋 فوليوم {best['vol']} | OI {best['oi']} | قوة {best['score']}/100"
-    return msg
-
-def scan_one(ticker, spy):
-    try:
-        stock, hist = get_price_safe(ticker)
-        if hist.empty or stock is None: return False
-        price = safe_float(hist['Close'].iloc[-1])
-        if price==0: return False
-        try: exps = stock.options
-        except: return False
-        best = None
-        for exp in exps:
-            dte = calculate_dte(exp)
-            if dte < MIN_DTE or dte > MAX_DTE: continue
+        # يفحص 3 اسابيع قدام (من اسبوع الى شهر)
+        for تاريخ_الانتهاء in السهم.options[1:4]:
             try:
-                chain = stock.option_chain(exp)
-                all_rows = [(r,'C') for _,r in chain.calls.iterrows()] + [(r,'P') for _,r in chain.puts.iterrows()]
-                for row, cp in all_rows:
-                    vol = safe_int(row.get('volume')); oi = safe_int(row.get('openInterest'))
-                    if vol < MIN_VOLUME or oi < MIN_OI: continue
-                    prem = safe_float(row.get('lastPrice'))
-                    if prem < MIN_OPTION_PRICE or prem > MAX_OPTION_PRICE: continue
-                    score = 35 + min(vol/5, 35) + min(oi/10, 20)
-                    cid = ticker + "_" + exp + "_" + str(row.get('strike')) + "_" + cp
-                    if cid in sent_contracts: continue
-                    if best is None or score > best['score']:
-                        best = {'ticker':ticker,'price':price,'strike':safe_float(row.get('strike')),'cp':cp,'exp':exp,'dte':dte,'prem':prem,'vol':vol,'oi':oi,'score':int(min(score,100)),'spy':spy}
-            except: time.sleep(2)
-        if best and best['score'] >= MIN_SCORE:
-            if send_tg(format_signal(best)):
-                sent_contracts.add(best['ticker'] + "_" + best['exp'] + "_" + str(best['strike']) + "_" + best['cp'])
-                daily_count[ticker]+=1
-                return True
-        return False
-    except Exception as ex:
-        print(ticker + " failed " + str(ex))
-        return False
+                if النوع == "CALL":
+                    العقود = السهم.option_chain(تاريخ_الانتهاء).calls
+                else:
+                    العقود = السهم.option_chain(تاريخ_الانتهاء).puts
 
-spy_now = get_spy_trend()
-tickers_text = ", ".join(TICKERS)
-start_msg = f"🚀 <b>البوت V5.4 النهائي شغال</b>\n💵 عقود ${MIN_OPTION_PRICE}-${MAX_OPTION_PRICE}\n📋 20 شركة: {tickers_text}\n📈 SPY: {spy_now}\n✅ مع الدخول والوقف والهدف\n🕐 {now_ksa().strftime('%H:%M')}"
-send_tg(start_msg)
+                # من 1 دولار الى 10 دولار فقط
+                العقود = العقود[(العقود["lastPrice"] >= 1) & (العقود["lastPrice"] <= 10)]
+                # قريب من سعر السهم
+                العقود = العقود[(العقود["strike"] >= السعر_الحالي*0.92) & (العقود["strike"] <= السعر_الحالي*1.08)]
 
-no_signal = 0
+                if العقود.empty:
+                    continue
+
+                # يختار اكثر عقد عليه تداول
+                افضل_عقد = العقود.sort_values("volume", ascending=False).iloc[0]
+
+                المفتاح = f"{الشركة}_{النوع}_{افضل_عقد['strike']}_{تاريخ_الانتهاء}"
+                if تم_الارسال.get(المفتاح):
+                    continue
+
+                if النوع == "CALL":
+                    الرسالة = f"""🎯 {الشركة} - CALL 🟢
+
+💰 الاسترايك: {افضل_عقد['strike']}$
+📈 الدخول: فوق {سعر_الدخول:.2f}$
+🎯 الاهداف: {سعر_الدخول*1.03:.2f} / {سعر_الدخول*1.06:.2f} / {سعر_الدخول*1.10:.2f}$
+🛑 وقف الخسارة: {سعر_الدخول*0.95:.2f}$
+📅 تاريخ الانتهاء: {تاريخ_الانتهاء}
+💵 سعر العقد: {افضل_عقد['lastPrice']}$"""
+                else:
+                    الرسالة = f"""🎯 {الشركة} - PUT 🔴
+
+💰 الاسترايك: {افضل_عقد['strike']}$
+📉 الدخول: تحت {سعر_الدخول:.2f}$
+🎯 الاهداف: {سعر_الدخول*0.97:.2f} / {سعر_الدخول*0.94:.2f} / {سعر_الدخول*0.90:.2f}$
+🛑 وقف الخسارة: {سعر_الدخول*1.05:.2f}$
+📅 تاريخ الانتهاء: {تاريخ_الانتهاء}
+💵 سعر العقد: {افضل_عقد['lastPrice']}$"""
+
+                ارسل_تيليجرام(الرسالة)
+                print(الرسالة)
+                تم_الارسال[المفتاح] = True
+                break
+
+            except:
+                continue
+    except:
+        pass
+
+# يشتغل 24 ساعة
+print("✅ البوت اشتغل - يفحص 19 شركة كل دقيقة")
+ارسل_تيليجرام("✅ البوت اشتغل - يفحص 19 شركة حقتك")
+
 while True:
-    try:
-        if now_ksa().date()!= last_date:
-            daily_count.clear(); sent_contracts.clear(); last_date = now_ksa().date()
-        if not is_us_market_open():
-            time.sleep(60); continue
-        spy = get_spy_trend()
-        found = False
-        for t in TICKERS:
-            if daily_count[t] >= MAX_SIGNALS_PER_TICKER: continue
-            if scan_one(t, spy): found = True
-            time.sleep(8)
-        if not found:
-            no_signal+=1
-            if no_signal >= 10:
-                msg2 = f"فحص مستمر - 20 شركة | SPY: {spy} - لا يوجد حيتان"
-                send_tg(msg2)
-                no_signal=0
-        else: no_signal=0
-        time.sleep(SCAN_INTERVAL)
-    except Exception as ex:
-        print("main loop " + str(ex))
-        time.sleep(30)
+    for شركة in الشركات:
+        افحص_الشركة(شركة)
+        time.sleep(2)
+    time.sleep(60)
