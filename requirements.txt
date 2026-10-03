@@ -1,5 +1,5 @@
 Flask
-yfinance
 requests
+finnhub-python
+yfinance
 pandas
-curl_cffi
