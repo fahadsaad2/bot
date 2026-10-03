@@ -29,16 +29,17 @@ def send(msg):
     except Exception as e:
         print(f"SEND ERR {e}", flush=True)
 
+# تعديل الدالة لتجلب المقاومة عن طريق yfinance لتفادي خطأ 403 في Finnhub
 def update_resistances():
-    now = int(time.time())
-    frm = now - 60*60*24*30
     for sym in SYMBOLS:
         try:
-            c = finnhub_client.stock_candles(sym, 'D', frm, now)
-            if c.get('s') == 'ok' and len(c['h']) >= 20:
-                RES_CACHE[sym] = max(c['h'][-20:])
-            time.sleep(1)
-        except: pass
+            ticker = yf.Ticker(sym)
+            hist = ticker.history(period="1m")
+            if not hist.empty and len(hist) >= 20:
+                RES_CACHE[sym] = max(hist['High'].tail(20))
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"RES ERR {sym}: {e}", flush=True)
 
 def get_opt(sym, price, mode):
     try:
@@ -72,6 +73,8 @@ def loop():
             try:
                 res = RES_CACHE.get(s)
                 if not res: continue
+
+                # جلب السعر اللحظي
                 q = finnhub_client.quote(s)
                 p = float(q.get('c', 0))
                 if p == 0: continue
@@ -95,7 +98,8 @@ def loop():
                     send(msg)
                     sent.add(key)
                 time.sleep(1)
-            except: pass
+            except Exception as e:
+                print(f"LOOP ERR {s}: {e}", flush=True)
         time.sleep(15)
 
 Thread(target=loop, daemon=True).start()
