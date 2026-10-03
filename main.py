@@ -1,108 +1,96 @@
-import os
-import time
-import requests
 import yfinance as yf
+import requests
+import time
+from datetime import datetime, timedelta
 
-# يقرأ التوكن من الصورة اللي انت حطيتها في Render
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = "حط توكنك هنا"
+TELEGRAM_CHAT_ID = "حط ايديك هنا"
+FINNHUB_API_KEY = "db070i9r01qn6m7vpb90db070i9r01qn6m7vpb9g"
 
-# قائمة شركاتك الـ 19
-الشركات = ["NVDA","TSLA","SMCI","MSTR","COIN","AAPL","GOOGL","META","AMD","AMZN","MSFT","PLTR","APP","ARM","AVGO","MU","LITE","SNDK","RDDT"]
+# قائمتك الثابتة النهائية - ما تتغير
+شركاتي = ["NVDA","TSLA","SMCI","MSTR","COIN","AAPL","GOOGL","META","AMD","AMZN","MSFT","PLTR","APP","ARM","AVGO","MU","LITE","SNDK","RDDT"]
 
-# عشان ما يكرر نفس التوصية
-تم_الارسال = {}
+المرسل = set()
 
-def ارسل_تيليجرام(نص):
+def سعر_لحظي(رمز):
     try:
-        رابط = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(رابط, data={"chat_id": TELEGRAM_CHAT_ID, "text": نص})
+        r = requests.get(f"https://finnhub.io/api/v1/quote?symbol={رمز}&token={FINNHUB_API_KEY}", timeout=5).json()
+        return r['c']
     except:
-        pass
+        return None
 
-def افحص_الشركة(الشركة):
+def فحص(رمز):
     try:
-        السهم = yf.Ticker(الشركة)
-        البيانات = السهم.history(period="1mo")
-        if len(البيانات) < 20:
-            return
+        حالي = سعر_لحظي(رمز)
+        if not حالي: return
+        سهم = yf.Ticker(رمز)
+        شمعات = سهم.history(period="1mo")
+        if len(شمعات) < 20: return
+        مقاومة = شمعات['High'].rolling(20).max().iloc[-1]
+        دعم = شمعات['Low'].rolling(20).min().iloc[-1]
 
-        السعر_الحالي = البيانات['Close'].iloc[-1]
-        المقاومة = البيانات['High'].iloc[:-1].rolling(20).max().iloc[-1]
-        الدعم = البيانات['Low'].iloc[:-1].rolling(20).min().iloc[-1]
+        نوع = None; دخول = 0
+        if abs(حالي - مقاومة)/مقاومة < 0.015:
+            نوع = "CALL"; دخول = مقاومة; ايموجي = "🟢 اختراق مقاومة"
+        elif abs(حالي - دعم)/دعم < 0.015:
+            نوع = "PUT"; دخول = دعم; ايموجي = "🔴 كسر دعم"
+        else: return
 
-        النوع = None
-        سعر_الدخول = 0
+        تواريخ = سهم.options
+        if not تواريخ: return
+        اليوم = datetime.now().date()
+        يومي = None; اسبوعي = None
+        for d in تواريخ:
+            dt = datetime.strptime(d, "%Y-%m-%d").date()
+            if not يومي and dt >= اليوم: يومي = d
+            if dt >= اليوم + timedelta(days=5): اسبوعي = d; break
+        if not يومي: يومي = تواريخ[0]
+        if not اسبوعي: اسبوعي = تواريخ[1] if len(تواريخ)>1 else تواريخ[0]
 
-        # اذا قرب من المقاومة = CALL
-        if abs(السعر_الحالي - المقاومة) / المقاومة < 0.02:
-            النوع = "CALL"
-            سعر_الدخول = المقاومة
-        # اذا قرب من الدعم = PUT
-        elif abs(السعر_الحالي - الدعم) / الدعم < 0.02:
-            النوع = "PUT"
-            سعر_الدخول = الدعم
-        else:
-            return
-
-        # يفحص 3 اسابيع قدام (من اسبوع الى شهر)
-        for تاريخ_الانتهاء in السهم.options[1:4]:
+        for انتهاء, تاغ, ح1, ح2 in [(يومي, "يومي 0DTE 🔥", 0.3, 4), (اسبوعي, "اسبوعي 🛡️", 1, 10)]:
             try:
-                if النوع == "CALL":
-                    العقود = السهم.option_chain(تاريخ_الانتهاء).calls
+                سلسلة = سهم.option_chain(انتهاء)
+                عقود = سلسلة.calls if نوع == "CALL" else سلسلة.puts
+                عقود = عقود[(عقود['lastPrice'] >= ح1) & (عقود['lastPrice'] <= ح2)]
+                عقود = عقود.sort_values(['volume','openInterest'], ascending=False)
+                if عقود.empty: continue
+                عقد = عقود.iloc[0]
+                مفتاح = f"{رمز}-{انتهاء}-{عقد['strike']}-{نوع}"
+                if مفتاح in المرسل: continue
+                المرسل.add(مفتاح)
+                if نوع == "CALL":
+                    ه1=دخول*1.015; ه2=دخول*1.03; ه3=دخول*1.05; وقف=دخول*0.97
+                    دخول_نص=f"فوق {دخول:.2f}$"
                 else:
-                    العقود = السهم.option_chain(تاريخ_الانتهاء).puts
+                    ه1=دخول*0.985; ه2=دخول*0.97; ه3=دخول*0.95; وقف=دخول*1.03
+                    دخول_نص=f"تحت {دخول:.2f}$"
 
-                # من 1 دولار الى 10 دولار فقط
-                العقود = العقود[(العقود["lastPrice"] >= 1) & (العقود["lastPrice"] <= 10)]
-                # قريب من سعر السهم
-                العقود = العقود[(العقود["strike"] >= السعر_الحالي*0.92) & (العقود["strike"] <= السعر_الحالي*1.08)]
+                رسالة = f"""{ايموجي}
+📈 السهم: {رمز}
+📊 النوع: {نوع}
+💵 لحظي: {حالي:.2f}$
+📍 الدخول: {دخول_نص}
 
-                if العقود.empty:
-                    continue
+💰 العقد ({تاغ}):
+- استرايك: {عقد['strike']}$
+- ينتهي: {انتهاء}
+- سعر العقد: {عقد['lastPrice']:.2f}$
+- سيولة: {int(عقد['volume'])}
 
-                # يختار اكثر عقد عليه تداول
-                افضل_عقد = العقود.sort_values("volume", ascending=False).iloc[0]
+🎯 اهداف: {ه1:.2f} / {ه2:.2f} / {ه3:.2f}
+🛑 وقف: {وقف:.2f}
+⚡ لحظي
+"""
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": رسالة})
+                print(f"ارسل {رمز} {تاغ}")
+            except: continue
+    except Exception as e:
+        print(f"خطأ {رمز}: {e}")
 
-                المفتاح = f"{الشركة}_{النوع}_{افضل_عقد['strike']}_{تاريخ_الانتهاء}"
-                if تم_الارسال.get(المفتاح):
-                    continue
-
-                if النوع == "CALL":
-                    الرسالة = f"""🎯 {الشركة} - CALL 🟢
-
-💰 الاسترايك: {افضل_عقد['strike']}$
-📈 الدخول: فوق {سعر_الدخول:.2f}$
-🎯 الاهداف: {سعر_الدخول*1.03:.2f} / {سعر_الدخول*1.06:.2f} / {سعر_الدخول*1.10:.2f}$
-🛑 وقف الخسارة: {سعر_الدخول*0.95:.2f}$
-📅 تاريخ الانتهاء: {تاريخ_الانتهاء}
-💵 سعر العقد: {افضل_عقد['lastPrice']}$"""
-                else:
-                    الرسالة = f"""🎯 {الشركة} - PUT 🔴
-
-💰 الاسترايك: {افضل_عقد['strike']}$
-📉 الدخول: تحت {سعر_الدخول:.2f}$
-🎯 الاهداف: {سعر_الدخول*0.97:.2f} / {سعر_الدخول*0.94:.2f} / {سعر_الدخول*0.90:.2f}$
-🛑 وقف الخسارة: {سعر_الدخول*1.05:.2f}$
-📅 تاريخ الانتهاء: {تاريخ_الانتهاء}
-💵 سعر العقد: {افضل_عقد['lastPrice']}$"""
-
-                ارسل_تيليجرام(الرسالة)
-                print(الرسالة)
-                تم_الارسال[المفتاح] = True
-                break
-
-            except:
-                continue
-    except:
-        pass
-
-# يشتغل 24 ساعة
-print("✅ البوت اشتغل - يفحص 19 شركة كل دقيقة")
-ارسل_تيليجرام("✅ البوت اشتغل - يفحص 19 شركة حقتك")
-
+print("🚀 V9 الثابت شغال - 19 شركة")
 while True:
-    for شركة in الشركات:
-        افحص_الشركة(شركة)
+    for ر in شركاتي:
+        فحص(ر)
         time.sleep(2)
-    time.sleep(60)
+    print(f"خلص فحص - {datetime.now().strftime('%H:%M:%S')}")
+    time.sleep(20)
