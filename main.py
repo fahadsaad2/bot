@@ -6,7 +6,7 @@ import pandas as pd
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot OK - Final Version"
+def home(): return "Bot OK - CALL/PUT + SMA+RSI"
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
@@ -31,6 +31,23 @@ def send(msg):
     except Exception as e:
         print(f"SEND ERR {e}", flush=True)
 
+def calc_rsi(hist, period=14):
+    try:
+        delta = hist['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
+    except:
+        return 50.0
+
+def calc_sma(hist, period=50):
+    try:
+        return float(hist['Close'].rolling(period).mean().iloc[-1])
+    except:
+        return float(hist['Close'].iloc[-1])
+
 def calc_atr(hist, period=14):
     try:
         hl = hist['High'] - hist['Low']
@@ -42,29 +59,39 @@ def calc_atr(hist, period=14):
     except:
         return float(hist['Close'].iloc[-1] * 0.02)
 
-def calc_levels(hist, entry_price, is_squeeze=False, gamma_res=None):
+def calc_levels(hist, entry_price, is_squeeze=False, gamma_res=None, is_put=False):
     atr = calc_atr(hist, 14)
-    if is_squeeze:
-        stop = entry_price - (atr * 1.0)
-        if gamma_res and gamma_res > entry_price and gamma_res < (entry_price + atr * 2.0):
-            t1 = gamma_res
+    if is_put:
+        stop = entry_price + (atr * 1.0)
+        if is_squeeze:
+            t1 = entry_price - (atr * 1.5)
+            t2 = entry_price - (atr * 3.0)
+            t3 = entry_price - (atr * 5.0)
         else:
-            t1 = entry_price + (atr * 1.5)
-        t2 = entry_price + (atr * 3.0)
-        t3 = entry_price + (atr * 5.0)
+            t1 = entry_price - (atr * 1.2)
+            t2 = entry_price - (atr * 2.5)
+            t3 = entry_price - (atr * 4.0)
     else:
-        stop = entry_price - (atr * 1.2)
-        t1 = entry_price + (atr * 1.2)
-        t2 = entry_price + (atr * 2.5)
-        t3 = entry_price + (atr * 4.0)
+        stop = entry_price - (atr * 1.0) if is_squeeze else entry_price - (atr * 1.2)
+        if is_squeeze:
+            if gamma_res and gamma_res > entry_price and gamma_res < (entry_price + atr * 2.0):
+                t1 = gamma_res
+            else:
+                t1 = entry_price + (atr * 1.5)
+            t2 = entry_price + (atr * 3.0)
+            t3 = entry_price + (atr * 5.0)
+        else:
+            t1 = entry_price + (atr * 1.2)
+            t2 = entry_price + (atr * 2.5)
+            t3 = entry_price + (atr * 4.0)
     return round(stop,2), round(t1,2), round(t2,2), round(t3,2), round(atr,2)
 
 def update_resistances():
     for sym in SYMBOLS:
         try:
             ticker = yf.Ticker(sym)
-            hist = ticker.history(period="1mo")
-            if not hist.empty and len(hist) >= 10:
+            hist = ticker.history(period="3mo") # نحتاج 3 شهور عشان SMA50
+            if not hist.empty and len(hist) >= 60:
                 RES_CACHE[sym] = max(hist['High'].tail(5))
                 HIST_CACHE[sym] = hist
             time.sleep(0.6)
@@ -75,17 +102,15 @@ def get_gamma_walls(sym, price):
     try:
         t = yf.Ticker(sym)
         exps = t.options[:2]
-        all_calls, all_puts = [], []
+        all_calls = []
         for exp in exps:
             chain = t.option_chain(exp)
             all_calls.append(chain.calls)
-            all_puts.append(chain.puts)
         if not all_calls: return None
         calls = pd.concat(all_calls)
-        puts = pd.concat(all_puts)
         calls_above = calls[calls['strike'] >= price]
         wall_res = calls_above.sort_values('openInterest', ascending=False).iloc[0] if not calls_above.empty else None
-        return {"res_strike": float(wall_res['strike']) if wall_res is not None else None, "res_oi": int(wall_res['openInterest']) if wall_res is not None else 0}
+        return {"res_strike": float(wall_res['strike']) if wall_res is not None else None}
     except:
         return None
 
@@ -102,12 +127,14 @@ def check_squeeze(hist):
         upper_kc = ma20 + (1.5 * atr)
         lower_kc = ma20 - (1.5 * atr)
         is_squeeze = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-        is_firing = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2]) and not is_squeeze
-        return {"squeeze": is_squeeze, "firing": is_firing}
+        prev_squeeze = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
+        is_firing = prev_squeeze and not is_squeeze
+        direction = "UP" if close.iloc[-1] > ma20.iloc[-1] else "DOWN"
+        return {"squeeze": is_squeeze, "firing": is_firing, "dir": direction}
     except:
         return None
 
-def get_opt(sym, price, mode):
+def get_opt(sym, price, mode, opt_type="CALL"):
     try:
         t = yf.Ticker(sym)
         exps = t.options
@@ -116,9 +143,13 @@ def get_opt(sym, price, mode):
             exp = exps[1] if len(exps) > 1 else exps[0]
         else:
             exp = exps[min(2, len(exps)-1)]
-        chain = t.option_chain(exp).calls
+        chain_full = t.option_chain(exp)
+        chain = chain_full.calls if opt_type == "CALL" else chain_full.puts
         chain = chain[(chain['lastPrice'] <= 10.0) & (chain['lastPrice'] >= 0.30)]
-        filt = chain[(chain['strike'] >= price * 0.999) & (chain['strike'] <= price * 1.05)]
+        if opt_type == "CALL":
+            filt = chain[(chain['strike'] >= price * 0.99) & (chain['strike'] <= price * 1.06)]
+        else:
+            filt = chain[(chain['strike'] <= price * 1.01) & (chain['strike'] >= price * 0.94)]
         if filt.empty:
             filt = chain
         if filt.empty:
@@ -134,7 +165,7 @@ def get_opt(sym, price, mode):
 
 def loop():
     update_resistances()
-    send("✅ البوت النهائي اشتغل - تم اصلاح الخطأ")
+    send("✅ البوت اشتغل - CALL/PUT + SMA50 + RSI فلتر")
     last_res_update = time.time()
     while True:
         if time.time() - last_res_update > 43200:
@@ -153,40 +184,69 @@ def loop():
                 p = float(q.get('c', 0))
                 if p == 0:
                     continue
+
+                rsi = calc_rsi(hist)
+                sma50 = calc_sma(hist, 50)
                 sq = check_squeeze(hist)
                 sq_key = f"{s}_{today_str}_sq"
+
                 if sq and (sq['squeeze'] or sq['firing']) and sq_key not in sent_squeeze:
+                    is_put_signal = sq['dir'] == "DOWN"
+                    # فلتر SMA + RSI
+                    if sq['firing']:
+                        if not is_put_signal and (p < sma50 or rsi < 52):
+                            # كان المفروض CALL بس فلتر ما سمح
+                            continue
+                        if is_put_signal and (p > sma50 or rsi > 48):
+                            # كان المفروض PUT بس فلتر ما سمح
+                            continue
+                    else: # انضغاط فقط - لا ترسل اذا عكس الترند
+                        if p < sma50 and rsi < 50:
+                            continue # سهم نازل لا ترسل انضغاط
+
+                    opt_type = "PUT" if is_put_signal else "CALL"
                     gamma = get_gamma_walls(s, p)
                     gamma_strike = gamma['res_strike'] if gamma else None
-                    stop, t1, t2, t3, atr = calc_levels(hist, p, is_squeeze=True, gamma_res=gamma_strike)
-                    d = get_opt(s, p, "daily")
-                    w = get_opt(s, p, "weekly")
+                    stop, t1, t2, t3, atr = calc_levels(hist, p, is_squeeze=True, gamma_res=gamma_strike, is_put=is_put_signal)
+                    d = get_opt(s, p, "daily", opt_type)
+                    w = get_opt(s, p, "weekly", opt_type)
                     if d is None and w is None:
                         continue
+
                     name_ar = AR_NAMES.get(s, s)
-                    firing_txt = "🔥 فك ضغط" if sq['firing'] else "⚠️ انضغاط"
+                    if sq['firing']:
+                        firing_txt = f"🔥 فك ضغط {opt_type} - RSI:{rsi:.0f}"
+                    else:
+                        firing_txt = f"⚠️ انضغاط {opt_type} - RSI:{rsi:.0f}"
+
                     msg = f"{firing_txt} - <b>{name_ar} ({s})</b> {p:.2f}$\n"
-                    msg += f"📊 مقاومة 5ايام: {res:.2f}$\n"
+                    msg += f"📊 SMA50: {sma50:.2f}$ | مقاومة 5ايام: {res:.2f}$\n"
                     if gamma and gamma['res_strike']:
                         msg += f"🧱 جدار غاما: {gamma['res_strike']:.0f}$\n"
-                    msg += f"\n🚀 دخول: {p:.2f}$\n🛑 وقف: {stop}$ ATR:{atr}$\n🎯 هدف1: {t1}$\n🎯 هدف2: {t2}$\n🎯 هدف3: {t3}$\n"
+                    if is_put_signal:
+                        msg += f"\n🔻 دخول PUT: {p:.2f}$\n🛑 وقف: {stop}$ ATR:{atr}$\n🎯 هدف1: {t1}$\n🎯 هدف2: {t2}$\n🎯 هدف3: {t3}$\n"
+                    else:
+                        msg += f"\n🚀 دخول CALL: {p:.2f}$\n🛑 وقف: {stop}$ ATR:{atr}$\n🎯 هدف1: {t1}$\n🎯 هدف2: {t2}$\n🎯 هدف3: {t3}$\n"
                     if d:
-                        msg += f"\n🔥 يومي - {d['exp']} {'🐋' if d['whale'] else ''}\n💰 {d['strike']}$ CALL - {d['last']}$\n"
+                        msg += f"\n🔥 يومي - {d['exp']} {'🐋' if d['whale'] else ''}\n💰 {d['strike']}$ {opt_type} - {d['last']}$\n"
                     if w:
-                        msg += f"\n🛡️ اسبوعي - {w['exp']}\n💰 {w['strike']}$ CALL - {w['last']}$\n"
+                        msg += f"\n🛡️ اسبوعي - {w['exp']}\n💰 {w['strike']}$ {opt_type} - {w['last']}$\n"
                     send(msg)
                     sent_squeeze.add(sq_key)
+
                 key = f"{s}_{today_str}"
                 if p >= res * 0.995 and key not in sent:
+                    if p < sma50 or rsi < 52: # فلتر الاختراق
+                        continue
                     gamma = get_gamma_walls(s, p)
                     gamma_strike = gamma['res_strike'] if gamma else None
-                    stop, t1, t2, t3, atr = calc_levels(hist, res, is_squeeze=False, gamma_res=gamma_strike)
-                    d = get_opt(s, p, "daily")
-                    w = get_opt(s, p, "weekly")
+                    stop, t1, t2, t3, atr = calc_levels(hist, res, is_squeeze=False, is_put=False)
+                    d = get_opt(s, p, "daily", "CALL")
+                    w = get_opt(s, p, "weekly", "CALL")
                     if d is None and w is None:
                         continue
                     name_ar = AR_NAMES.get(s, s)
-                    msg = f"🟢 <b>اختراق - {name_ar} ({s})</b> {p:.2f}$\n📊 مقاومة: {res:.2f}$\n"
+                    msg = f"🟢 <b>اختراق CALL - {name_ar} ({s})</b> {p:.2f}$\n📊 مقاومة: {res:.2f}$ SMA50:{sma50:.0f} RSI:{rsi:.0f}\n"
                     if gamma and gamma['res_strike']:
                         msg += f"🧱 غاما: {gamma['res_strike']:.0f}$\n"
                     msg += f"\n🚀 دخول فوق {res:.2f}$\n🛑 وقف: {stop}$\n🎯 {t1}$ | {t2}$ | {t3}$\n"
