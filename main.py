@@ -76,7 +76,7 @@ def get_finnhub_quote_safe(sym):
       return finnhub_client.quote(sym)
     except Exception as e:
       if '429' in str(e):
-        time.sleep(2)  # انتظار ثانيتين في حال كان هناك ضغط طلبات
+        time.sleep(2)
       else:
         print(f'FINNHUB ERR {sym}: {e}', flush=True)
         break
@@ -394,7 +394,7 @@ def loop():
           msg += f"\n🔥 عقد يومي (0-7 ايام) {d['exp']} {whale_txt}\n"
           msg += f"💰 سترايك {d['strike']}$ - سعره {d['last']}$ | فوليوم: {d['vol']} | OI: {d['oi']} | فرق: {d['spread']:.0%}\n"
         if w:
-          msg += f"\n🛡️️ عقد شهري (8-30 يوم) {w['exp']}\n"
+          msg += f"\n🛡 عقد شهري (8-30 يوم) {w['exp']}\n"
           msg += f"💰 سترايك {w['strike']}$ - سعره {w['last']}$ | فوليوم: {w['vol']} | OI: {w['oi']} | فرق: {w['spread']:.0%}\n"
         send(msg)
         sent_squeeze.add(sq_key)
@@ -402,7 +402,7 @@ def loop():
       except Exception as e:
         print(f'LOOP ERR {s}: {e}', flush=True)
 
-      time.sleep(1.0)  # تأخير ثانية واحدة بين كل سهم لمنع خطأ 429
+      time.sleep(1.0)
 
     time.sleep(15)
 
