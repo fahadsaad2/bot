@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-  return 'Bot OK - 19 COMPANIES CRUMB FIXED'
+  return 'Bot OK - Optimized Filters & Squeeze Active'
 
 def run_web():
   port = int(os.environ.get('PORT', 10000))
@@ -29,11 +29,12 @@ TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
 TIER2 = ['SMCI','MSTR','COIN','AAPL','AMD','AMZN','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT']
 SYMBOLS = TIER1 + TIER2
 
-MIN_VOL_TIER1 = 100
-MIN_OI_TIER1 = 500
-MIN_VOL_TIER2 = 20
-MIN_OI_TIER2 = 100
-MAX_SPREAD_PCT = 0.15
+# تخفيف شروط الفوليوم والسبريد لتسهيل مرور العقود
+MIN_VOL_TIER1 = 50
+MIN_OI_TIER1 = 200
+MIN_VOL_TIER2 = 10
+MIN_OI_TIER2 = 50
+MAX_SPREAD_PCT = 0.35
 
 RES_CACHE = {}
 HIST_CACHE = {}
@@ -178,18 +179,21 @@ def get_opt(sym, price, mode, opt_type='CALL'):
     exps = t.options
     if not exps:
       return None
-    target_exps = exps[0:3] if mode == 'daily' else exps[2:8]
+    target_exps = exps[0:2] if mode == 'daily' else exps[2:6]
     best_overall = None
     best_score = -1
     for exp in target_exps:
       try:
         chain_full = t.option_chain(exp)
         chain = chain_full.calls if opt_type == 'CALL' else chain_full.puts
-        chain = chain[(chain['lastPrice'] <= 10.0) & (chain['lastPrice'] >= 1.0)]
+        # توسيع النطاق السعري للعقد بين 0.5$ و 15$
+        chain = chain[(chain['lastPrice'] <= 15.0) & (chain['lastPrice'] >= 0.5)]
+        
         if opt_type == 'CALL':
-          filt = chain[(chain['strike'] >= price * 0.97) & (chain['strike'] <= price * 1.08)]
+          filt = chain[(chain['strike'] >= price * 0.95) & (chain['strike'] <= price * 1.10)]
         else:
-          filt = chain[(chain['strike'] <= price * 1.03) & (chain['strike'] >= price * 0.92)]
+          filt = chain[(chain['strike'] <= price * 1.05) & (chain['strike'] >= price * 0.90)]
+          
         if filt.empty:
           continue
         for _, row in filt.iterrows():
@@ -200,18 +204,20 @@ def get_opt(sym, price, mode, opt_type='CALL'):
           last = float(row['lastPrice'] or 0)
           if last == 0:
             continue
-          spread_pct = (ask - bid) / last if bid > 0 and ask > 0 else 1.0
+          spread_pct = (ask - bid) / last if bid > 0 and ask > 0 else 0.20
           min_vol = MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
           min_oi = MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
+          
           if vol < min_vol or oi < min_oi:
             continue
           if spread_pct > MAX_SPREAD_PCT:
             continue
-          score = (vol * 0.5) + (oi * 0.2) - (spread_pct * 1000)
+          score = (vol * 0.5) + (oi * 0.2) - (spread_pct * 100)
           if score > best_score:
             best_score = score
             flow = (vol / oi * 100) if oi > 0 else 0
-            whale = vol > 1000 and flow > 150
+            # زيادة حساسية كشف الحيتان
+            whale = vol > 500 and flow > 120
             best_overall = {'strike': row['strike'], 'last': last, 'vol': vol, 'oi': oi, 'exp': exp, 'whale': whale, 'spread': spread_pct}
       except:
         continue
@@ -222,7 +228,7 @@ def get_opt(sym, price, mode, opt_type='CALL'):
 
 def loop():
   update_resistances()
-  send('✅ تم تشغيل البوت - 19 شركة | سعر 1$-10$ | يومي 0-7 وشهري 8-30 يوم')
+  send('✅ تم تشغيل البوت - 19 شركة | تم تحسين فلاتر الزخم والعقود')
   last_res_update = time.time()
   while True:
     if time.time() - last_res_update > 43200:
