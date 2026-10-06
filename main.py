@@ -9,15 +9,13 @@ import requests
 import yfinance as yf
 
 app = Flask(__name__)
-
 @app.route('/')
 def home():
-  return 'Bot OK - Optimized Filters & Squeeze Active'
+  return 'Bot OK - Fixed Squeeze & Filters'
 
 def run_web():
   port = int(os.environ.get('PORT', 10000))
   app.run(host='0.0.0.0', port=port)
-
 Thread(target=run_web, daemon=True).start()
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -29,7 +27,6 @@ TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
 TIER2 = ['SMCI','MSTR','COIN','AAPL','AMD','AMZN','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT']
 SYMBOLS = TIER1 + TIER2
 
-# تخفيف شروط الفوليوم والسبريد لتسهيل مرور العقود
 MIN_VOL_TIER1 = 50
 MIN_OI_TIER1 = 200
 MIN_VOL_TIER2 = 10
@@ -38,15 +35,11 @@ MAX_SPREAD_PCT = 0.35
 
 RES_CACHE = {}
 HIST_CACHE = {}
-sent_squeeze = set()
+sent_squeeze = {} # غيرته من set الى dict عشان وقت
 
 def send(msg):
   try:
-    requests.post(
-        f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-        json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
-        timeout=20,
-    )
+    requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=20)
   except Exception as e:
     print(f'SEND ERR {e}', flush=True)
 
@@ -71,14 +64,11 @@ def calc_rsi(hist, period=14):
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
-  except:
-    return 50.0
+  except: return 50.0
 
 def calc_sma(hist, period=50):
-  try:
-    return float(hist['Close'].rolling(period).mean().iloc[-1])
-  except:
-    return float(hist['Close'].iloc[-1])
+  try: return float(hist['Close'].rolling(period).mean().iloc[-1])
+  except: return float(hist['Close'].iloc[-1])
 
 def calc_atr(hist, period=14):
   try:
@@ -87,11 +77,8 @@ def calc_atr(hist, period=14):
     lc = (hist['Low'] - hist['Close'].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     atr = tr.rolling(period).mean().iloc[-1]
-    if pd.isna(atr):
-      return float(hist['Close'].iloc[-1] * 0.02)
-    return float(atr)
-  except:
-    return float(hist['Close'].iloc[-1] * 0.02)
+    return float(atr) if not pd.isna(atr) else float(hist['Close'].iloc[-1] * 0.02)
+  except: return float(hist['Close'].iloc[-1] * 0.02)
 
 def calc_levels(hist, entry_price, is_squeeze=False, gamma_res=None, is_put=False):
   atr = calc_atr(hist, 14)
@@ -122,13 +109,8 @@ def update_resistances():
         print(f"تم {sym}", flush=True)
       time.sleep(3.0)
     except Exception as e:
-      err = str(e).lower()
-      if '429' in err or 'crumb' in err or 'rate' in err:
-        print(f'CRUMB 429 {sym} - انتظار 15 ثانية', flush=True)
-        time.sleep(15)
-      else:
-        print(f'RES ERR {sym}: {e}', flush=True)
-        time.sleep(3)
+      print(f'RES ERR {sym}: {e}', flush=True)
+      time.sleep(15)
 
 def get_gamma_walls(sym, price):
   try:
@@ -138,47 +120,41 @@ def get_gamma_walls(sym, price):
     for exp in exps:
       chain = t.option_chain(exp)
       all_calls.append(chain.calls)
-    if not all_calls:
-      return None
+    if not all_calls: return None
     calls = pd.concat(all_calls)
     calls_above = calls[calls['strike'] >= price]
-    if calls_above.empty:
-      return None
+    if calls_above.empty: return None
     wall_res = calls_above.sort_values('openInterest', ascending=False).iloc[0]
     return {'res_strike': float(wall_res['strike'])}
-  except:
-    return None
+  except: return None
 
 def check_squeeze(hist):
   try:
-    if len(hist) < 20:
-      return None
+    if len(hist) < 20: return None
     close = hist['Close']
     ma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
-    upper_bb = ma20 + (2 * std20)
-    lower_bb = ma20 - (2 * std20)
+    upper_bb = ma20 + (1.5 * std20) # خففت من 2 الى 1.5 عشان يصيد اكثر
+    lower_bb = ma20 - (1.5 * std20)
     hl = hist['High'] - hist['Low']
     hc = (hist['High'] - hist['Close'].shift()).abs()
     lc = (hist['Low'] - hist['Close'].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     atr = tr.rolling(20).mean()
-    upper_kc = ma20 + (1.5 * atr)
-    lower_kc = ma20 - (1.5 * atr)
+    upper_kc = ma20 + (1.2 * atr) # خففت من 1.5 الى 1.2
+    lower_kc = ma20 - (1.2 * atr)
     is_squeeze = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
     prev_squeeze = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
     is_firing = prev_squeeze and not is_squeeze
     direction = 'UP' if close.iloc[-1] > ma20.iloc[-1] else 'DOWN'
     return {'squeeze': is_squeeze, 'firing': is_firing, 'dir': direction}
-  except:
-    return None
+  except: return None
 
 def get_opt(sym, price, mode, opt_type='CALL'):
   try:
     t = yf.Ticker(sym)
     exps = t.options
-    if not exps:
-      return None
+    if not exps: return None
     target_exps = exps[0:2] if mode == 'daily' else exps[2:6]
     best_overall = None
     best_score = -1
@@ -186,41 +162,26 @@ def get_opt(sym, price, mode, opt_type='CALL'):
       try:
         chain_full = t.option_chain(exp)
         chain = chain_full.calls if opt_type == 'CALL' else chain_full.puts
-        # توسيع النطاق السعري للعقد بين 0.5$ و 15$
         chain = chain[(chain['lastPrice'] <= 15.0) & (chain['lastPrice'] >= 0.5)]
-        
-        if opt_type == 'CALL':
-          filt = chain[(chain['strike'] >= price * 0.95) & (chain['strike'] <= price * 1.10)]
-        else:
-          filt = chain[(chain['strike'] <= price * 1.05) & (chain['strike'] >= price * 0.90)]
-          
-        if filt.empty:
-          continue
+        filt = chain[(chain['strike'] >= price * 0.95) & (chain['strike'] <= price * 1.10)] if opt_type == 'CALL' else chain[(chain['strike'] <= price * 1.05) & (chain['strike'] >= price * 0.90)]
+        if filt.empty: continue
         for _, row in filt.iterrows():
           vol = int(row['volume'] or 0)
           oi = int(row['openInterest'] or 0)
           bid = float(row.get('bid', 0) or 0)
           ask = float(row.get('ask', 0) or 0)
           last = float(row['lastPrice'] or 0)
-          if last == 0:
-            continue
+          if last == 0: continue
           spread_pct = (ask - bid) / last if bid > 0 and ask > 0 else 0.20
           min_vol = MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
           min_oi = MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
-          
-          if vol < min_vol or oi < min_oi:
-            continue
-          if spread_pct > MAX_SPREAD_PCT:
-            continue
+          if vol < min_vol or oi < min_oi or spread_pct > MAX_SPREAD_PCT: continue
           score = (vol * 0.5) + (oi * 0.2) - (spread_pct * 100)
           if score > best_score:
             best_score = score
-            flow = (vol / oi * 100) if oi > 0 else 0
-            # زيادة حساسية كشف الحيتان
-            whale = vol > 500 and flow > 120
+            whale = vol > 500 and (vol / oi * 100 if oi > 0 else 0) > 120
             best_overall = {'strike': row['strike'], 'last': last, 'vol': vol, 'oi': oi, 'exp': exp, 'whale': whale, 'spread': spread_pct}
-      except:
-        continue
+      except: continue
     return best_overall
   except Exception as e:
     print(f'OPT ERR {sym}: {e}', flush=True)
@@ -228,45 +189,49 @@ def get_opt(sym, price, mode, opt_type='CALL'):
 
 def loop():
   update_resistances()
-  send('✅ تم تشغيل البوت - 19 شركة | تم تحسين فلاتر الزخم والعقود')
+  send('✅ تم تشغيل البوت - 19 شركة | فلتر مخفف | بيرسل الحين')
   last_res_update = time.time()
   while True:
     if time.time() - last_res_update > 43200:
       update_resistances()
       last_res_update = time.time()
       sent_squeeze.clear()
-    today_str = datetime.now().strftime('%Y-%m-%d')
     for s in SYMBOLS:
       try:
         res = RES_CACHE.get(s)
         hist = HIST_CACHE.get(s)
         if not res or hist is None:
+          time.sleep(1)
           continue
         q = get_finnhub_quote_safe(s)
         if not q:
+          time.sleep(1)
           continue
         p = float(q.get('c', 0))
         if p == 0:
+          time.sleep(1)
           continue
         rsi = calc_rsi(hist)
         sma50 = calc_sma(hist, 50)
         sq = check_squeeze(hist)
-        sq_key = f'{s}_{today_str}_sq'
-        if sq is None or not (sq['squeeze'] or sq['firing']) or sq_key in sent_squeeze:
-          time.sleep(1.5)
+        if sq is None or not (sq['squeeze'] or sq['firing']):
+          time.sleep(1)
           continue
+
+        # منع التكرار كل 3 ساعات فقط
+        if s in sent_squeeze and (time.time() - sent_squeeze[s] < 10800):
+          time.sleep(1)
+          continue
+
         is_put_signal = sq['dir'] == 'DOWN'
-        if sq['firing']:
-          if is_put_signal and p > sma50:
-            time.sleep(1.5)
-            continue
-          if not is_put_signal and (p < sma50 or rsi < 50):
-            time.sleep(1.5)
-            continue
-        else:
-          if p < sma50 and rsi < 50:
-            time.sleep(1.5)
-            continue
+        # === هذا هو التعديل اللي بيخليه يرسل ===
+        # شلت شرط sma50 و rsi < 50 القاتل
+        # بس نلغي المتطرف جدا
+        if rsi < 30 or rsi > 85:
+          print(f"{s} RSI متطرف {rsi}", flush=True)
+          time.sleep(1)
+          continue
+
         opt_type = 'PUT' if is_put_signal else 'CALL'
         gamma = get_gamma_walls(s, p)
         gamma_strike = gamma['res_strike'] if gamma else None
@@ -274,8 +239,10 @@ def loop():
         d = get_opt(s, p, 'daily', opt_type)
         w = get_opt(s, p, 'weekly', opt_type)
         if d is None and w is None:
-          time.sleep(1.5)
+          print(f"{s} لا يوجد عقد", flush=True)
+          time.sleep(1)
           continue
+
         tier_label = '🔵' if s in TIER1 else '🟡'
         firing_txt = f'🔥 انطلاق {opt_type}' if sq['firing'] else f'⚠️ انضغاط {opt_type}'
         msg = f'{firing_txt} {tier_label} <b>{s}</b> سعره {p:.2f}$\n'
@@ -291,14 +258,13 @@ def loop():
         if w:
           msg += f"\n🛡️ عقد شهري (8-30 يوم) {w['exp']}\n💰 سترايك {w['strike']}$ - سعره {w['last']}$ | فوليوم: {w['vol']} | OI: {w['oi']} | فرق: {w['spread']:.0%}\n"
         send(msg)
-        sent_squeeze.add(sq_key)
-        time.sleep(2.0)
+        sent_squeeze[s] = time.time()
+        time.sleep(2.5)
       except Exception as e:
         print(f'LOOP ERR {s}: {e}', flush=True)
         time.sleep(2)
-    time.sleep(30)
+    time.sleep(25)
 
 Thread(target=loop, daemon=True).start()
-
 while True:
   time.sleep(3600)
