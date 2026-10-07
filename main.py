@@ -131,7 +131,7 @@ def check_squeeze(hist):
     return {'squeeze': is_squeeze, 'firing': prev and not is_squeeze, 'dir': 'UP' if close.iloc[-1] > ma20.iloc[-1] else 'DOWN'}
   except: return None
 
-def get_opt(sym, price, mode, opt_type='CALL'):
+def get_opt(sym, price, mode, opt_type='CALL', strict=True):
   try:
     t = yf.Ticker(sym)
     exps = t.options
@@ -143,8 +143,8 @@ def get_opt(sym, price, mode, opt_type='CALL'):
       try:
         chain = t.option_chain(exp)
         chain = chain.calls if opt_type == 'CALL' else chain.puts
-        chain = chain[(chain['lastPrice'] <= 15.0) & (chain['lastPrice'] >= 0.5)]
-        filt = chain[(chain['strike'] >= price * 0.95) & (chain['strike'] <= price * 1.10)] if opt_type == 'CALL' else chain[(chain['strike'] <= price * 1.05) & (chain['strike'] >= price * 0.90)]
+        chain = chain[(chain['lastPrice'] <= 15.0) & (chain['lastPrice'] >= 0.20)]
+        filt = chain[(chain['strike'] >= price * 0.92) & (chain['strike'] <= price * 1.12)] if opt_type == 'CALL' else chain[(chain['strike'] <= price * 1.08) & (chain['strike'] >= price * 0.88)]
         if filt.empty: continue
         for _, row in filt.iterrows():
           vol = int(row['volume'] or 0)
@@ -153,22 +153,25 @@ def get_opt(sym, price, mode, opt_type='CALL'):
           ask = float(row.get('ask', 0) or 0)
           last = float(row['lastPrice'] or 0)
           if last == 0: continue
-          spread = (ask - bid) / last if bid > 0 and ask > 0 else 0.2
-          min_vol = MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
-          min_oi = MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
-          if vol < min_vol or oi < min_oi or spread > MAX_SPREAD_PCT: continue
+          spread = (ask - bid) / last if bid > 0 and ask > 0 else 0.5
+          if strict:
+            min_vol = MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
+            min_oi = MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
+            if vol < min_vol or oi < min_oi or spread > MAX_SPREAD_PCT: continue
+          else:
+            if spread > 0.70: continue
           score = vol*0.5 + oi*0.2 - spread*100
           if score > best_score:
             best_score = score
             whale = vol > 500 and (vol / oi * 100 if oi > 0 else 0) > 120
-            best = {'strike': row['strike'], 'last': last, 'vol': vol, 'oi': oi, 'exp': exp, 'whale': whale, 'spread': spread}
+            best = {'strike': row['strike'], 'last': last, 'vol': vol, 'oi': oi, 'exp': exp, 'whale': whale, 'spread': spread*100}
       except: continue
     return best
   except: return None
 
 def loop():
   update_resistances()
-  send('✅ البوت اشتغل - CALL اذا طالع | PUT اذا نزول حقيقي مو تصحيح')
+  send('✅ البوت اشتغل - CALL اذا طالع | PUT اذا نزول حقيقي - V2 مرتب')
   last_res_update = time.time()
   while True:
     if time.time() - last_res_update > 43200:
@@ -203,45 +206,58 @@ def loop():
         is_put = sq['dir'] == 'DOWN'
         drop_from_res = (res - p) / res * 100 if res else 0
 
-        # ===== منطق CALL و PUT الجديد =====
         if s in TIER_CRAZY:
-          if not is_put: # CALL للمجنون
+          if not is_put:
             if p < sma50 or rsi < 45:
-              print(f"{s} CALL ملغي مجنون تحت SMA", flush=True)
               time.sleep(1)
               continue
-          else: # PUT للمجنون - لازم نزول حقيقي
+          else:
             is_real_down = (p < sma50) or (drop_from_res > 4.0 and rsi < 50)
             if not is_real_down:
-              print(f"{s} PUT ملغي مجنون تصحيح {drop_from_res:.1f}%", flush=True)
               time.sleep(1)
               continue
-        else: # العاقل
-          if not is_put: # CALL
+        else:
+          if not is_put:
             if p < sma50 or rsi < 50:
               continue
-          else: # PUT
+          else:
             is_real_down = (p < sma50 and rsi < 45 and drop_from_res > 3.0)
             if not is_real_down:
               continue
-        # ===== نهاية المنطق =====
 
         opt_type = 'PUT' if is_put else 'CALL'
         gamma = get_gamma_walls(s, p)
         stop, t1, t2, t3, atr = calc_levels(hist, p, gamma['res_strike'] if gamma else None, is_put)
-        d = get_opt(s, p, 'daily', opt_type)
-        w = get_opt(s, p, 'weekly', opt_type)
+
+        d = get_opt(s, p, 'daily', opt_type, strict=True)
+        w = get_opt(s, p, 'weekly', opt_type, strict=True)
+        if d is None:
+            d = get_opt(s, p, 'daily', opt_type, strict=False)
+        if w is None:
+            w = get_opt(s, p, 'weekly', opt_type, strict=False)
+
         if d is None and w is None:
+          print(f"{s} ما فيه عقود حتى بعد التخفيف", flush=True)
+          time.sleep(1)
           continue
 
         crazy_label = '🤪' if s in TIER_CRAZY else '🧠'
         firing_txt = f'🔥 انطلاق {opt_type}' if sq['firing'] else f'⚠️ انضغاط {opt_type}'
-        msg = f'{firing_txt} {crazy_label} <b>{s}</b> ${p:.2f} نزول من القمة {drop_from_res:.1f}%\n'
-        msg += f'📊 SMA50: {sma50:.2f} | RSI: {rsi:.0f} | مقاومة: {res:.2f}\n'
-        if gamma: msg += f"🧱 غاما: {gamma['res_strike']:.0f}$\n"
-        msg += f"\n{'🔻 نزول حقيقي' if is_put else '🚀 صعود'} {opt_type}: {p:.2f}$\n🛑 {stop}$ | 🎯 {t1}$ / {t2}$ / {t3}$ ATR {atr}$\n"
-        if d: msg += f"\n🔥 يومي {d['exp']} {'🐋' if d['whale'] else ''} {d['strike']}$ @ {d['last']}$ V:{d['vol']}\n"
-        if w: msg += f"🛡️ شهري {w['exp']} {w['strike']}$ @ {w['last']}$\n"
+
+        msg = f'{firing_txt} {crazy_label} <b>{s}</b> سعره {p:.2f}$\n'
+        msg += f'📊 المتوسط 50: {sma50:.2f}$ | المقاومة: {res:.2f}$ | RSI: {rsi:.0f}\n'
+        if gamma: msg += f"🧱 حاجز غاما: {gamma['res_strike']:.0f}$\n"
+        msg += f"\n🚀 دخول {opt_type}: {p:.2f}$\n"
+        msg += f"🛑 وقف الخسارة: {stop}$ (ATR:{atr}$)\n"
+        msg += f"🎯 هدف اول: {t1}$\n🎯 هدف ثاني: {t2}$\n🎯 هدف ثالث: {t3}$\n"
+
+        if d:
+            msg += f"\n🔥 عقد يومي (0-7 ايام) {d['exp']} {'🐋 دخول حيتان' if d['whale'] else ''}\n"
+            msg += f"💰 سترايك {d['strike']}$ - سعره {d['last']}$ | فوليوم: {d['vol']} | OI: {d['oi']} | فرق: {d['spread']:.0f}%\n"
+        if w:
+            msg += f"\n🛡️ عقد شهري (8-30 يوم) {w['exp']}\n"
+            msg += f"💰 سترايك {w['strike']}$ - سعره {w['last']}$ | فوليوم: {w['vol']} | OI: {w['oi']} | فرق: {w['spread']:.0f}%\n"
+
         send(msg)
         sent_squeeze[s] = time.time()
         time.sleep(2.5)
