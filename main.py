@@ -29,6 +29,8 @@ TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
 TIER2 = ['SMCI','MSTR','COIN','AAPL','AMD','AMZN','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT']
 SYMBOLS = TIER1 + TIER2
 
+HIGH_PRICE = ['SNDK', 'META', 'AVGO', 'MSTR', 'APP', 'GOOGL', 'MSFT', 'NVDA']
+
 MIN_VOL_TIER1 = 50
 MIN_OI_TIER1 = 200
 MIN_VOL_TIER2 = 10
@@ -139,11 +141,12 @@ def get_opt(sym, price, mode, opt_type='CALL', strict=True):
     target_exps = exps[0:2] if mode == 'daily' else exps[2:6]
     best = None
     best_score = -1
+    max_price = 120.0 if sym in HIGH_PRICE else 15.0
     for exp in target_exps:
       try:
         chain = t.option_chain(exp)
         chain = chain.calls if opt_type == 'CALL' else chain.puts
-        chain = chain[(chain['lastPrice'] <= 15.0) & (chain['lastPrice'] >= 0.20)]
+        chain = chain[(chain['lastPrice'] <= max_price) & (chain['lastPrice'] >= 0.20)]
         filt = chain[(chain['strike'] >= price * 0.92) & (chain['strike'] <= price * 1.12)] if opt_type == 'CALL' else chain[(chain['strike'] <= price * 1.08) & (chain['strike'] >= price * 0.88)]
         if filt.empty: continue
         for _, row in filt.iterrows():
@@ -171,7 +174,7 @@ def get_opt(sym, price, mode, opt_type='CALL', strict=True):
 
 def loop():
   update_resistances()
-  send('✅ البوت اشتغل - CALL اذا طالع | PUT اذا نزول حقيقي - V2 مرتب')
+  send('✅ البوت اشتغل - كل الشركات + AMD انفجار حقيقي فقط - V4')
   last_res_update = time.time()
   while True:
     if time.time() - last_res_update > 43200:
@@ -206,7 +209,19 @@ def loop():
         is_put = sq['dir'] == 'DOWN'
         drop_from_res = (res - p) / res * 100 if res else 0
 
-        if s in TIER_CRAZY:
+        if s == 'AMD':
+            if not sq['firing']:
+                time.sleep(1)
+                continue
+            if not is_put:
+                if p < sma50 * 0.99 or rsi < 52 or rsi > 68:
+                    time.sleep(1)
+                    continue
+            else:
+                if p > sma50 * 1.01 or rsi > 48 or drop_from_res < 2.0:
+                    time.sleep(1)
+                    continue
+        elif s in TIER_CRAZY:
           if not is_put:
             if p < sma50 or rsi < 45:
               time.sleep(1)
@@ -242,6 +257,7 @@ def loop():
           continue
 
         crazy_label = '🤪' if s in TIER_CRAZY else '🧠'
+        if s == 'AMD': crazy_label = '🔥 AMD'
         firing_txt = f'🔥 انطلاق {opt_type}' if sq['firing'] else f'⚠️ انضغاط {opt_type}'
 
         msg = f'{firing_txt} {crazy_label} <b>{s}</b> سعره {p:.2f}$\n'
