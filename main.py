@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK - V5.3 Fixed'
+    return 'Bot OK - V5.4 Arabic'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -37,11 +37,7 @@ sent_squeeze = {}
 
 def send(msg):
     try:
-        requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
-            timeout=10
-        )
+        requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
     except Exception as e:
         print(f'SEND ERR {e}', flush=True)
 
@@ -52,10 +48,8 @@ def get_finnhub_quote_safe(sym):
             if q and q.get('c', 0) > 0:
                 return q
         except Exception as e:
-            if '429' in str(e):
-                time.sleep(60)
-            else:
-                break
+            if '429' in str(e): time.sleep(60)
+            else: break
     return None
 
 def calc_rsi(hist, period=14):
@@ -65,14 +59,11 @@ def calc_rsi(hist, period=14):
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
         return float(100 - (100 / (1 + rs)).iloc[-1])
-    except:
-        return 50.0
+    except: return 50.0
 
 def calc_sma(hist, period=50):
-    try:
-        return float(hist['Close'].rolling(period).mean().iloc[-1])
-    except:
-        return float(hist['Close'].iloc[-1])
+    try: return float(hist['Close'].rolling(period).mean().iloc[-1])
+    except: return float(hist['Close'].iloc[-1])
 
 def calc_atr(hist, period=14):
     try:
@@ -81,8 +72,7 @@ def calc_atr(hist, period=14):
         lc = (hist['Low'] - hist['Close'].shift()).abs()
         tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
         return float(tr.rolling(period).mean().iloc[-1])
-    except:
-        return float(hist['Close'].iloc[-1] * 0.02)
+    except: return float(hist['Close'].iloc[-1] * 0.02)
 
 def calc_levels(hist, entry_price, is_put=False):
     atr = calc_atr(hist, 14)
@@ -99,7 +89,7 @@ def calc_levels(hist, entry_price, is_put=False):
     return round(stop, 2), round(t1, 2), round(t2, 2), round(t3, 2), round(atr, 2)
 
 def update_resistances():
-    print("Updating data...", flush=True)
+    print("Updating...", flush=True)
     for sym in SYMBOLS:
         try:
             hist = yf.Ticker(sym).history(period='3mo', auto_adjust=True)
@@ -112,8 +102,7 @@ def update_resistances():
 
 def check_squeeze(hist):
     try:
-        if len(hist) < 20:
-            return None
+        if len(hist) < 20: return None
         close = hist['Close']
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
@@ -128,15 +117,13 @@ def check_squeeze(hist):
         firing = prev_squeeze and not is_squeeze
         direction = 'UP' if close.iloc[-1] >= ma20.iloc[-1] else 'DOWN'
         return {'squeeze': is_squeeze, 'firing': firing, 'dir': direction}
-    except:
-        return None
+    except: return None
 
 def get_opt(sym, price, opt_type='CALL'):
     try:
         t = yf.Ticker(sym)
         exps = t.options
-        if not exps:
-            return None
+        if not exps: return None
         target_exps = exps[:3]
         best = None
         best_score = -1
@@ -150,33 +137,28 @@ def get_opt(sym, price, opt_type='CALL'):
                     filt = filt[(filt['strike'] >= price * 0.95) & (filt['strike'] <= price * 1.10)]
                 else:
                     filt = filt[(filt['strike'] <= price * 1.05) & (filt['strike'] >= price * 0.90)]
-                if filt.empty:
-                    continue
+                if filt.empty: continue
                 for _, row in filt.iterrows():
                     vol = int(row['volume'] or 0)
                     oi = int(row['openInterest'] or 0)
                     bid = float(row.get('bid', 0) or 0)
                     ask = float(row.get('ask', 0) or 0)
                     last = float(row['lastPrice'] or 0)
-                    if last == 0:
-                        continue
+                    if last == 0: continue
                     spread = (ask - bid) / ask if ask > 0 else 1.0
-                    if spread > 0.35:
-                        continue
-                    score = vol * 0.6 + oi * 0.4 - spread * 100
+                    if spread > 0.35: continue
+                    score = vol * 0.6 + oi * 0.4 - spread*100
                     if score > best_score:
                         best_score = score
                         whale = vol > 300 and (vol / oi > 1.0 if oi > 0 else False)
                         best = {'strike': row['strike'], 'last': last, 'vol': vol, 'oi': oi, 'exp': exp, 'whale': whale, 'spread': round(spread*100,1)}
-            except:
-                continue
+            except: continue
         return best
-    except:
-        return None
+    except: return None
 
 def loop():
     update_resistances()
-    send('V5.3 Started - SNDK MU Early Fixed')
+    send('🚀 V5.4 اشتغل - عربي + SNDK و MU مبكر')
     last_res_update = time.time()
     while True:
         if time.time() - last_res_update > 28800:
@@ -187,71 +169,57 @@ def loop():
             try:
                 hist = HIST_CACHE.get(s)
                 res = RES_CACHE.get(s)
-                if hist is None:
-                    continue
+                if hist is None: continue
                 q = get_finnhub_quote_safe(s)
                 p = float(q.get('c', 0)) if q else float(hist['Close'].iloc[-1])
-                if p == 0:
-                    continue
+                if p == 0: continue
                 rsi = calc_rsi(hist)
                 sma50 = calc_sma(hist, 50)
                 sq = check_squeeze(hist)
-                if not sq or not (sq['squeeze'] or sq['firing']):
-                    continue
-                if s in sent_squeeze and (time.time() - sent_squeeze[s] < 7200):
-                    continue
-
+                if not sq or not (sq['squeeze'] or sq['firing']): continue
+                if s in sent_squeeze and (time.time() - sent_squeeze[s] < 14400): continue
                 is_put = sq['dir'] == 'DOWN'
                 drop_from_res = (res - p) / res * 100 if res else 0
 
                 if s == 'AMD':
-                    if not sq['firing']:
-                        continue
+                    if not sq['firing']: continue
                     if not is_put:
-                        if p < sma50 * 0.99 or rsi < 52 or rsi > 68:
-                            continue
+                        if p < sma50 * 0.99 or rsi < 52 or rsi > 68: continue
                     else:
-                        if p > sma50 * 1.01 or rsi > 48 or drop_from_res < 2.0:
-                            continue
+                        if p > sma50 * 1.01 or rsi > 48 or drop_from_res < 2.0: continue
                 elif s in ['SNDK', 'MU']:
                     near_sma = abs(p - sma50) / sma50 * 100 < 3.0
                     if not is_put:
-                        if not (near_sma and 42 < rsi < 65 and sq['firing']):
-                            continue
+                        if not (near_sma and 42 < rsi < 65 and sq['firing']): continue
                     else:
-                        if not (near_sma and 35 < rsi < 60 and sq['firing']):
-                            continue
+                        if not (near_sma and 35 < rsi < 60 and sq['firing']): continue
                 elif s in TIER_CRAZY:
                     if not is_put:
-                        if p < sma50 or rsi < 45:
-                            continue
+                        if p < sma50 or rsi < 45: continue
                     else:
-                        if not (p < sma50 or (drop_from_res > 4.0 and rsi < 50)):
-                            continue
+                        if not (p < sma50 or (drop_from_res > 4.0 and rsi < 50)): continue
                 else:
                     if not is_put:
-                        if p < sma50 or rsi < 50:
-                            continue
+                        if p < sma50 or rsi < 50: continue
                     else:
-                        if not (p < sma50 and rsi < 45 and drop_from_res > 3.0):
-                            continue
+                        if not (p < sma50 and rsi < 45 and drop_from_res > 3.0): continue
 
                 opt_type = 'PUT' if is_put else 'CALL'
                 stop, t1, t2, t3, atr = calc_levels(hist, p, is_put)
                 opt = get_opt(s, p, opt_type)
-                if not opt:
-                    continue
+                if not opt: continue
 
-                firing_txt = f"Fire {opt_type}" if sq['firing'] else f"Squeeze {opt_type}"
-                label = 'SNDK/MU Early' if s in ['SNDK','MU'] else ('AMD' if s=='AMD' else 'CRAZY' if s in TIER_CRAZY else 'OK')
+                # هنا التصليح - كل سطر لحاله بدون سطر جديد داخل f-string
+                firing_txt = '🔥 انطلاق' if sq['firing'] else '⚠️ انضغاط'
+                label = '⚡ SNDK/MU مبكر' if s in ['SNDK','MU'] else ('🔥 AMD' if s=='AMD' else '🤪 مجنون' if s in TIER_CRAZY else '🧠 مستقر')
 
-                msg = f"{firing_txt} {label} {s} | {p:.2f}$\n"
-                msg += f"SMA50: {sma50:.2f}$ | Res: {res:.2f}$ | RSI: {rsi:.0f}\n"
-                msg += f"Entry: {p:.2f}$\n"
-                msg += f"Stop: {stop}$ (ATR:{atr}$)\n"
-                msg += f"T1:{t1}$ T2:{t2}$ T3:{t3}$\n"
-                msg += f"{opt['exp']} {'WHALE' if opt['whale'] else ''}\n"
-                msg += f"Strike {opt['strike']}$ - {opt['last']}$ Vol:{opt['vol']} OI:{opt['oi']} Spread:{opt['spread']}%"
+                msg = f"{firing_txt} {opt_type} {label} <b>{s}</b> | {p:.2f}$\n"
+                msg += f"📊 SMA50: {sma50:.2f}$ | مقاومة: {res:.2f}$ | RSI: {rsi:.0f}\n\n"
+                msg += f"🚀 دخول: {p:.2f}$\n"
+                msg += f"🛑 وقف: {stop}$ (ATR:{atr}$)\n"
+                msg += f"🎯 T1:{t1}$ T2:{t2}$ T3:{t3}$\n\n"
+                msg += f"💎 {opt['exp']} {'🐋 حيتان' if opt['whale'] else ''}\n"
+                msg += f"💰 سترايك {opt['strike']}$ - {opt['last']}$ | Vol:{opt['vol']} OI:{opt['oi']} | فرق:{opt['spread']}%"
 
                 send(msg)
                 sent_squeeze[s] = time.time()
@@ -262,5 +230,4 @@ def loop():
         time.sleep(15)
 
 Thread(target=loop, daemon=True).start()
-while True:
-    time.sleep(3600)
+while True: time.sleep(3600)
