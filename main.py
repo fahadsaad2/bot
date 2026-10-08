@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK - V5.1 Real Squeeze'
+    return 'Bot OK - V5.3 SNDK MU Early'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -29,7 +29,6 @@ TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
 TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'AVGO', 'MU', 'LITE', 'SNDK', 'RDDT']
 SYMBOLS = TIER1 + TIER2
 TIER_CRAZY = ['SNDK', 'MU', 'MSTR', 'COIN', 'SMCI', 'APP', 'PLTR', 'LITE']
-
 HIGH_PRICE = ['SNDK', 'META', 'AVGO', 'MSTR', 'APP', 'GOOGL', 'MSFT', 'NVDA', 'SMCI', 'COIN']
 
 RES_CACHE = {}
@@ -153,7 +152,7 @@ def get_opt(sym, price, opt_type='CALL'):
                     last = float(row['lastPrice'] or 0)
                     if last == 0: continue
                     spread = (ask - bid) / ask if ask > 0 else 1.0
-                    if spread > 0.35: continue # حماية السبريد
+                    if spread > 0.35: continue
                     score = vol * 0.6 + oi * 0.4 - spread*100
                     if score > best_score:
                         best_score = score
@@ -165,7 +164,7 @@ def get_opt(sym, price, opt_type='CALL'):
 
 def loop():
     update_resistances()
-    send('🚀 V5.1 اشتغل - فلتر AMD حقيقي + حماية سبريد')
+    send('🚀 V5.3 اشتغل - SNDK و MU مبكر قبل الحركة')
     last_res_update = time.time()
     while True:
         if time.time() - last_res_update > 28800:
@@ -189,20 +188,32 @@ def loop():
                 is_put = sq['dir'] == 'DOWN'
                 drop_from_res = (res - p) / res * 100 if res else 0
 
-                # فلتر AMD الحقيقي
+                # فلتر AMD
                 if s == 'AMD':
                     if not sq['firing']: continue
                     if not is_put:
                         if p < sma50 * 0.99 or rsi < 52 or rsi > 68: continue
                     else:
                         if p > sma50 * 1.01 or rsi > 48 or drop_from_res < 2.0: continue
-                # فلتر المجانين
+
+                # فلتر SNDK و MU المبكر
+                elif s in ['SNDK', 'MU']:
+                    near_sma = abs(p - sma50) / sma50 * 100 < 3.0
+                    if not is_put:
+                        if not (near_sma and 42 < rsi < 65 and sq['firing']):
+                            continue
+                    else:
+                        if not (near_sma and 35 < rsi < 60 and sq['firing']):
+                            continue
+
+                # باقي المجانين
                 elif s in TIER_CRAZY:
                     if not is_put:
                         if p < sma50 or rsi < 45: continue
                     else:
                         if not (p < sma50 or (drop_from_res > 4.0 and rsi < 50)): continue
-                # فلتر المستقرة
+
+                # المستقرة
                 else:
                     if not is_put:
                         if p < sma50 or rsi < 50: continue
@@ -215,21 +226,8 @@ def loop():
                 if not opt: continue
 
                 firing_txt = f'🔥 انطلاق {opt_type}' if sq['firing'] else f'⚠️ انضغاط {opt_type}'
-                label = '🔥 AMD انفجار حقيقي' if s == 'AMD' else ('🤪' if s in TIER_CRAZY else '🧠')
+                label = '⚡ SNDK/MU مبكر' if s in ['SNDK','MU'] else ('🔥 AMD' if s=='AMD' else '🤪' if s in TIER_CRAZY else '🧠')
 
                 msg = f"{firing_txt} {label} <b>{s}</b> | {p:.2f}$\n"
                 msg += f"📊 SMA50: {sma50:.2f}$ | مقاومة: {res:.2f}$ | RSI: {rsi:.0f}\n\n"
-                msg += f"🚀 دخول: {p:.2f}$\n🛑 وقف: {stop}$ (ATR:{atr}$)\n🎯 T1:{t1}$ T2:{t2}$ T3:{t3}$\n"
-                msg += f"\n💎 {opt['exp']} {'🐋 حيتان' if opt['whale'] else ''}\n"
-                msg += f"💰 سترايك {opt['strike']}$ - {opt['last']}$ | Vol:{opt['vol']} OI:{opt['oi']} | فرق:{opt['spread']}%"
-
-                send(msg)
-                sent_squeeze[s] = time.time()
-                time.sleep(1.5)
-            except Exception as e:
-                print(f'LOOP ERR {s}: {e}', flush=True)
-                time.sleep(1)
-        time.sleep(15)
-
-Thread(target=loop, daemon=True).start()
-while True: time.sleep(3600)
+                msg += f"🚀 دخول: {p:.2f}$\n🛑 وقف: {stop}$ (ATR:{atr}$)\n🎯 T1:{t1}$ T2:{t2}$ T
