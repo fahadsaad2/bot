@@ -7,12 +7,13 @@ from flask import Flask
 import pandas as pd
 import requests
 import yfinance as yf
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK V58'
+    return 'Bot OK V59 EMOJI'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -35,17 +36,26 @@ sent_squeeze = {}
 
 def send(msg):
     try:
-        requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
-    except:
-        pass
+        requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=15)
+    except Exception as e:
+        print(f"SEND ERR {e}")
 
 def get_quote(sym):
     try:
         q = finnhub_client.quote(sym)
         if q and q.get('c',0) > 0:
-            return float(q['c'])
+            fh = float(q['c'])
+            hist = HIST_CACHE.get(sym)
+            if hist is not None:
+                yf_p = float(hist['Close'].iloc[-1])
+                if yf_p > 0 and abs(fh - yf_p)/yf_p*100 > 15:
+                    return yf_p
+            return fh
     except:
         pass
+    hist = HIST_CACHE.get(sym)
+    if hist is not None:
+        return float(hist['Close'].iloc[-1])
     return 0
 
 def calc_rsi(hist):
@@ -91,9 +101,7 @@ def update_res():
     for sym in SYMBOLS:
         try:
             hist = yf.Ticker(sym).history(period='3mo', auto_adjust=True)
-            if hist.empty:
-                continue
-            if len(hist) < 20:
+            if hist.empty or len(hist) < 20:
                 continue
             RES_CACHE[sym] = float(max(hist['High'].tail(5)))
             HIST_CACHE[sym] = hist
@@ -122,91 +130,81 @@ def check_squeeze(hist):
     except:
         return None
 
-def get_opt(sym, price, opt_type):
+def get_two_opts(sym, price, opt_type):
     try:
         t = yf.Ticker(sym)
         exps = t.options
         if not exps:
-            return None
-        best = None
-        best_score = -999
-        max_price = 150 if sym in HIGH_PRICE else 30
-        for exp in exps[:3]:
+            return None, None
+        today = datetime.now().date()
+        daily_candidates = []
+        monthly_candidates = []
+        for exp_str in exps:
             try:
-                ch = t.option_chain(exp)
-                if opt_type == 'CALL':
-                    data = ch.calls
-                else:
-                    data = ch.puts
-                filt = data[(data['lastPrice'] <= max_price) & (data['lastPrice'] >= 0.10)]
-                if opt_type == 'CALL':
-                    filt = filt[(filt['strike'] >= price*0.95) & (filt['strike'] <= price*1.10)]
-                else:
-                    filt = filt[(filt['strike'] <= price*1.05) & (filt['strike'] >= price*0.90)]
-                if filt.empty:
-                    continue
-                for _, row in filt.iterrows():
-                    vol = int(row['volume'] or 0)
-                    oi = int(row['openInterest'] or 0)
-                    last = float(row['lastPrice'] or 0)
-                    bid = float(row.get('bid',0) or 0)
-                    ask = float(row.get('ask',0) or 0)
-                    if last == 0:
-                        continue
-                    if ask > 0:
-                        spread = (ask-bid)/ask
-                    else:
-                        spread = 1
-                    if spread > 0.35:
-                        continue
-                    score = vol*0.6 + oi*0.4 - spread*100
-                    if score > best_score:
-                        best_score = score
-                        whale = False
-                        if oi > 0:
-                            if vol > 300 and vol/oi > 1.0:
-                                whale = True
-                        best = {'strike':row['strike'],'last':last,'vol':vol,'oi':oi,'exp':exp,'whale':whale,'spread':round(spread*100,1)}
+                exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+                days = (exp_date - today).days
+                if 0 <= days <= 7:
+                    daily_candidates.append(exp_str)
+                elif 8 <= days <= 30:
+                    monthly_candidates.append(exp_str)
             except:
                 continue
-        return best
+        if not daily_candidates:
+            daily_candidates = exps[:1]
+        if not monthly_candidates:
+            monthly_candidates = exps[1:3] if len(exps) > 1 else exps[:1]
+
+        max_price = 150 if sym in HIGH_PRICE else 30
+
+        def best_for_exp(exp_list):
+            best = None
+            best_score = -9999
+            for exp in exp_list[:3]:
+                try:
+                    ch = t.option_chain(exp)
+                    data = ch.calls if opt_type == 'CALL' else ch.puts
+                    filt = data[(data['lastPrice'] <= max_price) & (data['lastPrice'] >= 0.10)]
+                    if opt_type == 'CALL':
+                        filt = filt[(filt['strike'] >= price*0.95) & (filt['strike'] <= price*1.12)]
+                    else:
+                        filt = filt[(filt['strike'] <= price*1.05) & (filt['strike'] >= price*0.88)]
+                    if filt.empty:
+                        continue
+                    for _, row in filt.iterrows():
+                        vol = int(row['volume'] or 0)
+                        oi = int(row['openInterest'] or 0)
+                        last = float(row['lastPrice'] or 0)
+                        bid = float(row.get('bid',0) or 0)
+                        ask = float(row.get('ask',0) or 0)
+                        if last == 0:
+                            continue
+                        spread = (ask-bid)/ask if ask > 0 else 1
+                        if spread > 0.4:
+                            continue
+                        score = vol*0.7 + oi*0.3 - spread*50
+                        if score > best_score:
+                            best_score = score
+                            best = {'strike':row['strike'],'last':last,'vol':vol,'oi':oi,'exp':exp,'spread':round(spread*100,1)}
+                except:
+                    continue
+            return best
+
+        daily = best_for_exp(daily_candidates)
+        monthly = best_for_exp(monthly_candidates)
+        return daily, monthly
     except:
-        return None
+        return None, None
 
 def loop():
     update_res()
-    send('V58 اشتغل - عربي + فحص حي + SNDK MU مبكر')
+    send('🔥 V59 شغال - تنسيق ايموجي + عقدين يومي وشهري')
     last_res = time.time()
-    last_hb = time.time()
     while True:
         try:
             if time.time() - last_res > 28800:
                 update_res()
                 last_res = time.time()
                 sent_squeeze.clear()
-
-            if time.time() - last_hb > 3600:
-                txt = "فحص حي:\n"
-                for sym in ['SNDK','MU','AMD']:
-                    hist = HIST_CACHE.get(sym)
-                    if hist is None:
-                        continue
-                    p = float(hist['Close'].iloc[-1])
-                    sma = calc_sma(hist)
-                    rsi = calc_rsi(hist)
-                    sq = check_squeeze(hist)
-                    if sq is None:
-                        st = "لا بيانات"
-                    else:
-                        if sq['firing']:
-                            st = "انفجار"
-                        elif sq['squeeze']:
-                            st = "انضغاط"
-                        else:
-                            st = "عادي"
-                    txt = txt + f"{sym}: {p:.2f}$ | {st} | RSI:{rsi:.0f} SMA:{sma:.2f}$\n"
-                send(txt)
-                last_hb = time.time()
 
             for s in SYMBOLS:
                 try:
@@ -216,92 +214,71 @@ def loop():
                         continue
                     p = get_quote(s)
                     if p == 0:
-                        p = float(hist['Close'].iloc[-1])
-                    if p == 0:
                         continue
-                    if s in sent_squeeze:
-                        if time.time() - sent_squeeze[s] < 7200:
-                            continue
+                    if p > 500 and s in ['SNDK','MU','AMD','RDDT','LITE']:
+                        continue
+                    if s in sent_squeeze and time.time() - sent_squeeze[s] < 7200:
+                        continue
 
                     rsi = calc_rsi(hist)
                     sma = calc_sma(hist)
                     sq = check_squeeze(hist)
 
                     early = False
-                    if s in ['SNDK','MU']:
-                        if abs(p-sma)/sma*100 < 4.0:
-                            if rsi > 35 and rsi < 70:
-                                early = True
+                    if s in ['SNDK','MU','RDDT','AMD']:
+                        if abs(p-sma)/sma*100 < 4.0 and 40 < rsi < 68:
+                            early = True
 
                     if not early:
-                        if sq is None:
-                            continue
-                        if not sq['squeeze'] and not sq['firing']:
+                        if sq is None or (not sq['squeeze'] and not sq['firing']):
                             continue
 
-                    is_put = False
-                    if sq is not None:
-                        if sq['dir'] == 'DOWN':
-                            is_put = True
+                    is_put = sq['dir'] == 'DOWN' if sq else False
+                    if early:
+                        is_put = False
 
-                    if is_put:
-                        otype = 'PUT'
-                    else:
-                        otype = 'CALL'
+                    if is_put and rsi < 35:
+                        continue
 
+                    otype = 'PUT' if is_put else 'CALL'
                     atr = calc_atr(hist)
                     stop, t1, t2, t3, atr2 = calc_levels(p, atr, is_put)
                     sent_squeeze[s] = time.time()
 
-                    opt = get_opt(s, p, otype)
-                    if opt is None:
+                    daily_opt, monthly_opt = get_two_opts(s, p, otype)
+                    if not daily_opt and not monthly_opt:
                         continue
 
-                    if sq is not None:
-                        if sq['firing']:
-                            ftxt = 'انفجار'
-                        elif sq['squeeze']:
-                            ftxt = 'انضغاط'
-                        else:
-                            ftxt = 'دخول مبكر'
-                    else:
-                        ftxt = 'دخول مبكر'
+                    # حاجز غاما = اعلى مقاومة او اقرب رقم صحيح فوق السعر ب 8%
+                    gamma_barrier = res if res else round(p * 1.08, 2)
 
-                    if s in ['SNDK','MU']:
-                        lbl = 'SNDK/MU مبكر'
-                    elif s == 'AMD':
-                        lbl = 'AMD'
-                    elif s in TIER_CRAZY:
-                        lbl = 'مجنون'
-                    else:
-                        lbl = 'مستقر'
+                    icon = '🧠' if s in TIER_CRAZY else '💎' if s in ['NVDA','META'] else '📈'
 
-                    if opt['whale']:
-                        wtxt = 'حيتان'
-                    else:
-                        wtxt = ''
+                    msg = f"🔥 انطلاق {otype} {icon} {s} سعره {p:.2f}$\n"
+                    msg += f"📊 المتوسط 50: {sma:.2f}$ | المقاومة: {res:.2f}$ | RSI: {rsi:.0f}\n"
+                    msg += f"🧱 حاجز غاما: {gamma_barrier}$\n"
+                    msg += f"\n🚀 دخول {otype}: {p:.2f}$\n"
+                    msg += f"🛑 وقف الخسارة: {stop}$ (ATR:{atr2}$)\n"
+                    msg += f"🎯 هدف اول: {t1}$\n"
+                    msg += f"🎯 هدف ثاني: {t2}$\n"
+                    msg += f"🎯 هدف ثالث: {t3}$\n"
 
-                    m1 = f"{ftxt} {otype} {lbl} {s} | {p:.2f}$\n"
-                    m2 = f"SMA50: {sma:.2f}$ | مقاومة: {res:.2f}$ | RSI: {rsi:.0f}\n"
-                    m3 = f"دخول: {p:.2f}$\n"
-                    m4 = f"وقف: {stop}$ ATR:{atr2}$\n"
-                    m5 = f"T1:{t1}$ T2:{t2}$ T3:{t3}$\n"
-                    m6 = f"{opt['exp']} {wtxt}\n"
-                    m7 = f"سترايك {opt['strike']}$ - {opt['last']}$ Vol:{opt['vol']} OI:{opt['oi']} فرق:{opt['spread']}%"
+                    if daily_opt:
+                        msg += f"\n🔥 عقد يومي (0-7 ايام) {daily_opt['exp']} \n"
+                        msg += f"💰 سترايك {daily_opt['strike']}$ - سعره {daily_opt['last']}$ | فوليوم: {daily_opt['vol']} | OI: {daily_opt['oi']} | فرق: {daily_opt['spread']}%\n"
 
-                    full = m1 + m2 + "\n" + m3 + m4 + m5 + "\n" + m6 + m7
-                    send(full)
+                    if monthly_opt:
+                        msg += f"\n🛡️ عقد شهري (8-30 يوم) {monthly_opt['exp']}\n"
+                        msg += f"💰 سترايك {monthly_opt['strike']}$ - سعره {monthly_opt['last']}$ | فوليوم: {monthly_opt['vol']} | OI: {monthly_opt['oi']} | فرق: {monthly_opt['spread']}%"
+
+                    send(msg)
                     time.sleep(1.5)
                 except Exception as e:
                     print(f"ERR {s} {e}")
-                    time.sleep(0.5)
                     continue
-
         except Exception as e:
-            print(f"LOOP MAIN ERR {e}")
+            print(f"MAIN ERR {e}")
             time.sleep(5)
-            continue
-
         time.sleep(15)
 
 Thread(target=loop, daemon=True).start()
