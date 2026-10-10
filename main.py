@@ -12,7 +12,7 @@ import yfinance as yf
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return 'Bot V69 Squeeze & Real Breakout Alerts'
+    return 'Bot V70 - Squeeze & Real Breakout (Market Hours & Filtered)'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -39,6 +39,18 @@ def send(msg):
     except Exception as e:
         print(f"SEND ERR {e}")
 
+def is_market_open():
+    """التحقق من أن السوق الأمريكي في أوقات التداول (تجنب الإرسال في الإغلاق والويكند)"""
+    now = datetime.utcnow()
+    # الويكند (السبت الأحد) مغلق
+    if now.weekday() >= 5:
+        return False
+    # أوقات التداول (من تقريبا 13:30 إلى 22:00 UTC) تشمل التداول والبري ماركت
+    hour = now.hour
+    if 12 <= hour <= 23:
+        return True
+    return False
+
 def get_quote_safe(sym, hist):
     try:
         q = finnhub_client.quote(sym)
@@ -55,8 +67,8 @@ def get_quote_safe(sym, hist):
 
 def fetch_fresh_history(sym):
     try:
-        df = yf.Ticker(sym).history(period='5d', interval='5m', auto_adjust=True)
-        if not df.empty and len(df) >= 20:
+        df = yf.Ticker(sym).history(period='5d', interval='15m', auto_adjust=True)
+        if not df.empty and len(df) >= 25:
             HIST_CACHE[sym] = df
             return df
     except: pass
@@ -101,7 +113,7 @@ def update_res():
 
 def check_squeeze(hist, current_p):
     try:
-        if len(hist) < 20: return None
+        if len(hist) < 25: return None
         close = hist['Close'].copy()
         if current_p > 0:
             close.iloc[-1] = current_p
@@ -116,13 +128,18 @@ def check_squeeze(hist, current_p):
         upper_kc = ma20 + 1.5*atr20
         lower_kc = ma20 - 1.5*atr20
         
-        # 1. حالة الانضغاط حالياً
+        # 1. حالة الانضغاط
         is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
         
-        # 2. كشف الانفجار (توسع البولنجر وخروج السعر فوق/تحت القناة)
+        # 2. فحص الفوليوم (أعلى من المتوسط بضعفين) وانفجار السعر
+        current_vol = hist['Volume'].iloc[-1]
+        avg_vol = hist['Volume'].iloc[-21:-1].mean()
+        is_high_volume = current_vol >= (avg_vol * 1.8)
+        
         prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
         is_breakout = (current_p > upper_bb.iloc[-1]) or (current_p < lower_bb.iloc[-1])
-        firing = (prev_sq or not is_sq) and is_breakout
+        
+        firing = (prev_sq or not is_sq) and is_breakout and is_high_volume
         
         curr_close = close.iloc[-1]
         ma_val = ma20.iloc[-1]
@@ -175,11 +192,16 @@ def get_three_opts(sym, price, opt_type):
 
 def loop():
     update_res()
-    send('⚡ V69 شغال - تم تفكيك الانضغاط عن الانفجار بدقة')
+    send('⚡ V70 شغال - تم تفعيل فلاتر أوقات التداول ومنع التكرار')
     last_res = time.time()
 
     while True:
         try:
+            # إذا السوق مغلق، البوت ينتظر ولا يفحص عبثاً
+            if not is_market_open():
+                time.sleep(300)
+                continue
+
             if time.time() - last_res > 28800:
                 update_res()
                 last_res = time.time()
@@ -201,13 +223,13 @@ def loop():
 
                     now = time.time()
                     
-                    # 💥 أولوية الانفجار أولاً
+                    # 💥 أولوية الانفجار أولاً مع زيادة وقت منع التكرار (ساعة كاملة لكل سهم)
                     if sq['firing']:
-                        if s in sent_firing and now - sent_firing[s] < 1800:
+                        if s in sent_firing and now - sent_firing[s] < 3600:
                             continue
                         event_type = "FIRING"
                     elif sq['squeeze']:
-                        if s in sent_squeeze and now - sent_squeeze[s] < 2700:
+                        if s in sent_squeeze and now - sent_squeeze[s] < 7200:
                             continue
                         event_type = "SQUEEZE"
                     else:
@@ -223,7 +245,7 @@ def loop():
                     if not daily_opt and not weekly_opt and not monthly_opt:
                         continue
 
-                    # تسجيل التنبيه المرسل
+                    # تسجيل التنبيه المرسل لمنع التكرار
                     if event_type == "FIRING":
                         sent_firing[s] = now
                     else:
