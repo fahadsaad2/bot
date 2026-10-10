@@ -12,7 +12,7 @@ import yfinance as yf
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return 'Bot V68 Squeeze & Breakout Dual Alerts'
+    return 'Bot V69 Squeeze & Real Breakout Alerts'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -116,11 +116,13 @@ def check_squeeze(hist, current_p):
         upper_kc = ma20 + 1.5*atr20
         lower_kc = ma20 - 1.5*atr20
         
-        # حالة الانضغاط الحالية
+        # 1. حالة الانضغاط حالياً
         is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-        # خروج من الانضغاط وانطلاق السعر
+        
+        # 2. كشف الانفجار (توسع البولنجر وخروج السعر فوق/تحت القناة)
         prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
-        firing = prev_sq and not is_sq
+        is_breakout = (current_p > upper_bb.iloc[-1]) or (current_p < lower_bb.iloc[-1])
+        firing = (prev_sq or not is_sq) and is_breakout
         
         curr_close = close.iloc[-1]
         ma_val = ma20.iloc[-1]
@@ -173,7 +175,7 @@ def get_three_opts(sym, price, opt_type):
 
 def loop():
     update_res()
-    send('⏳ V68 شغال - تنبيهان: الأول وقت الانضغاط والثاني لحظة الانفجار')
+    send('⚡ V69 شغال - تم تفكيك الانضغاط عن الانفجار بدقة')
     last_res = time.time()
 
     while True:
@@ -197,19 +199,18 @@ def loop():
 
                     if not sq: continue
 
-                    # تحديد هل الحالة انضغاط أو انفجار
-                    is_squeeze_event = sq['squeeze']
-                    is_firing_event = sq['firing']
-
-                    # تخطي إذا لم يتحقق أي شرط
-                    if not is_squeeze_event and not is_firing_event:
-                        continue
-
-                    # تجنب تكرار التنبيهات لنفس السهم خلال فترة قصيرة
                     now = time.time()
-                    if is_squeeze_event and (s in sent_squeeze and now - sent_squeeze[s] < 2700):
-                        continue
-                    if is_firing_event and (s in sent_firing and now - sent_firing[s] < 2700):
+                    
+                    # 💥 أولوية الانفجار أولاً
+                    if sq['firing']:
+                        if s in sent_firing and now - sent_firing[s] < 1800:
+                            continue
+                        event_type = "FIRING"
+                    elif sq['squeeze']:
+                        if s in sent_squeeze and now - sent_squeeze[s] < 2700:
+                            continue
+                        event_type = "SQUEEZE"
+                    else:
                         continue
 
                     is_put = (sq['dir'] == 'DOWN')
@@ -222,16 +223,17 @@ def loop():
                     if not daily_opt and not weekly_opt and not monthly_opt:
                         continue
 
-                    # تحديث سجل الرسائل
-                    if is_squeeze_event: sent_squeeze[s] = now
-                    if is_firing_event: sent_firing[s] = now
+                    # تسجيل التنبيه المرسل
+                    if event_type == "FIRING":
+                        sent_firing[s] = now
+                    else:
+                        sent_squeeze[s] = now
 
                     icon = '🧠' if s in TIER_CRAZY else '⚡'
                     res = RES_CACHE.get(s, 0)
                     gamma_barrier = res if res else round(p*1.05,2)
 
-                    # صياغة العنوان بناءً على الحالة
-                    if is_firing_event:
+                    if event_type == "FIRING":
                         msg = f"🔥 انطلاق انفجار السعر الآن {otype} {icon} {s}\n"
                     else:
                         msg = f"⏳ تنبيه انضغاط متوقع انفجاره ({otype}) {icon} {s}\n"
@@ -265,7 +267,7 @@ def loop():
         except Exception as e:
             print(f"MAIN ERR {e}")
             time.sleep(5)
-        time.sleep(20)
+        time.sleep(15)
 
 Thread(target=loop, daemon=True).start()
 while True:
