@@ -10,7 +10,7 @@ import yfinance as yf
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return 'Bot V72 - Clean Format + RVol + VWAP'
+def home(): return 'Bot V76 Final - AAA Sweep + OB Bounce + Full Metrics'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -31,7 +31,7 @@ MIN_VOL_TIER2 = 300; MIN_OI_TIER2 = 800
 MAX_SPREAD_PCT = 0.08
 MIN_PRICE = 0.4; MAX_PRICE = 12.0
 
-RES_CACHE = {}; HIST_CACHE = {}; sent_squeeze = set()
+RES_CACHE = {}; HIST_CACHE = {}; sent_signals = set()
 
 def send(msg):
     try:
@@ -83,6 +83,42 @@ def calc_vwap(hist):
         return float((typical.tail(len(last)) * last['Volume']).sum() / last['Volume'].sum())
     except: return float(hist['Close'].iloc[-1])
 
+def calc_order_block(hist):
+    try:
+        if len(hist) < 10: return None, None
+        for i in range(len(hist)-2, 5, -1):
+            if hist['Close'].iloc[i] < hist['Open'].iloc[i] and hist['Close'].iloc[i+1] > hist['High'].iloc[i]:
+                return float(hist['Low'].iloc[i]), float(hist['High'].iloc[i])
+        return float(hist['Low'].tail(10).min()), float(hist['High'].tail(10).max())
+    except: return None, None
+
+def check_liquidity_sweep(hist):
+    try:
+        if len(hist) < 22: return False, False
+        history_20 = hist.iloc[:-1].tail(20)
+        low_20 = float(history_20['Low'].min())
+        high_20 = float(history_20['High'].max())
+        last_low = float(hist['Low'].iloc[-1])
+        last_high = float(hist['High'].iloc[-1])
+        last_close = float(hist['Close'].iloc[-1])
+        bullish_sweep = (last_low < low_20) and (last_close > low_20)
+        bearish_sweep = (last_high > high_20) and (last_close < high_20)
+        return bullish_sweep, bearish_sweep
+    except: return False, False
+
+def check_squeeze(hist):
+    try:
+        if len(hist)<20: return None
+        close=hist['Close']; ma20=close.rolling(20).mean(); std20=close.rolling(20).std()
+        upper_bb=ma20+2*std20; lower_bb=ma20-2*std20
+        tr=pd.concat([hist['High']-hist['Low'], (hist['High']-hist['Close'].shift()).abs(), (hist['Low']-hist['Close'].shift()).abs()], axis=1).max(axis=1)
+        atr=tr.rolling(20).mean()
+        upper_kc=ma20+1.5*atr; lower_kc=ma20-1.5*atr
+        is_sq=(lower_bb.iloc[-1]>lower_kc.iloc[-1]) and (upper_bb.iloc[-1]<upper_kc.iloc[-1])
+        prev_sq=(lower_bb.iloc[-2]>lower_kc.iloc[-2]) and (upper_bb.iloc[-2]<upper_kc.iloc[-2])
+        return {'squeeze':is_sq,'firing':prev_sq and not is_sq,'dir':'UP' if close.iloc[-1]>ma20.iloc[-1] else 'DOWN'}
+    except: return None
+
 def calc_levels(hist, entry, gamma_res=None, is_put=False):
     atr=calc_atr(hist)
     if is_put:
@@ -108,19 +144,6 @@ def get_gamma_walls(sym, price):
         if above.empty: return None
         wall=above.sort_values('openInterest', ascending=False).iloc[0]
         return {'res_strike':float(wall['strike'])}
-    except: return None
-
-def check_squeeze(hist):
-    try:
-        if len(hist)<20: return None
-        close=hist['Close']; ma20=close.rolling(20).mean(); std20=close.rolling(20).std()
-        upper_bb=ma20+2*std20; lower_bb=ma20-2*std20
-        tr=pd.concat([hist['High']-hist['Low'], (hist['High']-hist['Close'].shift()).abs(), (hist['Low']-hist['Close'].shift()).abs()], axis=1).max(axis=1)
-        atr=tr.rolling(20).mean()
-        upper_kc=ma20+1.5*atr; lower_kc=ma20-1.5*atr
-        is_sq=(lower_bb.iloc[-1]>lower_kc.iloc[-1]) and (upper_bb.iloc[-1]<upper_kc.iloc[-1])
-        prev_sq=(lower_bb.iloc[-2]>lower_kc.iloc[-2]) and (upper_bb.iloc[-2]<upper_kc.iloc[-2])
-        return {'squeeze':is_sq,'firing':prev_sq and not is_sq,'dir':'UP' if close.iloc[-1]>ma20.iloc[-1] else 'DOWN'}
     except: return None
 
 def get_opt(sym, price, mode, opt_type='CALL'):
@@ -160,11 +183,11 @@ def get_opt(sym, price, mode, opt_type='CALL'):
 
 def loop():
     update_resistances()
-    send('✅ V72 اشتغل - تنسيق نظيف + RVol + VWAP')
+    send('✅ V76 Final اشتغل - AAA Sweep + OB Bounce + Full Metrics')
     last_res=time.time()
     while True:
         if time.time()-last_res>43200:
-            update_resistances(); last_res=time.time(); sent_squeeze.clear()
+            update_resistances(); last_res=time.time(); sent_signals.clear()
         today_str=datetime.now().strftime('%Y-%m-%d')
         for s in SYMBOLS:
             try:
@@ -174,38 +197,47 @@ def loop():
                 if not q: continue
                 p=float(q.get('c',0))
                 if p==0: continue
+
                 rsi=calc_rsi(hist); sma50=calc_sma(hist); sq=check_squeeze(hist)
                 if sq is None: continue
                 rvol=calc_rvol(hist); vwap=calc_vwap(hist)
-                if rvol < 1.2: continue
-                sq_key=f'{s}_{today_str}_sq'
-                if not (sq['squeeze'] or sq['firing']) or sq_key in sent_squeeze:
-                    time.sleep(0.5); continue
-                is_put=sq['dir']=='DOWN'
-                if not is_put and p < vwap: continue
-                if is_put and p > vwap: continue
-                if sq['firing']:
-                    if is_put and p>sma50: continue
-                    if not is_put and (p<sma50 or rsi<50): continue
-                else:
-                    if p<sma50 and rsi<50: continue
-                opt_type='PUT' if is_put else 'CALL'
-                gamma=get_gamma_walls(s,p); gamma_strike=gamma['res_strike'] if gamma else None
-                stop,t1,t2,t3,atr=calc_levels(hist,p,gamma_res=gamma_strike,is_put=is_put)
-                d=get_opt(s,p,'daily',opt_type); w=get_opt(s,p,'weekly',opt_type)
+
+                bull_sweep, bear_sweep = check_liquidity_sweep(hist)
+                ob_low, ob_high = calc_order_block(hist)
+
+                if bull_sweep: is_put = False
+                elif bear_sweep: is_put = True
+                else: continue
+
+                in_ob = True if ob_low is None else (p >= ob_low * 0.97)
+
+                is_valid_setup = (sq['squeeze'] or sq['firing']) and (rvol >= 1.2) and in_ob
+                if not is_valid_setup: continue
+
+                sig_key = f'{s}_{today_str}_sig'
+                if sig_key in sent_signals: continue
+
+                opt_type = 'PUT' if is_put else 'CALL'
+                gamma = get_gamma_walls(s, p); gamma_strike = gamma['res_strike'] if gamma else None
+                stop, t1, t2, t3, atr = calc_levels(hist, p, gamma_res=gamma_strike, is_put=is_put)
+
+                d = get_opt(s, p, 'daily', opt_type); w = get_opt(s, p, 'weekly', opt_type)
                 if d is None and w is None: continue
 
-                # --- تنسيق الرسالة الجديد المرتب ---
-                icon = "🔥" if sq['firing'] else "⏳"
+                icon = "🔥" if sq['firing'] else "🎯"
                 type_txt = "تنبيه انطلاق" if sq['firing'] else "تنبيه انضغاط متوقع انفجاره"
                 tier_emoji = "🧠" if s in TIER1 else "💡"
+                sweep_type = "SSL" if bull_sweep else "BSL"
 
-                msg = f"{icon} {type_txt} ({opt_type}) {tier_emoji} {s}\n"
+                msg = f"{icon} {type_txt} ({opt_type}) {tier_emoji} {s} [AAA - {sweep_type} + Squeeze]\n"
+                msg += f"💧 سحب سيولة {sweep_type} + ارتداد\n"
                 msg += f"💵 نقطة الدخول اللحظية: {p:.2f}$\n"
                 msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma50:.2f}$\n"
                 msg += f"📈 RVol: {rvol:.2f}x | VWAP: {vwap:.2f}$\n"
                 if gamma and gamma['res_strike']:
                     msg += f"🧱 حاجز المقاومة/غاما: {gamma['res_strike']:.2f}$\n"
+                if ob_low and ob_high:
+                    msg += f"🧱 منطقة OB: {ob_low:.2f}$ - {ob_high:.2f}$\n"
                 msg += f"\n🛑 وقف الخسارة: {stop}$\n"
                 msg += f"🎯 الهدف الأول: {t1}$\n"
                 msg += f"🎯 الهدف الثاني: {t2}$\n"
@@ -222,7 +254,7 @@ def loop():
                     msg += f"🔹 سترايك: {w['strike']}$ | السعر: {w['last']}$\n"
                     msg += f"📈 فوليوم: {w['vol']} | OI: {w['oi']} | الفرق: {w['spread']:.1%}\n"
 
-                send(msg); sent_squeeze.add(sq_key); time.sleep(2)
+                send(msg); sent_signals.add(sig_key); time.sleep(2)
             except Exception as e:
                 print(f'LOOP ERR {s}:{e}'); time.sleep(2)
         time.sleep(30)
