@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
+from datetime import datetime
 import os
 from threading import Thread
 import time
-from datetime import datetime
 import finnhub
 from flask import Flask
 import pandas as pd
@@ -11,8 +10,7 @@ import yfinance as yf
 
 app = Flask(__name__)
 @app.route('/')
-def home():
-    return 'Bot V70 - Squeeze & Real Breakout (Market Hours & Filtered)'
+def home(): return 'Bot V72 - Clean Format + RVol + VWAP'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -24,273 +22,210 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-SYMBOLS = ['NVDA','TSLA','GOOGL','META','MSFT','SMCI','MSTR','COIN','AAPL','AMD','AMZN','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT']
-TIER_CRAZY = ['SNDK','MU','MSTR','COIN','SMCI','APP','PLTR','LITE']
-HIGH_PRICE = ['META','AVGO','MSTR','APP','GOOGL','MSFT','NVDA','SMCI','COIN','SNDK']
+TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
+TIER2 = ['SMCI','MSTR','COIN','AAPL','AMD','AMZN','PLTR','APP','ARM','AVGO','MU','LITE','SNDK','RDDT']
+SYMBOLS = TIER1 + TIER2
 
-RES_CACHE = {}
-HIST_CACHE = {}
-sent_squeeze = {}
-sent_firing = {}
+MIN_VOL_TIER1 = 1000; MIN_OI_TIER1 = 3000
+MIN_VOL_TIER2 = 300; MIN_OI_TIER2 = 800
+MAX_SPREAD_PCT = 0.08
+MIN_PRICE = 0.4; MAX_PRICE = 12.0
+
+RES_CACHE = {}; HIST_CACHE = {}; sent_squeeze = set()
 
 def send(msg):
     try:
-        requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=15)
-    except Exception as e:
-        print(f"SEND ERR {e}")
+        requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+                      json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=20)
+    except Exception as e: print(f'SEND ERR {e}', flush=True)
 
-def is_market_open():
-    """التحقق من أن السوق الأمريكي في أوقات التداول (تجنب الإرسال في الإغلاق والويكند)"""
-    now = datetime.utcnow()
-    # الويكند (السبت الأحد) مغلق
-    if now.weekday() >= 5:
-        return False
-    # أوقات التداول (من تقريبا 13:30 إلى 22:00 UTC) تشمل التداول والبري ماركت
-    hour = now.hour
-    if 12 <= hour <= 23:
-        return True
-    return False
+def get_finnhub_quote_safe(sym):
+    for _ in range(3):
+        try: return finnhub_client.quote(sym)
+        except Exception as e:
+            if '429' in str(e): time.sleep(60)
+            else: break
+    return None
 
-def get_quote_safe(sym, hist):
+def calc_rsi(hist, period=14):
     try:
-        q = finnhub_client.quote(sym)
-        if q and q.get('c',0) > 0:
-            fh = float(q['c'])
-            if hist is not None and not hist.empty:
-                yf_p = float(hist['Close'].iloc[-1])
-                if yf_p > 0 and abs(fh - yf_p)/yf_p*100 > 15:
-                    return yf_p
-            return fh
-    except:
-        pass
-    return float(hist['Close'].iloc[-1]) if hist is not None and not hist.empty else 0
+        delta = hist['Close'].diff()
+        gain = delta.where(delta>0,0).rolling(period).mean()
+        loss = -delta.where(delta<0,0).rolling(period).mean()
+        return float((100-(100/(1+gain/loss))).iloc[-1])
+    except: return 50.0
 
-def fetch_fresh_history(sym):
-    try:
-        df = yf.Ticker(sym).history(period='5d', interval='15m', auto_adjust=True)
-        if not df.empty and len(df) >= 25:
-            HIST_CACHE[sym] = df
-            return df
-    except: pass
-    return HIST_CACHE.get(sym)
-
-def calc_rsi(hist):
-    try:
-        d = hist['Close'].diff()
-        g = d.where(d > 0, 0).rolling(14).mean()
-        l = -d.where(d < 0, 0).rolling(14).mean()
-        rs = g / l
-        return float(100 - (100 / (1 + rs)).iloc[-1])
-    except: return 50
-
-def calc_sma(hist):
-    try: return float(hist['Close'].rolling(50).mean().iloc[-1])
+def calc_sma(hist, period=50):
+    try: return float(hist['Close'].rolling(period).mean().iloc[-1])
     except: return float(hist['Close'].iloc[-1])
 
-def calc_atr(hist):
+def calc_atr(hist, period=14):
     try:
-        hl = hist['High']-hist['Low']
-        hc = (hist['High']-hist['Close'].shift()).abs()
-        lc = (hist['Low']-hist['Close'].shift()).abs()
-        tr = pd.concat([hl,hc,lc], axis=1).max(axis=1)
-        return float(tr.rolling(14).mean().iloc[-1])
+        hl=hist['High']-hist['Low']
+        hc=(hist['High']-hist['Close'].shift()).abs()
+        lc=(hist['Low']-hist['Close'].shift()).abs()
+        tr=pd.concat([hl,hc,lc],axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
     except: return float(hist['Close'].iloc[-1]*0.02)
 
-def calc_levels(entry, atr, is_put):
-    if is_put:
-        return round(entry+atr*1.2,2), round(entry-atr*1.5,2), round(entry-atr*3.0,2), round(entry-atr*4.5,2)
-    else:
-        return round(entry-atr*1.2,2), round(entry+atr*1.5,2), round(entry+atr*3.0,2), round(entry+atr*4.5,2)
+def calc_rvol(hist):
+    try:
+        if len(hist)<21: return 1.0
+        today_vol=float(hist['Volume'].iloc[-1])
+        avg20=float(hist['Volume'].tail(21).head(20).mean())
+        return today_vol/avg20 if avg20!=0 else 1.0
+    except: return 1.0
 
-def update_res():
+def calc_vwap(hist):
+    try:
+        typical = (hist['High']+hist['Low']+hist['Close'])/3
+        last = hist.tail(78) if len(hist)>78 else hist
+        return float((typical.tail(len(last)) * last['Volume']).sum() / last['Volume'].sum())
+    except: return float(hist['Close'].iloc[-1])
+
+def calc_levels(hist, entry, gamma_res=None, is_put=False):
+    atr=calc_atr(hist)
+    if is_put:
+        stop=entry+atr*1.0; t1=entry-atr*1.5; t2=entry-atr*3.0; t3=entry-atr*5.0
+    else:
+        t1=gamma_res if (gamma_res and entry<gamma_res<entry+atr*2) else entry+atr*1.5
+        t2=entry+atr*3.0; t3=entry+atr*5.0; stop=entry-atr*1.0
+    return round(stop,2), round(t1,2), round(t2,2), round(t3,2), round(atr,2)
+
+def update_resistances():
     for sym in SYMBOLS:
         try:
-            hist = yf.Ticker(sym).history(period='3mo', auto_adjust=True)
-            if hist.empty: continue
-            RES_CACHE[sym] = float(max(hist['High'].tail(20)))
-            time.sleep(0.3)
-        except: continue
+            hist=yf.Ticker(sym).history(period='3mo', auto_adjust=True)
+            if not hist.empty and len(hist)>=60:
+                RES_CACHE[sym]=max(hist['High'].tail(5)); HIST_CACHE[sym]=hist
+            time.sleep(2.5)
+        except Exception as e: print(f'RES ERR {sym}:{e}'); time.sleep(10)
 
-def check_squeeze(hist, current_p):
+def get_gamma_walls(sym, price):
     try:
-        if len(hist) < 25: return None
-        close = hist['Close'].copy()
-        if current_p > 0:
-            close.iloc[-1] = current_p
-            
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        upper_bb = ma20 + 2*std20
-        lower_bb = ma20 - 2*std20
-        
-        tr = pd.concat([hist['High']-hist['Low'], (hist['High']-close.shift()).abs(), (hist['Low']-close.shift()).abs()], axis=1).max(axis=1)
-        atr20 = tr.rolling(20).mean()
-        upper_kc = ma20 + 1.5*atr20
-        lower_kc = ma20 - 1.5*atr20
-        
-        # 1. حالة الانضغاط
-        is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-        
-        # 2. فحص الفوليوم (أعلى من المتوسط بضعفين) وانفجار السعر
-        current_vol = hist['Volume'].iloc[-1]
-        avg_vol = hist['Volume'].iloc[-21:-1].mean()
-        is_high_volume = current_vol >= (avg_vol * 1.8)
-        
-        prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
-        is_breakout = (current_p > upper_bb.iloc[-1]) or (current_p < lower_bb.iloc[-1])
-        
-        firing = (prev_sq or not is_sq) and is_breakout and is_high_volume
-        
-        curr_close = close.iloc[-1]
-        ma_val = ma20.iloc[-1]
-        direction = 'UP' if curr_close >= ma_val else 'DOWN'
-        
-        return {'squeeze': is_sq, 'firing': firing, 'dir': direction}
+        t=yf.Ticker(sym); calls=pd.concat([t.option_chain(exp).calls for exp in t.options[:2]])
+        above=calls[calls['strike']>=price]
+        if above.empty: return None
+        wall=above.sort_values('openInterest', ascending=False).iloc[0]
+        return {'res_strike':float(wall['strike'])}
     except: return None
 
-def get_three_opts(sym, price, opt_type):
+def check_squeeze(hist):
     try:
-        t = yf.Ticker(sym)
-        exps = t.options
-        if not exps: return None,None,None
-        today = datetime.now().date()
-        daily_exp, weekly_exp, monthly_exp = None,None,None
-        for exp_str in exps:
+        if len(hist)<20: return None
+        close=hist['Close']; ma20=close.rolling(20).mean(); std20=close.rolling(20).std()
+        upper_bb=ma20+2*std20; lower_bb=ma20-2*std20
+        tr=pd.concat([hist['High']-hist['Low'], (hist['High']-hist['Close'].shift()).abs(), (hist['Low']-hist['Close'].shift()).abs()], axis=1).max(axis=1)
+        atr=tr.rolling(20).mean()
+        upper_kc=ma20+1.5*atr; lower_kc=ma20-1.5*atr
+        is_sq=(lower_bb.iloc[-1]>lower_kc.iloc[-1]) and (upper_bb.iloc[-1]<upper_kc.iloc[-1])
+        prev_sq=(lower_bb.iloc[-2]>lower_kc.iloc[-2]) and (upper_bb.iloc[-2]<upper_kc.iloc[-2])
+        return {'squeeze':is_sq,'firing':prev_sq and not is_sq,'dir':'UP' if close.iloc[-1]>ma20.iloc[-1] else 'DOWN'}
+    except: return None
+
+def get_opt(sym, price, mode, opt_type='CALL'):
+    try:
+        t=yf.Ticker(sym); exps=t.options
+        if not exps: return None
+        today=datetime.now().date()
+        daily=[]; weekly=[]
+        for exp in exps:
+            d=(datetime.strptime(exp, '%Y-%m-%d').date()-today).days
+            if 0<=d<=3: daily.append(exp)
+            elif 4<=d<=12: weekly.append(exp)
+        target = daily if mode=='daily' else weekly
+        if not target: return None
+        best=None; best_score=-1
+        for exp in target[:3]:
             try:
-                d = datetime.strptime(exp_str, '%Y-%m-%d').date()
-                days = (d - today).days
-                if 0 <= days <= 3 and not daily_exp: daily_exp = exp_str
-                elif 4 <= days <= 10 and not weekly_exp: weekly_exp = exp_str
-                elif 11 <= days <= 30 and not monthly_exp: monthly_exp = exp_str
+                chain=t.option_chain(exp); df=chain.calls if opt_type=='CALL' else chain.puts
+                df=df[(df['lastPrice']>=MIN_PRICE)&(df['lastPrice']<=MAX_PRICE)]
+                filt=df[(df['strike']>=price*0.97)&(df['strike']<=price*1.08)] if opt_type=='CALL' else df[(df['strike']<=price*1.03)&(df['strike']>=price*0.92)]
+                if filt.empty: continue
+                for _, row in filt.iterrows():
+                    vol=int(row['volume'] or 0); oi=int(row['openInterest'] or 0)
+                    bid=float(row.get('bid',0) or 0); ask=float(row.get('ask',0) or 0); last=float(row['lastPrice'] or 0)
+                    if last==0 or bid==0 or ask==0: continue
+                    spread=(ask-bid)/last
+                    min_v=MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
+                    min_o=MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
+                    if vol<min_v or oi<min_o or spread>MAX_SPREAD_PCT: continue
+                    score=(vol*0.7+oi*0.3)-(spread*1000)-abs(row['strike']-price)*2
+                    if score>best_score:
+                        best_score=score; flow=(vol/oi*100) if oi>0 else 0
+                        best={'strike':row['strike'],'last':last,'vol':vol,'oi':oi,'exp':exp,'whale':vol>2000 and flow>150,'spread':spread}
             except: continue
-
-        max_price = 150 if sym in HIGH_PRICE else 30
-
-        def parse_chain(exp):
-            if not exp: return None
-            try:
-                ch = t.option_chain(exp)
-                data = ch.calls if opt_type == 'CALL' else ch.puts
-                if data.empty: return None
-                filt = data[(data['lastPrice'] <= max_price) & (data['lastPrice'] >= 0.05)]
-                if opt_type == 'CALL':
-                    filt = filt[(filt['strike'] >= price*0.95) & (filt['strike'] <= price*1.12)]
-                else:
-                    filt = filt[(filt['strike'] <= price*1.05) & (filt['strike'] >= price*0.88)]
-                if filt.empty: return None
-                filt = filt.copy()
-                filt['score'] = filt['volume'].fillna(0)*0.7 + filt['openInterest'].fillna(0)*0.3
-                best = filt.sort_values(by='score', ascending=False).iloc[0]
-                bid = float(best.get('bid',0) or 0)
-                ask = float(best.get('ask',0) or 0)
-                spread = round(((ask-bid)/ask)*100,1) if ask>0 else 0
-                return {'strike':best['strike'],'last':float(best['lastPrice'] or 0),'vol':int(best['volume'] or 0),'oi':int(best['openInterest'] or 0),'exp':exp,'spread':spread}
-            except: return None
-
-        return parse_chain(daily_exp), parse_chain(weekly_exp), parse_chain(monthly_exp)
-    except: return None,None,None
+        return best
+    except: return None
 
 def loop():
-    update_res()
-    send('⚡ V70 شغال - تم تفعيل فلاتر أوقات التداول ومنع التكرار')
-    last_res = time.time()
-
+    update_resistances()
+    send('✅ V72 اشتغل - تنسيق نظيف + RVol + VWAP')
+    last_res=time.time()
     while True:
-        try:
-            # إذا السوق مغلق، البوت ينتظر ولا يفحص عبثاً
-            if not is_market_open():
-                time.sleep(300)
-                continue
+        if time.time()-last_res>43200:
+            update_resistances(); last_res=time.time(); sent_squeeze.clear()
+        today_str=datetime.now().strftime('%Y-%m-%d')
+        for s in SYMBOLS:
+            try:
+                res=RES_CACHE.get(s); hist=HIST_CACHE.get(s)
+                if not res or hist is None: continue
+                q=get_finnhub_quote_safe(s)
+                if not q: continue
+                p=float(q.get('c',0))
+                if p==0: continue
+                rsi=calc_rsi(hist); sma50=calc_sma(hist); sq=check_squeeze(hist)
+                if sq is None: continue
+                rvol=calc_rvol(hist); vwap=calc_vwap(hist)
+                if rvol < 1.2: continue
+                sq_key=f'{s}_{today_str}_sq'
+                if not (sq['squeeze'] or sq['firing']) or sq_key in sent_squeeze:
+                    time.sleep(0.5); continue
+                is_put=sq['dir']=='DOWN'
+                if not is_put and p < vwap: continue
+                if is_put and p > vwap: continue
+                if sq['firing']:
+                    if is_put and p>sma50: continue
+                    if not is_put and (p<sma50 or rsi<50): continue
+                else:
+                    if p<sma50 and rsi<50: continue
+                opt_type='PUT' if is_put else 'CALL'
+                gamma=get_gamma_walls(s,p); gamma_strike=gamma['res_strike'] if gamma else None
+                stop,t1,t2,t3,atr=calc_levels(hist,p,gamma_res=gamma_strike,is_put=is_put)
+                d=get_opt(s,p,'daily',opt_type); w=get_opt(s,p,'weekly',opt_type)
+                if d is None and w is None: continue
 
-            if time.time() - last_res > 28800:
-                update_res()
-                last_res = time.time()
+                # --- تنسيق الرسالة الجديد المرتب ---
+                icon = "🔥" if sq['firing'] else "⏳"
+                type_txt = "تنبيه انطلاق" if sq['firing'] else "تنبيه انضغاط متوقع انفجاره"
+                tier_emoji = "🧠" if s in TIER1 else "💡"
 
-            for s in SYMBOLS:
-                try:
-                    hist = fetch_fresh_history(s)
-                    if hist is None or hist.empty: continue
-                    
-                    p = get_quote_safe(s, hist)
-                    if p == 0: continue
+                msg = f"{icon} {type_txt} ({opt_type}) {tier_emoji} {s}\n"
+                msg += f"💵 نقطة الدخول اللحظية: {p:.2f}$\n"
+                msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma50:.2f}$\n"
+                msg += f"📈 RVol: {rvol:.2f}x | VWAP: {vwap:.2f}$\n"
+                if gamma and gamma['res_strike']:
+                    msg += f"🧱 حاجز المقاومة/غاما: {gamma['res_strike']:.2f}$\n"
+                msg += f"\n🛑 وقف الخسارة: {stop}$\n"
+                msg += f"🎯 الهدف الأول: {t1}$\n"
+                msg += f"🎯 الهدف الثاني: {t2}$\n"
+                msg += f"🎯 الهدف الثالث: {t3}$\n"
 
-                    rsi = calc_rsi(hist)
-                    sma = calc_sma(hist)
-                    atr = calc_atr(hist)
-                    sq = check_squeeze(hist, p)
+                if d:
+                    whale_txt = " 🐋 دخول حيتان" if d['whale'] else ""
+                    msg += f"\n📅 عقد يومي (0-3 أيام) ({d['exp']}){whale_txt}\n"
+                    msg += f"🔹 سترايك: {d['strike']}$ | السعر: {d['last']}$\n"
+                    msg += f"📈 فوليوم: {d['vol']} | OI: {d['oi']} | الفرق: {d['spread']:.1%}\n"
 
-                    if not sq: continue
+                if w:
+                    msg += f"\n🛡️ عقد أسبوعي/آمن ({w['exp']})\n"
+                    msg += f"🔹 سترايك: {w['strike']}$ | السعر: {w['last']}$\n"
+                    msg += f"📈 فوليوم: {w['vol']} | OI: {w['oi']} | الفرق: {w['spread']:.1%}\n"
 
-                    now = time.time()
-                    
-                    # 💥 أولوية الانفجار أولاً مع زيادة وقت منع التكرار (ساعة كاملة لكل سهم)
-                    if sq['firing']:
-                        if s in sent_firing and now - sent_firing[s] < 3600:
-                            continue
-                        event_type = "FIRING"
-                    elif sq['squeeze']:
-                        if s in sent_squeeze and now - sent_squeeze[s] < 7200:
-                            continue
-                        event_type = "SQUEEZE"
-                    else:
-                        continue
-
-                    is_put = (sq['dir'] == 'DOWN')
-                    if is_put and rsi < 35: continue
-                    if not is_put and rsi > 65: continue
-
-                    otype = 'PUT' if is_put else 'CALL'
-                    stop, t1, t2, t3 = calc_levels(p, atr, is_put)
-                    daily_opt, weekly_opt, monthly_opt = get_three_opts(s, p, otype)
-                    if not daily_opt and not weekly_opt and not monthly_opt:
-                        continue
-
-                    # تسجيل التنبيه المرسل لمنع التكرار
-                    if event_type == "FIRING":
-                        sent_firing[s] = now
-                    else:
-                        sent_squeeze[s] = now
-
-                    icon = '🧠' if s in TIER_CRAZY else '⚡'
-                    res = RES_CACHE.get(s, 0)
-                    gamma_barrier = res if res else round(p*1.05,2)
-
-                    if event_type == "FIRING":
-                        msg = f"🔥 انطلاق انفجار السعر الآن {otype} {icon} {s}\n"
-                    else:
-                        msg = f"⏳ تنبيه انضغاط متوقع انفجاره ({otype}) {icon} {s}\n"
-
-                    msg += f"💵 نقطة الدخول اللحظية: {p:.2f}$\n"
-                    msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma:.2f}$\n"
-                    msg += f"🧱 حاجز المقاومة/غاما: {gamma_barrier:.2f}$\n\n"
-                    msg += f"🛑 وقف الخسارة: {stop}$\n"
-                    msg += f"🎯 الهدف الأول: {t1}$\n"
-                    msg += f"🎯 الهدف الثاني: {t2}$\n"
-                    msg += f"🎯 الهدف الثالث: {t3}$\n"
-
-                    if daily_opt:
-                        msg += f"\n⚡ عقد يومي/سريع ({daily_opt['exp']})\n"
-                        msg += f"🔹 سترايك: {daily_opt['strike']}$ | السعر: {daily_opt['last']}$\n"
-                        msg += f"📈 فوليوم: {daily_opt['vol']} | OI: {daily_opt['oi']} | الفرق: {daily_opt['spread']}%\n"
-                    if weekly_opt:
-                        msg += f"\n📅 عقد أسبوعي ({weekly_opt['exp']})\n"
-                        msg += f"🔹 سترايك: {weekly_opt['strike']}$ | السعر: {weekly_opt['last']}$\n"
-                        msg += f"📈 فوليوم: {weekly_opt['vol']} | OI: {weekly_opt['oi']} | الفرق: {weekly_opt['spread']}%\n"
-                    if monthly_opt:
-                        msg += f"\n🛡️ عقد شهري/آمن ({monthly_opt['exp']})\n"
-                        msg += f"🔹 سترايك: {monthly_opt['strike']}$ | السعر: {monthly_opt['last']}$\n"
-                        msg += f"📈 فوليوم: {monthly_opt['vol']} | OI: {monthly_opt['oi']} | الفرق: {monthly_opt['spread']}%\n"
-
-                    send(msg)
-                    time.sleep(1.5)
-                except Exception as e:
-                    print(f"ERR {s} {e}")
-                    continue
-        except Exception as e:
-            print(f"MAIN ERR {e}")
-            time.sleep(5)
-        time.sleep(15)
+                send(msg); sent_squeeze.add(sq_key); time.sleep(2)
+            except Exception as e:
+                print(f'LOOP ERR {s}:{e}'); time.sleep(2)
+        time.sleep(30)
 
 Thread(target=loop, daemon=True).start()
-while True:
-    time.sleep(3600)
+while True: time.sleep(3600)
