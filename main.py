@@ -8,7 +8,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, OptionChainRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import ContractType
+from alpaca.trading.enums import ContractType
 
 app = Flask(__name__)
 
@@ -30,7 +30,6 @@ ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# 19 سهم ممتازة لمنع الـ Rate Limits والوصول لأفضل سرعة فحص
 TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
 TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'AVGO', 'MU', 'LITE', 'RDDT']
 SYMBOLS = TIER1 + TIER2
