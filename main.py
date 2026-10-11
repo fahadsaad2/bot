@@ -276,3 +276,6 @@ def clear_old_squeeze_cache():
     if datetime.now() - last_cache_clear > timedelta(hours=12):
         sent_squeeze.clear()
         last_cache_clear = datetime.now()
+
+if __name__ == '__main__':
+    run_web()
