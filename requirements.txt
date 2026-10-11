@@ -1,6 +1,5 @@
 Flask
 requests
-finnhub-python
-yfinance
 pandas
 numpy
+alpaca-py
