@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK - RealTime + Liquidity + OB + Squeeze + 3 Contracts'
+    return 'Bot OK - RealTime + Liquidity + OB + Squeeze + Greeks Filter'
 
 def run_web():
     port = int(os.environ.get('PORT', 10000))
@@ -231,6 +231,22 @@ def get_opt(sym, price, mode, opt_type='CALL'):
             if opt_type == 'PUT' and not (price * 0.90 <= strike <= price * 1.05):
                 continue
                 
+            # فلترة المؤشرات اليونانية (Greeks Filters)
+            greeks = getattr(c, 'greeks', None)
+            if greeks:
+                delta = float(greeks.delta) if greeks.delta is not None else 0.5
+                theta = float(greeks.theta) if greeks.theta is not None else 0.0
+                
+                # التحقق من نطاق الدلتا المناسب للحركة المتوازنة
+                if opt_type == 'CALL' and not (0.35 <= delta <= 0.70):
+                    continue
+                if opt_type == 'PUT' and not (-0.70 <= delta <= -0.35):
+                    continue
+                
+                # استبعاد العقود ذات التآكل الزمني السلبي العالي جداً
+                if theta < -1.5:
+                    continue
+            
             last = float(c.latest_trade.price) if c.latest_trade else 0
             if last == 0 and c.latest_quote:
                 last = (float(c.latest_quote.bid_price or 0) + float(c.latest_quote.ask_price or 0)) / 2
