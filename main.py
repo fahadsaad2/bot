@@ -1,313 +1,605 @@
-from datetime import datetime, timedelta
+"""\
+تنبيهات Squeeze للأسهم الأمريكية عبر Alpaca وTelegram.
+
+مهم: هذا البوت يرسل تنبيهات تحليلية فقط، ولا ينفذ أوامر تداول.
+الإشارات تعتمد على شموع مكتملة مدتها 5 دقائق.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
 import os
-from threading import Thread
 import time
-from flask import Flask
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from threading import Thread
+from typing import Any
+
 import pandas as pd
 import requests
-from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, OptionChainRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.enums import ContractType
+from flask import Flask, jsonify
+from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.requests import (
+    OptionChainRequest,
+    StockBarsRequest,
+    StockLatestTradeRequest,
+)
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import AssetStatus, ContractType
+from alpaca.trading.requests import GetOptionContractsRequest
+
+
+# ------------------------------- الإعدادات ----------------------------------
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+
+TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
+TIER2 = [
+    "SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP",
+    "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK",
+]
+SYMBOLS = TIER1 + TIER2
+
+BAR_MINUTES = 5
+TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
+POLL_SECONDS = max(30, int(os.getenv("POLL_SECONDS", "60")))
+HISTORY_DAYS = max(10, int(os.getenv("HISTORY_DAYS", "15")))
+MAX_OPTION_SPREAD_PCT = max(1.0, float(os.getenv("MAX_OPTION_SPREAD_PCT", "35")))
+STATE_FILE = Path(os.getenv("STATE_FILE", "squeeze_state.json"))
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return 'Bot OK - Squeeze + Better Candles Arabic Style'
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("squeeze_bot")
 
-@app.route('/health')
-def health():
-    return 'OK'
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
-ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
+# تحقق مبكر حتى لا يبدأ البوت بحالة ناقصة.
+_required_env = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    "ALPACA_API_KEY": ALPACA_API_KEY,
+    "ALPACA_SECRET_KEY": ALPACA_SECRET_KEY,
+}
+_missing = [key for key, value in _required_env.items() if not value]
+if _missing:
+    raise RuntimeError("متغيرات البيئة المطلوبة غير موجودة: " + ", ".join(_missing))
 
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+# يُستخدم TradingClient هنا لجلب بيانات تعريف العقود فقط؛ لا توجد أوامر تداول.
+trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
-TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'AVGO', 'MU', 'LITE', 'RDDT', 'SNDK']
-SYMBOLS = TIER1 + TIER2
 
-RES_CACHE, HIST_CACHE = {}, {}
-sent_squeeze = set()
-last_cache_clear = datetime.now()
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """قراءة حقل من كائن Alpaca أو قاموس مع دعم الحالتين."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
-def send(msg):
+
+def _as_float(value: Any, default: float | None = None) -> float | None:
     try:
-        requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
-            timeout=20
-        )
-    except Exception as e:
-        print(f'SEND ERR {e}')
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
 
-def get_alpaca_price(sym):
+
+def _as_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     try:
-        req = StockLatestTradeRequest(symbol_or_symbols=sym)
-        trade = stock_client.get_stock_latest_trade(req)
-        return float(trade[sym].price)
-    except:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
         return None
 
-def calc_rsi(hist, period=14):
-    try:
-        delta = hist['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(period).mean()
-        loss = -delta.where(delta < 0, 0).rolling(period).mean()
-        rs = gain / loss
-        return float((100 - (100 / (1 + rs))).iloc[-1])
-    except:
-        return 50.0
 
-def calc_atr(hist, p=14):
-    try:
-        hl = hist['High'] - hist['Low']
-        hc = (hist['High'] - hist['Close'].shift()).abs()
-        lc = (hist['Low'] - hist['Close'].shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        return float(tr.rolling(p).mean().iloc[-1])
-    except:
-        return float(hist['Close'].iloc[-1] * 0.02)
-
-def calc_levels(hist, entry, is_put=False):
-    atr = calc_atr(hist, 14)
-    if is_put:
-        stop = entry + (atr * 1.0)
-        t1 = entry - (atr * 1.5)
-        t2 = entry - (atr * 3.0)
-        t3 = entry - (atr * 5.0)
-    else:
-        stop = entry - (atr * 1.0)
-        t1 = entry + (atr * 1.5)
-        t2 = entry + (atr * 3.0)
-        t3 = entry + (atr * 5.0)
-    return round(stop, 2), round(t1, 2), round(t2, 2), round(t3, 2)
-
-def calc_liquidity_and_ob(hist):
-    try:
-        low_20 = hist['Low'].tail(20).min()
-        high_20 = hist['High'].tail(20).max()
-        curr_low = hist['Low'].iloc[-1]
-        curr_high = hist['High'].iloc[-1]
-        curr_close = hist['Close'].iloc[-1]
-
-        liq_type, liq_txt = None, "بدون سحب سيولة"
-        if curr_low <= low_20 and curr_close > low_20:
-            liq_txt = "💧 سحب سيولة SSL + ارتداد"
-        elif curr_high >= high_20 and curr_close < high_20:
-            liq_txt = "💧 سحب سيولة BSL + ارتداد"
-
-        ob_low, ob_high = 0, 0
-        ob_txt = "غير محدد"
-        last = hist.tail(25)
-
-        for i in range(len(last) - 4, 5, -1):
-            if last['Close'].iloc[i] < last['Open'].iloc[i]:
-                if last['Close'].iloc[i + 1] > last['Open'].iloc[i + 1] and last['Close'].iloc[i + 1] > last['Close'].iloc[i]:
-                    ob_low = float(last['Low'].iloc[i])
-                    ob_high = float(last['High'].iloc[i])
-                    ob_txt = f"{ob_low:.2f}$ - {ob_high:.2f}$"
-                    break
-        if ob_low == 0:
-            ob_low = float(hist['Low'].tail(5).min())
-            ob_high = float(curr_close)
-            ob_txt = f"{ob_low:.2f}$ - {ob_high:.2f}$"
-
-        return liq_txt, ob_txt
-    except:
-        return "بدون سحب سيولة", "غير محدد"
-
-def update_resistances():
-    for idx, sym in enumerate(SYMBOLS):
+def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """توحيد أسماء أعمدة Alpaca وترتيب الشموع زمنيًا."""
+    frame = raw.copy()
+    if isinstance(frame.index, pd.MultiIndex):
         try:
-            req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Day, start=datetime.now() - timedelta(days=120))
-            bars = stock_client.get_stock_bars(req)
-            df = bars.df
-            if df.empty:
-                continue
-            hist = df.xs(sym, level=0) if isinstance(df.index, pd.MultiIndex) else df
-            hist = hist.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'})
-            if len(hist) >= 20:
-                RES_CACHE[sym] = {
-                    'res': max(hist['High'].tail(20)),
-                    'sup': min(hist['Low'].tail(20))
-                }
-                HIST_CACHE[sym] = hist
-            time.sleep(0.2)
-        except Exception as e:
-            print(f'RES ERR {sym}: {e}')
+            frame = frame.xs(symbol, level=0)
+        except KeyError:
+            return pd.DataFrame()
+    rename = {
+        "open": "Open", "high": "High", "low": "Low", "close": "Close",
+        "volume": "Volume", "trade_count": "TradeCount", "vwap": "VWAP",
+    }
+    frame = frame.rename(columns=rename)
+    needed = ["Open", "High", "Low", "Close"]
+    if any(col not in frame.columns for col in needed):
+        return pd.DataFrame()
+    for col in needed + (["Volume"] if "Volume" in frame.columns else []):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = frame.dropna(subset=needed).sort_index()
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        try:
+            frame.index = pd.to_datetime(frame.index, utc=True)
+        except Exception:
+            return pd.DataFrame()
+    elif frame.index.tz is None:
+        frame.index = frame.index.tz_localize("UTC")
+    else:
+        frame.index = frame.index.tz_convert("UTC")
+    return frame
 
-def check_squeeze(hist):
+
+def fetch_market_data() -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
+    """جلب شموع حديثة وأسعار آخر صفقة دفعة واحدة بدل إبقاء cache قديمًا."""
+    now = datetime.now(timezone.utc)
+    request = StockBarsRequest(
+        symbol_or_symbols=SYMBOLS,
+        timeframe=TIMEFRAME,
+        start=now - timedelta(days=HISTORY_DAYS),
+        limit=1000,
+    )
+    bar_set = stock_client.get_stock_bars(request)
+    raw = bar_set.df
+    histories: dict[str, pd.DataFrame] = {}
+    # نستبعد الشمعة التي لم يمض على افتتاحها وقت كافٍ لتكتمل.
+    closed_before = now - timedelta(minutes=BAR_MINUTES + 1)
+    for symbol in SYMBOLS:
+        frame = _bar_frame(raw, symbol)
+        if not frame.empty:
+            frame = frame.loc[frame.index <= closed_before]
+            if not frame.empty:
+                histories[symbol] = frame
+
+    prices: dict[str, float] = {}
     try:
-        if len(hist) < 20:
-            return None
-        close = hist['Close']
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        upper_bb = ma20 + (2 * std20)
-        lower_bb = ma20 - (2 * std20)
+        latest = stock_client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=SYMBOLS)
+        )
+        for symbol in SYMBOLS:
+            trade = latest.get(symbol) if isinstance(latest, dict) else None
+            price = _as_float(_field(trade, "price")) if trade else None
+            if price is not None and price > 0:
+                prices[symbol] = price
+    except Exception as exc:
+        logger.exception("تعذر جلب أحدث الصفقات: %s", exc)
 
-        hl = hist['High'] - hist['Low']
-        hc = (hist['High'] - hist['Close'].shift()).abs()
-        lc = (hist['Low'] - hist['Close'].shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        atr = tr.rolling(20).mean()
+    # احتياط عند تعذر أحدث صفقة: آخر إغلاق شمعة مكتملة، مع تسجيل ذلك.
+    for symbol, frame in histories.items():
+        if symbol not in prices and len(frame):
+            fallback = _as_float(frame["Close"].iloc[-1])
+            if fallback and fallback > 0:
+                prices[symbol] = fallback
+                logger.warning("استخدام إغلاق آخر شمعة بدل السعر اللحظي للسهم %s", symbol)
+    return histories, prices
 
-        upper_kc = ma20 + (1.5 * atr)
-        lower_kc = ma20 - (1.5 * atr)
 
-        is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-        prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
-        return {
-            'squeeze': is_sq,
-            'firing': prev_sq and not is_sq,
-            'dir': 'UP' if close.iloc[-1] > ma20.iloc[-1] else 'DOWN'
+def calc_rsi(hist: pd.DataFrame, period: int = 14) -> float | None:
+    if len(hist) < period + 1:
+        return None
+    delta = hist["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
+    if not math.isfinite(float(avg_gain)) or not math.isfinite(float(avg_loss)):
+        return None
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return float(100 - (100 / (1 + (avg_gain / avg_loss))))
+
+
+def calc_atr(hist: pd.DataFrame, period: int = 14) -> float | None:
+    if len(hist) < period + 1:
+        return None
+    previous_close = hist["Close"].shift(1)
+    tr = pd.concat(
+        [
+            hist["High"] - hist["Low"],
+            (hist["High"] - previous_close).abs(),
+            (hist["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    value = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
+    return float(value) if pd.notna(value) and math.isfinite(float(value)) and value > 0 else None
+
+
+def calc_levels(hist: pd.DataFrame, entry: float, is_put: bool = False) -> tuple[float, float, float, float] | None:
+    atr = calc_atr(hist)
+    if atr is None or entry <= 0:
+        return None
+    if is_put:
+        values = (entry + atr, entry - 1.5 * atr, entry - 3 * atr, entry - 5 * atr)
+    else:
+        values = (entry - atr, entry + 1.5 * atr, entry + 3 * atr, entry + 5 * atr)
+    return tuple(round(x, 2) for x in values)
+
+
+def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
+    """TTM-style Bollinger/Keltner squeeze على شموع الخمس دقائق المكتملة."""
+    if len(hist) < 25:
+        return None
+    close = hist["Close"]
+    mid = close.rolling(20, min_periods=20).mean()
+    std = close.rolling(20, min_periods=20).std(ddof=0)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            hist["High"] - hist["Low"],
+            (hist["High"] - prev_close).abs(),
+            (hist["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(20, min_periods=20).mean()
+    upper_bb, lower_bb = mid + 2 * std, mid - 2 * std
+    upper_kc, lower_kc = mid + 1.5 * atr, mid - 1.5 * atr
+    values = [upper_bb.iloc[-1], lower_bb.iloc[-1], upper_kc.iloc[-1], lower_kc.iloc[-1],
+              upper_bb.iloc[-2], lower_bb.iloc[-2], upper_kc.iloc[-2], lower_kc.iloc[-2], mid.iloc[-1]]
+    if any(pd.isna(v) for v in values):
+        return None
+    squeeze_now = lower_bb.iloc[-1] > lower_kc.iloc[-1] and upper_bb.iloc[-1] < upper_kc.iloc[-1]
+    squeeze_prev = lower_bb.iloc[-2] > lower_kc.iloc[-2] and upper_bb.iloc[-2] < upper_kc.iloc[-2]
+    return {
+        "squeeze": bool(squeeze_now),
+        "firing": bool(squeeze_prev and not squeeze_now),
+        # تصنيف أولي للاتجاه، وليس تأكيدًا أو توصية دخول.
+        "dir": "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN",
+        "bar_time": hist.index[-1].isoformat(),
+    }
+
+
+def calc_liquidity_and_ob(hist: pd.DataFrame, direction: str) -> tuple[str, str]:
+    """كشف تقريبي لسحب السيولة وكتلة الأوامر، مع استبعاد الشمعة الحالية من المستويات."""
+    if len(hist) < 22:
+        return "💧 بيانات غير كافية لتقييم السيولة", "غير محدد"
+    current = hist.iloc[-1]
+    previous = hist.iloc[-21:-1]
+    prior_low = float(previous["Low"].min())
+    prior_high = float(previous["High"].max())
+    liq = "بدون سحب سيولة واضح"
+    if current["Low"] < prior_low and current["Close"] > prior_low:
+        liq = "💧 سحب سيولة SSL محتمل + إغلاق فوق القاع السابق"
+    elif current["High"] > prior_high and current["Close"] < prior_high:
+        liq = "💧 سحب سيولة BSL محتمل + إغلاق تحت القمة السابقة"
+
+    atr = calc_atr(hist)
+    ob_text = "لم تُرصد منطقة واضحة (الكشف تقريبي)"
+    if atr:
+        # شمعة معاكسة قبل شمعة اندفاع قوية؛ تعريف إرشادي وليس كشفًا مؤسسيًا مؤكدًا.
+        start = max(0, len(hist) - 26)
+        for i in range(len(hist) - 2, start - 1, -1):
+            base = hist.iloc[i]
+            impulse = hist.iloc[i + 1]
+            impulse_body = abs(float(impulse["Close"] - impulse["Open"]))
+            is_bullish_pair = direction == "UP" and base["Close"] < base["Open"] and impulse["Close"] > impulse["Open"]
+            is_bearish_pair = direction == "DOWN" and base["Close"] > base["Open"] and impulse["Close"] < impulse["Open"]
+            if (is_bullish_pair or is_bearish_pair) and impulse_body >= 0.8 * atr:
+                ob_text = f"{float(base['Low']):.2f}$ - {float(base['High']):.2f}$ (تقريبي)"
+                break
+    return liq, ob_text
+
+
+def _contracts_from_response(response: Any) -> tuple[list[Any], str | None]:
+    contracts = _field(response, "option_contracts", None)
+    if contracts is None and isinstance(response, (list, tuple)):
+        contracts = response
+    if contracts is None and isinstance(response, dict):
+        contracts = response.get("option_contracts", [])
+    next_token = _field(response, "next_page_token")
+    return list(contracts or []), next_token
+
+
+def get_option_recommendations(symbol: str, stock_price: float, option_type: str) -> dict[str, dict[str, Any]]:
+    """اختيار عقود من بيانات Alpaca الصحيحة: قائمة العقود ثم snapshots للسلسلة."""
+    if stock_price <= 0:
+        return {}
+    target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
+    today = datetime.now(timezone.utc).date()
+    max_expiry = today + timedelta(days=45)
+    # نطاقات قريبة نسبيًا من السعر لتقليل حجم الاستجابة.
+    low = stock_price * (0.90 if option_type == "CALL" else 0.85)
+    high = stock_price * (1.15 if option_type == "CALL" else 1.10)
+
+    all_contracts: list[Any] = []
+    page_token = None
+    for _ in range(10):
+        request_kwargs: dict[str, Any] = {
+            "underlying_symbols": [symbol],
+            "status": AssetStatus.ACTIVE,
+            "expiration_date_gte": today,
+            "expiration_date_lte": max_expiry,
+            "type": target,
+            "strike_price_gte": f"{low:.2f}",
+            "strike_price_lte": f"{high:.2f}",
+            "limit": 10000,
         }
-    except:
-        return None
+        if page_token:
+            request_kwargs["page_token"] = page_token
+        response = trading_client.get_option_contracts(GetOptionContractsRequest(**request_kwargs))
+        contracts, page_token = _contracts_from_response(response)
+        all_contracts.extend(contracts)
+        if not page_token:
+            break
+    if not all_contracts:
+        return {}
 
-def get_specific_opt(sym, price, mode, opt_type):
+    # تأكيد المرشحين محليًا؛ يمنع الاعتماد على اختلاف تنسيق استجابة SDK.
+    filtered: list[tuple[Any, date, float]] = []
+    for contract in all_contracts:
+        expiry = _as_date(_field(contract, "expiration_date"))
+        strike = _as_float(_field(contract, "strike_price"))
+        contract_symbol = _field(contract, "symbol")
+        if not expiry or not strike or not contract_symbol:
+            continue
+        if expiry < today or expiry > max_expiry or not low <= strike <= high:
+            continue
+        filtered.append((contract, expiry, strike))
+    if not filtered:
+        return {}
+
     try:
-        req = OptionChainRequest(underlying_symbol=sym)
-        resp = option_client.get_option_chain(req)
-        contracts = resp.option_chain.get(sym, [])
-        if not contracts:
-            return None
+        chain = option_client.get_option_chain(
+            OptionChainRequest(
+                underlying_symbol=symbol,
+                type=target,
+                strike_price_gte=low,
+                strike_price_lte=high,
+                expiration_date_gte=today,
+                expiration_date_lte=max_expiry,
+            )
+        )
+    except Exception as exc:
+        logger.warning("تعذر جلب snapshots خيارات %s: %s", symbol, exc)
+        return {}
 
-        today = datetime.now().date()
-        best = None
-        best_score = -1
-        target = ContractType.CALL if opt_type == 'CALL' else ContractType.PUT
+    if not isinstance(chain, dict):
+        logger.warning("صيغة سلسلة الخيارات غير متوقعة للسهم %s", symbol)
+        return {}
 
-        for c in contracts:
-            if c.type != target:
-                continue
+    buckets: dict[str, list[dict[str, Any]]] = {"daily": [], "weekly": [], "monthly": []}
+    for contract, expiry, strike in filtered:
+        days_to_expiry = (expiry - today).days
+        if 0 <= days_to_expiry <= 7:
+            bucket = "daily"
+        elif 8 <= days_to_expiry <= 14:
+            bucket = "weekly"
+        elif 15 <= days_to_expiry <= 45:
+            bucket = "monthly"
+        else:
+            continue
 
-            dte = (c.expiration_date - today).days
-            if mode == 'daily' and not (0 <= dte <= 7):
-                continue
-            if mode == 'weekly' and not (8 <= dte <= 14):
-                continue
-            if mode == 'monthly' and not (15 <= dte <= 45):
-                continue
+        contract_symbol = str(_field(contract, "symbol"))
+        snapshot = chain.get(contract_symbol)
+        if snapshot is None:
+            continue
+        quote = _field(snapshot, "latest_quote")
+        bid = _as_float(_field(quote, "bid_price")) if quote else None
+        ask = _as_float(_field(quote, "ask_price")) if quote else None
+        if bid is None or ask is None or bid <= 0 or ask < bid:
+            continue
+        mid = (bid + ask) / 2
+        if not 0.30 <= mid <= 50:
+            continue
+        spread_pct = ((ask - bid) / mid) * 100 if mid else 1000
+        if spread_pct > MAX_OPTION_SPREAD_PCT:
+            continue
 
-            strike = float(c.strike_price)
-            if opt_type == 'CALL' and not (price * 0.90 <= strike <= price * 1.15):
-                continue
-            if opt_type == 'PUT' and not (price * 0.85 <= strike <= price * 1.10):
-                continue
+        oi = _as_float(_field(contract, "open_interest"), 0.0) or 0.0
+        oi_date = _as_date(_field(contract, "open_interest_date"))
+        # لا نعرض قيمة OI وكأنها حديثة إذا كان تاريخها قديمًا بوضوح.
+        oi_is_recent = oi_date is not None and (today - oi_date).days <= 7
+        diff_pct = abs(strike - stock_price) / stock_price * 100
+        score = spread_pct + 0.35 * diff_pct - 0.4 * min(math.log1p(max(oi, 0)), 12)
+        buckets[bucket].append({
+            "symbol": contract_symbol,
+            "strike": strike,
+            "exp": expiry.isoformat(),
+            "mid": mid,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            "oi": int(oi) if oi_is_recent else None,
+            "diff": round(diff_pct, 1),
+            "score": score,
+        })
 
-            last = float(c.latest_trade.price) if c.latest_trade else 0
-            if last == 0 and c.latest_quote:
-                b = float(c.latest_quote.bid_price or 0)
-                a = float(c.latest_quote.ask_price or 0)
-                last = (b + a) / 2
+    result: dict[str, dict[str, Any]] = {}
+    for bucket, candidates in buckets.items():
+        if candidates:
+            result[bucket] = min(candidates, key=lambda item: item["score"])
+    return result
 
-            if not (0.3 <= last <= 50.0):
-                continue
 
-            vol = int(c.day.volume) if c.day else 0
-            oi = int(c.open_interest or 0)
+def _load_state() -> dict[str, str]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("تعذر قراءة ملف حالة التنبيهات: %s", exc)
+        return {}
 
-            score = vol + oi
-            if score > best_score:
-                best_score = score
-                diff_pct = abs(strike - price) / price * 100
-                best = {
-                    'strike': strike,
-                    'exp': c.expiration_date.strftime('%Y-%m-%d'),
-                    'last': last,
-                    'vol': vol,
-                    'oi': oi,
-                    'diff': round(diff_pct, 1)
-                }
-        return best
-    except:
-        return None
 
-def clear_old_squeeze_cache():
-    global last_cache_clear, sent_squeeze
-    if datetime.now() - last_cache_clear > timedelta(hours=12):
-        sent_squeeze.clear()
-        last_cache_clear = datetime.now()
+def _save_state(state: dict[str, str]) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(STATE_FILE)
+    except Exception as exc:
+        logger.exception("تعذر حفظ حالة التنبيهات: %s", exc)
 
-def main_loop():
-    time.sleep(5)
-    send("✅ تم تشغيل البوت - Squeeze + نطاق شموع محسن بالعربي")
-    update_resistances()
-    
+
+def send_telegram(message: str) -> bool:
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=20,
+        )
+        if not response.ok:
+            logger.error("Telegram رفض الرسالة: HTTP %s - %s", response.status_code, response.text[:500])
+            return False
+        payload = response.json()
+        if not payload.get("ok", False):
+            logger.error("Telegram أبلغ عن فشل إرسال: %s", payload)
+            return False
+        return True
+    except Exception as exc:
+        logger.exception("فشل إرسال Telegram: %s", exc)
+        return False
+
+
+def _option_message(label: str, opt: dict[str, Any]) -> str:
+    oi_text = str(opt["oi"]) if opt["oi"] is not None else "غير متاح/غير حديث"
+    return (
+        f"{label} ({opt['exp']})\n"
+        f"🔹 العقد: {opt['symbol']} | سترايك: {opt['strike']:.2f}$\n"
+        f"💵 متوسط العرض والطلب: {opt['mid']:.2f}$ "
+        f"(Bid {opt['bid']:.2f} / Ask {opt['ask']:.2f})\n"
+        f"📈 OI: {oi_text} | السبريد: {opt['spread_pct']:.1f}% | البعد عن السعر: {opt['diff']}%\n"
+    )
+
+
+def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str, float], sq: dict[str, Any]) -> str:
+    option_type = "CALL" if sq["dir"] == "UP" else "PUT"
+    rsi = calc_rsi(hist)
+    sma50 = float(hist["Close"].rolling(50, min_periods=50).mean().iloc[-1]) if len(hist) >= 50 else None
+    resistance = levels["res"] if option_type == "CALL" else levels["sup"]
+    stops = calc_levels(hist, price, is_put=(option_type == "PUT"))
+    liquidity_text, ob_text = calc_liquidity_and_ob(hist, sq["dir"])
+
+    lines = [
+        f"⏳ انطلاق محتمل بعد انضغاط Squeeze ({option_type}) — {symbol}",
+        f"🕯 الإطار: شموع مكتملة {BAR_MINUTES} دقائق | وقت الإشارة UTC: {sq['bar_time']}",
+        f"💵 سعر السهم اللحظي/آخر شمعة: {price:.2f}$",
+        f"📊 RSI: {rsi:.1f}" if rsi is not None else "📊 RSI: غير متاح",
+        f"📉 المتوسط 50: {sma50:.2f}$" if sma50 is not None and math.isfinite(sma50) else "📉 المتوسط 50: بيانات غير كافية",
+        f"🧱 مقاومة/دعم تقريبي (20 شمعة سابقة): {resistance:.2f}$",
+        f"{liquidity_text} | OB: {ob_text}",
+    ]
+    if stops:
+        stop, target1, target2, target3 = stops
+        lines.extend([
+            "",
+            "مستويات ATR التقديرية للسهم (وليست لسعر عقد الخيار):",
+            f"🛑 وقف مرجعي: {stop:.2f}$",
+            f"🎯 أهداف مرجعية: {target1:.2f}$ / {target2:.2f}$ / {target3:.2f}$",
+        ])
+    else:
+        lines.extend(["", "مستويات ATR: بيانات غير كافية لحسابها."])
+
+    # جلب سلسلة الخيارات قد يفشل بسبب صلاحيات/اشتراك بيانات الخيارات؛ لا يمنع تنبيه السهم.
+    try:
+        options = get_option_recommendations(symbol, price, option_type)
+    except Exception as exc:
+        logger.exception("فشل تحليل خيارات %s: %s", symbol, exc)
+        options = {}
+    lines.append("")
+    if options:
+        labels = {
+            "daily": "⚡ عقد قريب (0–7 أيام)",
+            "weekly": "📅 عقد أسبوعي (8–14 يومًا)",
+            "monthly": "🛡️ عقد أبعد (15–45 يومًا)",
+        }
+        for bucket in ("daily", "weekly", "monthly"):
+            if bucket in options:
+                lines.append(_option_message(labels[bucket], options[bucket]))
+    else:
+        lines.append("عقود الخيارات: لم يُعثر على عقد يطابق فلاتر السعر والسيولة والسبريد، أو أن بيانات الخيارات غير متاحة.")
+
+    lines.extend([
+        "",
+        "تنبيه تعليمي آلي فقط؛ لا يمثل توصية مالية ولا ينفذ صفقات. الخيارات عالية المخاطر وقد تفقد كامل قيمتها.",
+    ])
+    return "\n".join(lines)
+
+
+def _prune_state(state: dict[str, str]) -> dict[str, str]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    kept: dict[str, str] = {}
+    for key, value in state.items():
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if stamp >= cutoff:
+                kept[key] = value
+        except (TypeError, ValueError):
+            continue
+    return kept
+
+
+def main_loop() -> None:
+    state = _prune_state(_load_state())
+    if send_telegram(
+        f"✅ بدأ بوت Squeeze. الإشارات على شموع مكتملة {BAR_MINUTES} دقائق. "
+        "التنبيهات تحليلية فقط ولا تنفذ صفقات."
+    ):
+        logger.info("تم إرسال إشعار التشغيل")
+
     while True:
         try:
-            clear_old_squeeze_cache()
-            for sym in SYMBOLS:
-                price = get_alpaca_price(sym)
-                if not price:
-                    continue
-                
-                levels = RES_CACHE.get(sym)
-                hist = HIST_CACHE.get(sym)
-                if not levels or hist is None:
-                    continue
+            histories, prices = fetch_market_data()
+            logger.info("تم تحديث البيانات: %s رمزًا، %s سعرًا", len(histories), len(prices))
+            state = _prune_state(state)
 
-                sq = check_squeeze(hist)
-                if sq and sq.get('firing') and sym not in sent_squeeze:
-                    otype = 'CALL' if sq['dir'] == 'UP' else 'PUT'
-                    
-                    rsi = calc_rsi(hist)
-                    sma50 = float(hist['Close'].rolling(50).mean().iloc[-1]) if len(hist) >= 50 else price
-                    res_val = levels['res'] if otype == 'CALL' else levels['sup']
-                    
-                    stop, t1, t2, t3 = calc_levels(hist, price, is_put=(otype == 'PUT'))
-                    liq_txt, ob_txt = calc_liquidity_and_ob(hist)
+            for symbol in SYMBOLS:
+                try:
+                    hist = histories.get(symbol)
+                    price = prices.get(symbol)
+                    if hist is None or price is None or len(hist) < 60:
+                        continue
+                    sq = check_squeeze(hist)
+                    if not sq or not sq["firing"]:
+                        continue
+                    if state.get(symbol) == sq["bar_time"]:
+                        continue
 
-                    opt_daily = get_specific_opt(sym, price, 'daily', otype)
-                    opt_weekly = get_specific_opt(sym, price, 'weekly', otype)
-                    opt_monthly = get_specific_opt(sym, price, 'monthly', otype)
+                    # مستويات الدعم والمقاومة من الشموع الأسبق دون شمعة الاختراق الحالية.
+                    prior = hist.iloc[:-1].tail(20)
+                    if len(prior) < 10:
+                        continue
+                    levels = {
+                        "res": float(prior["High"].max()),
+                        "sup": float(prior["Low"].min()),
+                    }
+                    message = build_alert(symbol, price, hist, levels, sq)
+                    if send_telegram(message):
+                        state[symbol] = sq["bar_time"]
+                        _save_state(state)
+                        logger.info("تم إرسال تنبيه %s عند %s", symbol, sq["bar_time"])
+                    time.sleep(1.0)
+                except Exception as exc:
+                    logger.exception("خطأ أثناء فحص %s: %s", symbol, exc)
+            time.sleep(POLL_SECONDS)
+        except Exception as exc:
+            logger.exception("خطأ في دورة البوت: %s", exc)
+            time.sleep(15)
 
-                    msg = f"⏳ تنبيه انضغاط متوقع انفجاره ({otype}) ⚡ {sym}\n"
-                    msg += f"💵 نقطة الدخول اللحظية: {price:.2f}$\n"
-                    msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma50:.2f}$\n"
-                    msg += f"🧱 حاجز المقاومة/الدعم: {res_val:.2f}$\n"
-                    msg += f"{liq_txt} | OB: {ob_txt}\n\n"
 
-                    msg += f"🛑 وقف الخسارة: {stop}$\n"
-                    msg += f"🎯 الهدف الأول: {t1}$\n"
-                    msg += f"🎯 الهدف الثاني: {t2}$\n"
-                    msg += f"🎯 الهدف الثالث: {t3}$\n\n"
+@app.get("/")
+def home():
+    return "Bot OK - Squeeze Alerts (5-minute closed bars)"
 
-                    if opt_daily:
-                        msg += f"⚡ عقد يومي/سريع ({opt_daily['exp']})\n"
-                        msg += f"🔹 سترايك: {opt_daily['strike']}$ | السعر: {opt_daily['last']}$\n"
-                        msg += f"📈 فوليوم: {opt_daily['vol']} | OI: {opt_daily['oi']} | الفرق: {opt_daily['diff']}%\n\n"
 
-                    if opt_weekly:
-                        msg += f"📅 عقد أسبوعي ({opt_weekly['exp']})\n"
-                        msg += f"🔹 سترايك: {opt_weekly['strike']}$ | السعر: {opt_weekly['last']}$\n"
-                        msg += f"📈 فوليوم: {opt_weekly['vol']} | OI: {opt_weekly['oi']} | الفرق: {opt_weekly['diff']}%\n\n"
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "symbols": len(SYMBOLS), "bar_minutes": BAR_MINUTES})
 
-                    if opt_monthly:
-                        msg += f"🛡️ عقد شهري/آمن ({opt_monthly['exp']})\n"
-                        msg += f"🔹 سترايك: {opt_monthly['strike']}$ | السعر: {opt_monthly['last']}$\n"
-                        msg += f"📈 فوليوم: {opt_monthly['vol']} | OI: {opt_monthly['oi']} | الفرق: {opt_monthly['diff']}%\n"
 
-                    send(msg)
-                    sent_squeeze.add(sym)
-
-                time.sleep(1.5)
-            time.sleep(60)
-        except Exception as e:
-            print(f"LOOP ERR: {e}")
-            time.sleep(10)
-
-if not hasattr(app, 'started'):
-    Thread(target=main_loop, daemon=True).start()
-    app.started = True
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    # شغّله كعملية واحدة: python bot_revised.py
+    # تجنّب تشغيل عدة Workers حتى لا تتكرر التنبيهات.
+    worker = Thread(target=main_loop, name="squeeze-worker", daemon=True)
+    worker.start()
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
