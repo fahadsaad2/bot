@@ -523,6 +523,41 @@ def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str,
     return "\n".join(lines)
 
 
+def build_watch_alert(symbol: str, price: float, hist: pd.DataFrame, sq: dict[str, Any]) -> tuple[str, str]:
+    """تنبيه مبكر عند دخول السهم حالة الانضغاط، قبل انفراجها."""
+    rsi = calc_rsi(hist)
+    sma20 = float(hist["Close"].rolling(20, min_periods=20).mean().iloc[-1])
+    option_type = "CALL" if float(hist["Close"].iloc[-1]) >= sma20 else "PUT"
+    rsi_text = f"{rsi:.1f}" if rsi is not None else "غير متاح"
+    message = (
+        f"👀 متابعة مبكرة: بدأ/اكتُشف انضغاط Squeeze — {symbol}\n"
+        f"🕯 شمعة مكتملة {BAR_MINUTES} دقائق | UTC: {sq['bar_time']}\n"
+        f"💵 سعر السهم: {price:.2f}$ | RSI: {rsi_text}\n"
+        f"🧭 الميل الأولي فقط: {option_type} (مقارنة الإغلاق بمتوسط 20)\n\n"
+        "الانضغاط ما زال قائمًا؛ لم يتأكد الانطلاق أو اتجاهه بعد. هذا تنبيه مراقبة مبكر، "
+        "وليس تأكيدًا لشراء عقد. قد يستمر الانضغاط أو يتحرك السعر عكس الميل الأولي."
+    )
+    return message, option_type
+
+
+def build_watch_options_message(symbol: str, option_type: str, options: dict[str, dict[str, Any]]) -> str:
+    """عرض العقود كقائمة متابعة لا كتوصية شراء."""
+    labels = {
+        "daily": "عقد قريب (0–7 أيام)",
+        "weekly": "عقد أسبوعي (8–14 يومًا)",
+        "monthly": "عقد أبعد (15–45 يومًا)",
+    }
+    lines = [
+        f"📋 {symbol} — عقود {option_type} مرشحة للمراقبة فقط:",
+        "لم يحدث تأكيد انطلاق بعد؛ هذه قائمة متابعة وليست توصية شراء.",
+    ]
+    for bucket in ("daily", "weekly", "monthly"):
+        if bucket in options:
+            lines.append(_option_message(labels[bucket], options[bucket]))
+    lines.append("عقد الخيار قد يفقد جزءًا كبيرًا من قيمته أو كاملها أثناء الانتظار.")
+    return "\n".join(lines)
+
+
 def _prune_state(state: dict[str, str]) -> dict[str, str]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     kept: dict[str, str] = {}
@@ -559,9 +594,30 @@ def main_loop() -> None:
                     if hist is None or price is None or len(hist) < 60:
                         continue
                     sq = check_squeeze(hist)
-                    if not sq or not sq["firing"]:
+                    if not sq:
                         continue
-                    if state.get(symbol) == sq["bar_time"]:
+
+                    watch_key = f"watch:{symbol}"
+                    fire_key = f"fire:{symbol}"
+
+                    # المرحلة الأولى: نبه فور اكتشاف الانضغاط، ولا تنتظر انفراجه.
+                    # مفتاح watch يبقى محفوظًا حتى انتهاء هذه الدورة لمنع تكرار التنبيه.
+                    if sq["squeeze"] and watch_key not in state:
+                        watch_message, option_type = build_watch_alert(symbol, price, hist, sq)
+                        if send_telegram(watch_message):
+                            state[watch_key] = sq["bar_time"]
+                            _save_state(state)
+                            logger.info("تنبيه متابعة Squeeze للسهم %s عند %s", symbol, sq["bar_time"])
+                            # أرسل تنبيه المتابعة أولًا، ثم ابحث عن العقود حتى لا يتأخر التنبيه بسبب API الخيارات.
+                            try:
+                                watch_options = get_option_recommendations(symbol, price, option_type)
+                                if watch_options:
+                                    send_telegram(build_watch_options_message(symbol, option_type, watch_options))
+                            except Exception as exc:
+                                logger.exception("تعذر جلب عقود متابعة %s: %s", symbol, exc)
+
+                    # المرحلة الثانية: تنبيه مستقل عند خروج الشمعة المكتملة من الانضغاط.
+                    if not sq["firing"] or state.get(fire_key) == sq["bar_time"]:
                         continue
 
                     # مستويات الدعم والمقاومة من الشموع الأسبق دون شمعة الاختراق الحالية.
@@ -574,9 +630,10 @@ def main_loop() -> None:
                     }
                     message = build_alert(symbol, price, hist, levels, sq)
                     if send_telegram(message):
-                        state[symbol] = sq["bar_time"]
+                        state[fire_key] = sq["bar_time"]
+                        state.pop(watch_key, None)
                         _save_state(state)
-                        logger.info("تم إرسال تنبيه %s عند %s", symbol, sq["bar_time"])
+                        logger.info("تنبيه انفراج Squeeze للسهم %s عند %s", symbol, sq["bar_time"])
                     time.sleep(1.0)
                 except Exception as exc:
                     logger.exception("خطأ أثناء فحص %s: %s", symbol, exc)
