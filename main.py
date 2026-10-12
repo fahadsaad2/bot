@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK - Full Details Arabic Style'
+    return 'Bot OK - Squeeze + Better Candles Arabic Style'
 
 @app.route('/health')
 def health():
@@ -33,7 +33,8 @@ TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'A
 SYMBOLS = TIER1 + TIER2
 
 RES_CACHE, HIST_CACHE = {}, {}
-sent_signals = {}
+sent_squeeze = set()
+last_cache_clear = datetime.now()
 
 def send(msg):
     try:
@@ -97,9 +98,9 @@ def calc_liquidity_and_ob(hist):
 
         liq_type, liq_txt = None, "بدون سحب سيولة"
         if curr_low <= low_20 and curr_close > low_20:
-            liq_type, liq_txt = "SSL", "💧 سحب سيولة SSL + ارتداد"
+            liq_txt = "💧 سحب سيولة SSL + ارتداد"
         elif curr_high >= high_20 and curr_close < high_20:
-            liq_type, liq_txt = "BSL", "💧 سحب سيولة BSL + ارتداد"
+            liq_txt = "💧 سحب سيولة BSL + ارتداد"
 
         ob_low, ob_high = 0, 0
         ob_txt = "غير محدد"
@@ -117,9 +118,9 @@ def calc_liquidity_and_ob(hist):
             ob_high = float(curr_close)
             ob_txt = f"{ob_low:.2f}$ - {ob_high:.2f}$"
 
-        return liq_type, liq_txt, ob_txt
+        return liq_txt, ob_txt
     except:
-        return None, "بدون سحب سيولة", "غير محدد"
+        return "بدون سحب سيولة", "غير محدد"
 
 def update_resistances():
     for idx, sym in enumerate(SYMBOLS):
@@ -133,13 +134,42 @@ def update_resistances():
             hist = hist.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'})
             if len(hist) >= 20:
                 RES_CACHE[sym] = {
-                    'res': max(hist['High'].tail(5)),
-                    'sup': min(hist['Low'].tail(5))
+                    'res': max(hist['High'].tail(20)),
+                    'sup': min(hist['Low'].tail(20))
                 }
                 HIST_CACHE[sym] = hist
             time.sleep(0.2)
         except Exception as e:
             print(f'RES ERR {sym}: {e}')
+
+def check_squeeze(hist):
+    try:
+        if len(hist) < 20:
+            return None
+        close = hist['Close']
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        upper_bb = ma20 + (2 * std20)
+        lower_bb = ma20 - (2 * std20)
+
+        hl = hist['High'] - hist['Low']
+        hc = (hist['High'] - hist['Close'].shift()).abs()
+        lc = (hist['Low'] - hist['Close'].shift()).abs()
+        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+        atr = tr.rolling(20).mean()
+
+        upper_kc = ma20 + (1.5 * atr)
+        lower_kc = ma20 - (1.5 * atr)
+
+        is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
+        prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
+        return {
+            'squeeze': is_sq,
+            'firing': prev_sq and not is_sq,
+            'dir': 'UP' if close.iloc[-1] > ma20.iloc[-1] else 'DOWN'
+        }
+    except:
+        return None
 
 def get_specific_opt(sym, price, mode, opt_type):
     try:
@@ -187,10 +217,7 @@ def get_specific_opt(sym, price, mode, opt_type):
             score = vol + oi
             if score > best_score:
                 best_score = score
-                
-                # حساب الفرق النسبي بين Strike والسعر الحالي
                 diff_pct = abs(strike - price) / price * 100
-                
                 best = {
                     'strike': strike,
                     'exp': c.expiration_date.strftime('%Y-%m-%d'),
@@ -203,13 +230,20 @@ def get_specific_opt(sym, price, mode, opt_type):
     except:
         return None
 
+def clear_old_squeeze_cache():
+    global last_cache_clear, sent_squeeze
+    if datetime.now() - last_cache_clear > timedelta(hours=12):
+        sent_squeeze.clear()
+        last_cache_clear = datetime.now()
+
 def main_loop():
     time.sleep(5)
-    send("✅ تم تشغيل البوت - الشكل الاحترافي الكامل (عربي)")
+    send("✅ تم تشغيل البوت - Squeeze + نطاق شموع محسن بالعربي")
     update_resistances()
     
     while True:
         try:
+            clear_old_squeeze_cache()
             for sym in SYMBOLS:
                 price = get_alpaca_price(sym)
                 if not price:
@@ -220,39 +254,25 @@ def main_loop():
                 if not levels or hist is None:
                     continue
 
-                now = datetime.now()
-                last_sent = sent_signals.get(sym)
-                if last_sent and (now - last_sent) < timedelta(hours=2):
-                    continue
-
-                res = levels['res']
-                sup = levels['sup']
-
-                otype = None
-                reason = ""
-                if price >= res:
-                    otype = 'CALL'
-                    reason = "اختراق مقاومة يومية"
-                elif price <= sup:
-                    otype = 'PUT'
-                    reason = "كسر دعم يومي"
-
-                if otype:
+                sq = check_squeeze(hist)
+                if sq and sq.get('firing') and sym not in sent_squeeze:
+                    otype = 'CALL' if sq['dir'] == 'UP' else 'PUT'
+                    
                     rsi = calc_rsi(hist)
                     sma50 = float(hist['Close'].rolling(50).mean().iloc[-1]) if len(hist) >= 50 else price
+                    res_val = levels['res'] if otype == 'CALL' else levels['sup']
+                    
                     stop, t1, t2, t3 = calc_levels(hist, price, is_put=(otype == 'PUT'))
-                    liq_type, liq_txt, ob_txt = calc_liquidity_and_ob(hist)
+                    liq_txt, ob_txt = calc_liquidity_and_ob(hist)
 
-                    # جلب العقود الثلاثة
                     opt_daily = get_specific_opt(sym, price, 'daily', otype)
                     opt_weekly = get_specific_opt(sym, price, 'weekly', otype)
                     opt_monthly = get_specific_opt(sym, price, 'monthly', otype)
 
-                    # بناء الرسالة بنفس الشكل المطلوب
-                    msg = f"⏳ تنبيه {reason} ({otype}) ⚡ {sym}\n"
+                    msg = f"⏳ تنبيه انضغاط متوقع انفجاره ({otype}) ⚡ {sym}\n"
                     msg += f"💵 نقطة الدخول اللحظية: {price:.2f}$\n"
                     msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma50:.2f}$\n"
-                    msg += f"🧱 حاجز المقاومة/الدعم: {res if otype=='CALL' else sup:.2f}$\n"
+                    msg += f"🧱 حاجز المقاومة/الدعم: {res_val:.2f}$\n"
                     msg += f"{liq_txt} | OB: {ob_txt}\n\n"
 
                     msg += f"🛑 وقف الخسارة: {stop}$\n"
@@ -276,10 +296,10 @@ def main_loop():
                         msg += f"📈 فوليوم: {opt_monthly['vol']} | OI: {opt_monthly['oi']} | الفرق: {opt_monthly['diff']}%\n"
 
                     send(msg)
-                    sent_signals[sym] = now
+                    sent_squeeze.add(sym)
 
-                time.sleep(1)
-            time.sleep(30)
+                time.sleep(1.5)
+            time.sleep(60)
         except Exception as e:
             print(f"LOOP ERR: {e}")
             time.sleep(10)
