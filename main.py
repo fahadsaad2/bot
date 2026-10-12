@@ -13,7 +13,7 @@ import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any
 
 import pandas as pd
@@ -596,10 +596,27 @@ def health():
     return jsonify({"status": "ok", "symbols": len(SYMBOLS), "bar_minutes": BAR_MINUTES})
 
 
+_worker_lock = Lock()
+_worker_started = False
+
+
+def start_background_worker() -> None:
+    """ابدأ حلقة البوت مرة واحدة داخل عملية التطبيق، بما فيها تشغيل Gunicorn."""
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        Thread(target=main_loop, name="squeeze-worker", daemon=True).start()
+        _worker_started = True
+
+
+# Gunicorn يستورد app من هذا الملف؛ لذلك يجب تشغيل الحلقة عند الاستيراد أيضًا.
+# استخدم عامل Gunicorn واحدًا لتجنب تكرار إرسال الإشارات.
+start_background_worker()
+
+
 if __name__ == "__main__":
     # شغّله كعملية واحدة: python bot_revised.py
     # تجنّب تشغيل عدة Workers حتى لا تتكرر التنبيهات.
-    worker = Thread(target=main_loop, name="squeeze-worker", daemon=True)
-    worker.start()
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
