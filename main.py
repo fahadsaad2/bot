@@ -259,37 +259,3 @@ def get_opt(sym, price, mode, opt_type='CALL'):
                     'bid': bid,
                     'ask': ask
                 }
-        return best
-    except Exception as e:
-        print(f"OPT ERR {sym}: {e}")
-        return None
-
-def clear_old_squeeze_cache():
-    global last_cache_clear, sent_squeeze
-    if datetime.now() - last_cache_clear > timedelta(hours=12):
-        sent_squeeze.clear()
-        last_cache_clear = datetime.now()
-
-# ===== الحلقة الرئيسية =====
-def main_loop():
-    time.sleep(5)
-    send("✅ تم تشغيل البوت - RealTime + Liquidity + OB + Squeeze + Greeks Filter")
-    update_resistances()
-    while True:
-        try:
-            clear_old_squeeze_cache()
-            for sym in SYMBOLS:
-                price = get_alpaca_price(sym)
-                if not price:
-                    continue
-                hist = HIST_CACHE.get(sym)
-                if hist is None:
-                    continue
-                sq = check_squeeze(hist)
-                gamma = get_gamma_walls(sym, price)
-                # مثال: فحص سكويز فايرينق
-                if sq and sq.get('firing') and sym not in sent_squeeze:
-                    opt = get_opt(sym, price, 'daily', 'CALL' if sq['dir']=='UP' else 'PUT')
-                    if opt:
-                        liq_type, liq_txt, ob_txt, _ = calc_liquidity_and_ob(hist)
-                        stop, t1, t2, t3, atr = calc_levels(hist, price, True, gamma['res_strike'] if gamma else None, opt_type='PUT'
