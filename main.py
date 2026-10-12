@@ -14,7 +14,8 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Bot OK - RealTime + Liquidity + OB + Squeeze + Greeks Filter'
+    return 'Bot OK - Full Details Arabic Style'
+
 @app.route('/health')
 def health():
     return 'OK'
@@ -24,21 +25,15 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
 ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
 
-print(f"CHECK KEYS: API={bool(ALPACA_API_KEY)} SECRET={bool(ALPACA_SECRET_KEY)} TG={bool(TELEGRAM_BOT_TOKEN)} CHAT={bool(TELEGRAM_CHAT_ID)}", flush=True)
-
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 TIER1 = ['NVDA', 'TSLA', 'GOOGL', 'META', 'MSFT']
-TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'AVGO', 'MU', 'LITE', 'RDDT']
+TIER2 = ['SMCI', 'MSTR', 'COIN', 'AAPL', 'AMD', 'AMZN', 'PLTR', 'APP', 'ARM', 'AVGO', 'MU', 'LITE', 'RDDT', 'SNDK']
 SYMBOLS = TIER1 + TIER2
 
-MIN_VOL_TIER1, MIN_OI_TIER1 = 50, 200
-MIN_VOL_TIER2, MIN_OI_TIER2 = 10, 50
-MAX_SPREAD_PCT = 0.35
 RES_CACHE, HIST_CACHE = {}, {}
-sent_squeeze = set()
-last_cache_clear = datetime.now()
+sent_signals = {}
 
 def send(msg):
     try:
@@ -47,7 +42,6 @@ def send(msg):
             json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
             timeout=20
         )
-        print(f"TG sent", flush=True)
     except Exception as e:
         print(f'SEND ERR {e}')
 
@@ -69,12 +63,6 @@ def calc_rsi(hist, period=14):
     except:
         return 50.0
 
-def calc_sma(hist, p=50):
-    try:
-        return float(hist['Close'].rolling(p).mean().iloc[-1])
-    except:
-        return float(hist['Close'].iloc[-1])
-
 def calc_atr(hist, p=14):
     try:
         hl = hist['High'] - hist['Low']
@@ -85,7 +73,7 @@ def calc_atr(hist, p=14):
     except:
         return float(hist['Close'].iloc[-1] * 0.02)
 
-def calc_levels(hist, entry, is_squeeze=False, gamma_res=None, is_put=False):
+def calc_levels(hist, entry, is_put=False):
     atr = calc_atr(hist, 14)
     if is_put:
         stop = entry + (atr * 1.0)
@@ -93,11 +81,11 @@ def calc_levels(hist, entry, is_squeeze=False, gamma_res=None, is_put=False):
         t2 = entry - (atr * 3.0)
         t3 = entry - (atr * 5.0)
     else:
-        t1 = gamma_res if (is_squeeze and gamma_res and entry < gamma_res < entry + atr * 2) else entry + (atr * 1.5)
+        stop = entry - (atr * 1.0)
+        t1 = entry + (atr * 1.5)
         t2 = entry + (atr * 3.0)
         t3 = entry + (atr * 5.0)
-        stop = entry - (atr * 1.0)
-    return round(stop, 2), round(t1, 2), round(t2, 2), round(t3, 2), round(atr, 2)
+    return round(stop, 2), round(t1, 2), round(t2, 2), round(t3, 2)
 
 def calc_liquidity_and_ob(hist):
     try:
@@ -107,7 +95,7 @@ def calc_liquidity_and_ob(hist):
         curr_high = hist['High'].iloc[-1]
         curr_close = hist['Close'].iloc[-1]
 
-        liq_type, liq_txt = None, ""
+        liq_type, liq_txt = None, "بدون سحب سيولة"
         if curr_low <= low_20 and curr_close > low_20:
             liq_type, liq_txt = "SSL", "💧 سحب سيولة SSL + ارتداد"
         elif curr_high >= high_20 and curr_close < high_20:
@@ -129,14 +117,13 @@ def calc_liquidity_and_ob(hist):
             ob_high = float(curr_close)
             ob_txt = f"{ob_low:.2f}$ - {ob_high:.2f}$"
 
-        return liq_type, liq_txt, ob_txt, ob_low
+        return liq_type, liq_txt, ob_txt
     except:
-        return None, "", "غير محدد", 0
+        return None, "بدون سحب سيولة", "غير محدد"
 
 def update_resistances():
     for idx, sym in enumerate(SYMBOLS):
         try:
-            print(f"تحميل {sym} {idx+1}/{len(SYMBOLS)}", flush=True)
             req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Day, start=datetime.now() - timedelta(days=120))
             bars = stock_client.get_stock_bars(req)
             df = bars.df
@@ -144,60 +131,17 @@ def update_resistances():
                 continue
             hist = df.xs(sym, level=0) if isinstance(df.index, pd.MultiIndex) else df
             hist = hist.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'})
-            if len(hist) >= 60:
-                RES_CACHE[sym] = max(hist['High'].tail(5))
+            if len(hist) >= 20:
+                RES_CACHE[sym] = {
+                    'res': max(hist['High'].tail(5)),
+                    'sup': min(hist['Low'].tail(5))
+                }
                 HIST_CACHE[sym] = hist
-                print(f"تم {sym}", flush=True)
-            time.sleep(0.3)
+            time.sleep(0.2)
         except Exception as e:
             print(f'RES ERR {sym}: {e}')
-            time.sleep(1)
 
-def get_gamma_walls(sym, price):
-    try:
-        req = OptionChainRequest(underlying_symbol=sym)
-        chain = option_client.get_option_chain(req)
-        data = chain.option_chain.get(sym, [])
-        best = None
-        max_oi = 0
-        for c in data:
-            if c.strike_price >= price and c.open_interest and c.open_interest > max_oi:
-                max_oi = c.open_interest
-                best = c
-        return {'res_strike': float(best.strike_price)} if best else None
-    except:
-        return None
-
-def check_squeeze(hist):
-    try:
-        if len(hist) < 20:
-            return None
-        close = hist['Close']
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        upper_bb = ma20 + (2 * std20)
-        lower_bb = ma20 - (2 * std20)
-
-        hl = hist['High'] - hist['Low']
-        hc = (hist['High'] - hist['Close'].shift()).abs()
-        lc = (hist['Low'] - hist['Close'].shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        atr = tr.rolling(20).mean()
-
-        upper_kc = ma20 + (1.5 * atr)
-        lower_kc = ma20 - (1.5 * atr)
-
-        is_sq = (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-        prev_sq = (lower_bb.iloc[-2] > lower_kc.iloc[-2]) and (upper_bb.iloc[-2] < upper_kc.iloc[-2])
-        return {
-            'squeeze': is_sq,
-            'firing': prev_sq and not is_sq,
-            'dir': 'UP' if close.iloc[-1] > ma20.iloc[-1] else 'DOWN'
-        }
-    except:
-        return None
-
-def get_opt(sym, price, mode, opt_type='CALL'):
+def get_specific_opt(sym, price, mode, opt_type):
     try:
         req = OptionChainRequest(underlying_symbol=sym)
         resp = option_client.get_option_chain(req)
@@ -210,11 +154,8 @@ def get_opt(sym, price, mode, opt_type='CALL'):
         best_score = -1
         target = ContractType.CALL if opt_type == 'CALL' else ContractType.PUT
 
-        min_vol = MIN_VOL_TIER1 if sym in TIER1 else MIN_VOL_TIER2
-        min_oi = MIN_OI_TIER1 if sym in TIER1 else MIN_OI_TIER2
-
         for c in contracts:
-            if c.type!= target:
+            if c.type != target:
                 continue
 
             dte = (c.expiration_date - today).days
@@ -226,23 +167,10 @@ def get_opt(sym, price, mode, opt_type='CALL'):
                 continue
 
             strike = float(c.strike_price)
-            if opt_type == 'CALL' and not (price * 0.95 <= strike <= price * 1.10):
+            if opt_type == 'CALL' and not (price * 0.90 <= strike <= price * 1.15):
                 continue
-            if opt_type == 'PUT' and not (price * 0.90 <= strike <= price * 1.05):
+            if opt_type == 'PUT' and not (price * 0.85 <= strike <= price * 1.10):
                 continue
-
-            greeks = getattr(c, 'greeks', None)
-            if greeks:
-                delta = float(greeks.delta) if greeks.delta is not None else 0.5
-                theta = float(greeks.theta) if greeks.theta is not None else 0.0
-
-                if opt_type == 'CALL' and not (0.35 <= delta <= 0.70):
-                    continue
-                if opt_type == 'PUT' and not (-0.70 <= delta <= -0.35):
-                    continue
-
-                if theta < -1.5:
-                    continue
 
             last = float(c.latest_trade.price) if c.latest_trade else 0
             if last == 0 and c.latest_quote:
@@ -250,85 +178,112 @@ def get_opt(sym, price, mode, opt_type='CALL'):
                 a = float(c.latest_quote.ask_price or 0)
                 last = (b + a) / 2
 
-            if not (0.5 <= last <= 15.0):
+            if not (0.3 <= last <= 50.0):
                 continue
 
             vol = int(c.day.volume) if c.day else 0
             oi = int(c.open_interest or 0)
 
-            if vol < min_vol or oi < min_oi:
-                continue
-
-            bid = float(c.latest_quote.bid_price) if (c.latest_quote and c.latest_quote.bid_price) else 0
-            ask = float(c.latest_quote.ask_price) if (c.latest_quote and c.latest_quote.ask_price) else 0
-
-            if ask > 0:
-                spread = (ask - bid) / ask
-                if spread > MAX_SPREAD_PCT:
-                    continue
-
             score = vol + oi
             if score > best_score:
                 best_score = score
+                
+                # حساب الفرق النسبي بين Strike والسعر الحالي
+                diff_pct = abs(strike - price) / price * 100
+                
                 best = {
-                    'symbol': c.symbol,
                     'strike': strike,
                     'exp': c.expiration_date.strftime('%Y-%m-%d'),
                     'last': last,
                     'vol': vol,
                     'oi': oi,
-                    'bid': bid,
-                    'ask': ask
+                    'diff': round(diff_pct, 1)
                 }
-
         return best
-    except Exception as e:
-        print(f"OPT ERR {sym}: {e}")
+    except:
         return None
-
-def clear_old_squeeze_cache():
-    global last_cache_clear, sent_squeeze
-    if datetime.now() - last_cache_clear > timedelta(hours=12):
-        sent_squeeze.clear()
-        last_cache_clear = datetime.now()
 
 def main_loop():
     time.sleep(5)
-    send("✅ تم تشغيل البوت - RealTime + Liquidity + OB + Squeeze + Greeks Filter")
+    send("✅ تم تشغيل البوت - الشكل الاحترافي الكامل (عربي)")
     update_resistances()
+    
     while True:
         try:
-            clear_old_squeeze_cache()
             for sym in SYMBOLS:
                 price = get_alpaca_price(sym)
                 if not price:
                     continue
+                
+                levels = RES_CACHE.get(sym)
                 hist = HIST_CACHE.get(sym)
-                if hist is None:
+                if not levels or hist is None:
                     continue
-                sq = check_squeeze(hist)
-                gamma = get_gamma_walls(sym, price)
-                if sq and sq.get('firing') and sym not in sent_squeeze:
-                    if sq['dir'] == 'UP':
-                        otype = 'CALL'
-                    else:
-                        otype = 'PUT'
-                    opt = get_opt(sym, price, 'daily', otype)
-                    if opt:
-                        liq_type, liq_txt, ob_txt, _ = calc_liquidity_and_ob(hist)
-                        is_put = (sq['dir'] == 'DOWN')
-                        glevel = gamma['res_strike'] if gamma else None
-                        stop, t1, t2, t3, atr = calc_levels(hist, price, True, glevel, is_put=is_put)
-                        msg = f"🔥 <b>{sym}</b> SQUEEZE FIRING {sq['dir']}\n💰 ${price:.2f} → {opt['strike']} Exp:{opt['exp']} ${opt['last']} Vol:{opt['vol']} OI:{opt['oi']}\n{liq_txt}\nOB: {ob_txt}\nSL:{stop} T1:{t1} T2:{t2} T3:{t3}"
-                        send(msg)
-                        sent_squeeze.add(sym)
-                time.sleep(1.5)
-            time.sleep(60)
+
+                now = datetime.now()
+                last_sent = sent_signals.get(sym)
+                if last_sent and (now - last_sent) < timedelta(hours=2):
+                    continue
+
+                res = levels['res']
+                sup = levels['sup']
+
+                otype = None
+                reason = ""
+                if price >= res:
+                    otype = 'CALL'
+                    reason = "اختراق مقاومة يومية"
+                elif price <= sup:
+                    otype = 'PUT'
+                    reason = "كسر دعم يومي"
+
+                if otype:
+                    rsi = calc_rsi(hist)
+                    sma50 = float(hist['Close'].rolling(50).mean().iloc[-1]) if len(hist) >= 50 else price
+                    stop, t1, t2, t3 = calc_levels(hist, price, is_put=(otype == 'PUT'))
+                    liq_type, liq_txt, ob_txt = calc_liquidity_and_ob(hist)
+
+                    # جلب العقود الثلاثة
+                    opt_daily = get_specific_opt(sym, price, 'daily', otype)
+                    opt_weekly = get_specific_opt(sym, price, 'weekly', otype)
+                    opt_monthly = get_specific_opt(sym, price, 'monthly', otype)
+
+                    # بناء الرسالة بنفس الشكل المطلوب
+                    msg = f"⏳ تنبيه {reason} ({otype}) ⚡ {sym}\n"
+                    msg += f"💵 نقطة الدخول اللحظية: {price:.2f}$\n"
+                    msg += f"📊 RSI: {rsi:.0f} | المتوسط 50: {sma50:.2f}$\n"
+                    msg += f"🧱 حاجز المقاومة/الدعم: {res if otype=='CALL' else sup:.2f}$\n"
+                    msg += f"{liq_txt} | OB: {ob_txt}\n\n"
+
+                    msg += f"🛑 وقف الخسارة: {stop}$\n"
+                    msg += f"🎯 الهدف الأول: {t1}$\n"
+                    msg += f"🎯 الهدف الثاني: {t2}$\n"
+                    msg += f"🎯 الهدف الثالث: {t3}$\n\n"
+
+                    if opt_daily:
+                        msg += f"⚡ عقد يومي/سريع ({opt_daily['exp']})\n"
+                        msg += f"🔹 سترايك: {opt_daily['strike']}$ | السعر: {opt_daily['last']}$\n"
+                        msg += f"📈 فوليوم: {opt_daily['vol']} | OI: {opt_daily['oi']} | الفرق: {opt_daily['diff']}%\n\n"
+
+                    if opt_weekly:
+                        msg += f"📅 عقد أسبوعي ({opt_weekly['exp']})\n"
+                        msg += f"🔹 سترايك: {opt_weekly['strike']}$ | السعر: {opt_weekly['last']}$\n"
+                        msg += f"📈 فوليوم: {opt_weekly['vol']} | OI: {opt_weekly['oi']} | الفرق: {opt_weekly['diff']}%\n\n"
+
+                    if opt_monthly:
+                        msg += f"🛡️ عقد شهري/آمن ({opt_monthly['exp']})\n"
+                        msg += f"🔹 سترايك: {opt_monthly['strike']}$ | السعر: {opt_monthly['last']}$\n"
+                        msg += f"📈 فوليوم: {opt_monthly['vol']} | OI: {opt_monthly['oi']} | الفرق: {opt_monthly['diff']}%\n"
+
+                    send(msg)
+                    sent_signals[sym] = now
+
+                time.sleep(1)
+            time.sleep(30)
         except Exception as e:
-            print(f"LOOP ERR: {e}", flush=True)
+            print(f"LOOP ERR: {e}")
             time.sleep(10)
 
-# هذا هو الحل لمشكلة Port 10000 is in use
 if not hasattr(app, 'started'):
     Thread(target=main_loop, daemon=True).start()
     app.started = True
