@@ -1,7 +1,8 @@
-"""\
-تنبيهات Squeeze للأسهم الأمريكية عبر Alpaca وTelegram.
+"""
+تنبيهات Squeeze + Breakout للأسهم الأمريكية عبر Alpaca وTelegram.
 مهم: هذا البوت يرسل تنبيهات تحليلية فقط، ولا ينفذ أوامر تداول.
 الإشارات تعتمد على شموع مكتملة مدتها 5 دقائق.
+نسخة محسّنة
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -29,28 +31,48 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetStatus, ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
 
+# ====================== الإعدادات ======================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 
+# نفس الأسهم الـ 19 الأصلية بالضبط
 TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
 TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
 SYMBOLS = TIER1 + TIER2
 
 BAR_MINUTES = 5
 TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
-POLL_SECONDS = max(30, int(os.getenv("POLL_SECONDS", "60")))
-HISTORY_DAYS = max(10, int(os.getenv("HISTORY_DAYS", "15")))
-MAX_OPTION_SPREAD_PCT = max(1.0, float(os.getenv("MAX_OPTION_SPREAD_PCT", "35")))
+POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "45")))
+HISTORY_DAYS = max(8, int(os.getenv("HISTORY_DAYS", "12")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "squeeze_state.json"))
 
+# عتبات قابلة للتعديل
+MIN_SQUEEZE_BARS = int(os.getenv("MIN_SQUEEZE_BARS", "2"))
+VOLUME_MULT = float(os.getenv("VOLUME_MULT", "1.15"))
+BODY_ATR_MULT = float(os.getenv("BODY_ATR_MULT", "0.35"))
+MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "25"))
+MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "30"))
+MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "35"))
+MIN_OI = int(os.getenv("MIN_OI", "300"))
+
+US_EASTERN = ZoneInfo("America/New_York")
+
 app = Flask(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 logger = logging.getLogger("squeeze_bot")
 
-_required_env = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID, "ALPACA_API_KEY": ALPACA_API_KEY, "ALPACA_SECRET_KEY": ALPACA_SECRET_KEY}
-_missing = [key for key, value in _required_env.items() if not value]
+_required = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    "ALPACA_API_KEY": ALPACA_API_KEY,
+    "ALPACA_SECRET_KEY": ALPACA_SECRET_KEY,
+}
+_missing = [k for k, v in _required.items() if not v]
 if _missing:
     raise RuntimeError("متغيرات البيئة المطلوبة غير موجودة: " + ", ".join(_missing))
 
@@ -58,6 +80,7 @@ stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
+# ====================== أدوات مساعدة ======================
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
@@ -80,6 +103,14 @@ def _as_date(value: Any) -> date | None:
     except (TypeError, ValueError):
         return None
 
+def is_market_open() -> bool:
+    now = datetime.now(US_EASTERN)
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
 def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     frame = raw.copy()
     if isinstance(frame.index, pd.MultiIndex):
@@ -87,7 +118,11 @@ def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
             frame = frame.xs(symbol, level=0)
         except KeyError:
             return pd.DataFrame()
-    rename = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume", "trade_count": "TradeCount", "vwap": "VWAP"}
+    rename = {
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+        "trade_count": "TradeCount", "vwap": "VWAP"
+    }
     frame = frame.rename(columns=rename)
     needed = ["Open", "High", "Low", "Close"]
     if any(col not in frame.columns for col in needed):
@@ -108,20 +143,29 @@ def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 def fetch_market_data() -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
     now = datetime.now(timezone.utc)
-    request = StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=TIMEFRAME, start=now - timedelta(days=HISTORY_DAYS), limit=1000)
+    request = StockBarsRequest(
+        symbol_or_symbols=SYMBOLS,
+        timeframe=TIMEFRAME,
+        start=now - timedelta(days=HISTORY_DAYS),
+        limit=1000
+    )
     bar_set = stock_client.get_stock_bars(request)
     raw = bar_set.df
     histories: dict[str, pd.DataFrame] = {}
     closed_before = now - timedelta(minutes=BAR_MINUTES + 1)
+
     for symbol in SYMBOLS:
         frame = _bar_frame(raw, symbol)
         if not frame.empty:
             frame = frame.loc[frame.index <= closed_before]
             if not frame.empty:
                 histories[symbol] = frame
+
     prices: dict[str, float] = {}
     try:
-        latest = stock_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=SYMBOLS))
+        latest = stock_client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=SYMBOLS)
+        )
         for symbol in SYMBOLS:
             trade = latest.get(symbol) if isinstance(latest, dict) else None
             price = _as_float(_field(trade, "price")) if trade else None
@@ -129,6 +173,7 @@ def fetch_market_data() -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
                 prices[symbol] = price
     except Exception as exc:
         logger.exception("تعذر جلب أحدث الصفقات: %s", exc)
+
     for symbol, frame in histories.items():
         if symbol not in prices and len(frame):
             fallback = _as_float(frame["Close"].iloc[-1])
@@ -142,8 +187,8 @@ def calc_rsi(hist: pd.DataFrame, period: int = 14) -> float | None:
     delta = hist["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean().iloc[-1]
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean().iloc[-1]
     if not math.isfinite(float(avg_gain)) or not math.isfinite(float(avg_loss)):
         return None
     if avg_loss == 0:
@@ -154,8 +199,12 @@ def calc_atr(hist: pd.DataFrame, period: int = 14) -> float | None:
     if len(hist) < period + 1:
         return None
     previous_close = hist["Close"].shift(1)
-    tr = pd.concat([hist["High"] - hist["Low"], (hist["High"] - previous_close).abs(), (hist["Low"] - previous_close).abs()], axis=1).max(axis=1)
-    value = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
+    tr = pd.concat([
+        hist["High"] - hist["Low"],
+        (hist["High"] - previous_close).abs(),
+        (hist["Low"] - previous_close).abs()
+    ], axis=1).max(axis=1)
+    value = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean().iloc[-1]
     return float(value) if pd.notna(value) and math.isfinite(float(value)) and value > 0 else None
 
 def calc_levels(hist: pd.DataFrame, entry: float, is_put: bool = False) -> tuple[float, float, float, float] | None:
@@ -163,11 +212,12 @@ def calc_levels(hist: pd.DataFrame, entry: float, is_put: bool = False) -> tuple
     if atr is None or entry <= 0:
         return None
     if is_put:
-        values = (entry + atr, entry - 1.5 * atr, entry - 3 * atr, entry - 5 * atr)
+        values = (entry + atr, entry - 1.5*atr, entry - 3*atr, entry - 5*atr)
     else:
-        values = (entry - atr, entry + 1.5 * atr, entry + 3 * atr, entry + 5 * atr)
+        values = (entry - atr, entry + 1.5*atr, entry + 3*atr, entry + 5*atr)
     return tuple(round(x, 2) for x in values)
 
+# ====================== منطق الإشارات ======================
 def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
     if len(hist) < 25:
         return None
@@ -175,16 +225,39 @@ def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
     mid = close.rolling(20, min_periods=20).mean()
     std = close.rolling(20, min_periods=20).std(ddof=0)
     prev_close = close.shift(1)
-    tr = pd.concat([hist["High"] - hist["Low"], (hist["High"] - prev_close).abs(), (hist["Low"] - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        hist["High"] - hist["Low"],
+        (hist["High"] - prev_close).abs(),
+        (hist["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
     atr = tr.rolling(20, min_periods=20).mean()
-    upper_bb, lower_bb = mid + 2 * std, mid - 2 * std
-    upper_kc, lower_kc = mid + 1.5 * atr, mid - 1.5 * atr
-    values = [upper_bb.iloc[-1], lower_bb.iloc[-1], upper_kc.iloc[-1], lower_kc.iloc[-1], upper_bb.iloc[-2], lower_bb.iloc[-2], upper_kc.iloc[-2], lower_kc.iloc[-2], mid.iloc[-1]]
+
+    upper_bb = mid + 2 * std
+    lower_bb = mid - 2 * std
+    upper_kc = mid + 1.5 * atr
+    lower_kc = mid - 1.5 * atr
+
+    values = [
+        upper_bb.iloc[-1], lower_bb.iloc[-1],
+        upper_kc.iloc[-1], lower_kc.iloc[-1],
+        upper_bb.iloc[-2], lower_bb.iloc[-2],
+        upper_kc.iloc[-2], lower_kc.iloc[-2],
+        mid.iloc[-1]
+    ]
     if any(pd.isna(v) for v in values):
         return None
+
     squeeze_now = lower_bb.iloc[-1] > lower_kc.iloc[-1] and upper_bb.iloc[-1] < upper_kc.iloc[-1]
     squeeze_prev = lower_bb.iloc[-2] > lower_kc.iloc[-2] and upper_bb.iloc[-2] < upper_kc.iloc[-2]
-    return {"squeeze": bool(squeeze_now), "firing": bool(squeeze_prev and not squeeze_now), "dir": "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN", "bar_time": hist.index[-1].isoformat(), "bb_width": float((upper_bb.iloc[-1] - lower_bb.iloc[-1]) / mid.iloc[-1] * 100) if mid.iloc[-1] else 999}
+    bb_width = float((upper_bb.iloc[-1] - lower_bb.iloc[-1]) / mid.iloc[-1] * 100) if mid.iloc[-1] else 999
+
+    return {
+        "squeeze": bool(squeeze_now),
+        "firing": bool(squeeze_prev and not squeeze_now),
+        "dir": "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN",
+        "bar_time": hist.index[-1].isoformat(),
+        "bb_width": bb_width
+    }
 
 def is_real_squeeze_follow(hist: pd.DataFrame) -> bool:
     if len(hist) < 30:
@@ -193,120 +266,140 @@ def is_real_squeeze_follow(hist: pd.DataFrame) -> bool:
     mid = close.rolling(20).mean()
     std = close.rolling(20).std(ddof=0)
     prev_close = close.shift(1)
-    tr = pd.concat([hist["High"] - hist["Low"], (hist["High"] - prev_close).abs(), (hist["Low"] - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        hist["High"] - hist["Low"],
+        (hist["High"] - prev_close).abs(),
+        (hist["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
     atr = tr.rolling(20).mean()
-    upper_bb, lower_bb = mid + 2 * std, mid - 2 * std
-    upper_kc, lower_kc = mid + 1.5 * atr, mid - 1.5 * atr
+    upper_bb = mid + 2 * std
+    lower_bb = mid - 2 * std
+    upper_kc = mid + 1.5 * atr
+    lower_kc = mid - 1.5 * atr
+
     count = 0
-    for i in range(1, 4):
+    for i in range(1, MIN_SQUEEZE_BARS + 2):
         try:
             if lower_bb.iloc[-i] > lower_kc.iloc[-i] and upper_bb.iloc[-i] < upper_kc.iloc[-i]:
                 count += 1
-        except:
+        except Exception:
             break
-    return count >= 3
+    return count >= MIN_SQUEEZE_BARS
 
 def is_real_firing(hist: pd.DataFrame) -> bool:
-    if len(hist) < 30:
+    if len(hist) < 25:
         return False
     last = hist.iloc[-1]
     avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
     curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
-    vol_ok = curr_vol > avg_vol * 1.2 if avg_vol > 0 else True
+    vol_ok = curr_vol > avg_vol * VOLUME_MULT if avg_vol > 0 else True
+
     body = abs(float(last["Close"] - last["Open"]))
     atr = calc_atr(hist)
-    body_ok = body > (atr * 0.5) if atr else True
+    body_ok = body > (atr * BODY_ATR_MULT) if atr else True
     return vol_ok and body_ok
 
-def calc_liquidity_and_ob(hist: pd.DataFrame, direction: str) -> tuple[str, str]:
-    if len(hist) < 22:
-        return "💧 بيانات غير كافية", "غير محدد"
-    current = hist.iloc[-1]
-    previous = hist.iloc[-21:-1]
-    prior_low = float(previous["Low"].min())
-    prior_high = float(previous["High"].max())
-    liq = "بدون سحب سيولة واضح"
-    if current["Low"] < prior_low and current["Close"] > prior_low:
-        liq = "💧 سحب سيولة SSL محتمل + إغلاق فوق القاع السابق"
-    elif current["High"] > prior_high and current["Close"] < prior_high:
-        liq = "💧 سحب سيولة BSL محتمل + إغلاق تحت القمة السابقة"
-    atr = calc_atr(hist)
-    ob_text = "لم تُرصد منطقة واضحة"
-    if atr:
-        start = max(0, len(hist) - 26)
-        for i in range(len(hist) - 2, start - 1, -1):
-            base = hist.iloc[i]
-            impulse = hist.iloc[i + 1]
-            impulse_body = abs(float(impulse["Close"] - impulse["Open"]))
-            is_bullish_pair = direction == "UP" and base["Close"] < base["Open"] and impulse["Close"] > impulse["Open"]
-            is_bearish_pair = direction == "DOWN" and base["Close"] > base["Open"] and impulse["Close"] < impulse["Open"]
-            if (is_bullish_pair or is_bearish_pair) and impulse_body >= 0.8 * atr:
-                ob_text = f"{float(base['Low']):.2f}$ - {float(base['High']):.2f}$"
-                break
-    return liq, ob_text
+def check_volume_breakout(hist: pd.DataFrame) -> dict[str, Any] | None:
+    if len(hist) < 30:
+        return None
+    last = hist.iloc[-1]
+    prev = hist.iloc[-21:-1]
+    avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
+    curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
 
-def _contracts_from_response(response: Any) -> tuple[list[Any], str | None]:
-    contracts = _field(response, "option_contracts", None)
-    if contracts is None and isinstance(response, (list, tuple)):
-        contracts = response
-    if contracts is None and isinstance(response, dict):
-        contracts = response.get("option_contracts", [])
-    next_token = _field(response, "next_page_token")
-    return list(contracts or []), next_token
+    if avg_vol <= 0 or curr_vol < avg_vol * 1.8:
+        return None
 
+    high_prev = float(prev["High"].max())
+    low_prev = float(prev["Low"].min())
+
+    if last["Close"] > high_prev and last["Close"] > last["Open"]:
+        return {"type": "BREAKOUT_UP", "dir": "UP", "bar_time": hist.index[-1].isoformat()}
+    if last["Close"] < low_prev and last["Close"] < last["Open"]:
+        return {"type": "BREAKOUT_DOWN", "dir": "DOWN", "bar_time": hist.index[-1].isoformat()}
+    return None
+
+# ====================== الخيارات ======================
 def get_option_recommendations(symbol: str, stock_price: float, option_type: str) -> dict[str, dict[str, Any]]:
     if stock_price <= 0:
         return {}
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
     today = datetime.now(timezone.utc).date()
     max_expiry = today + timedelta(days=45)
-    low = stock_price * (0.90 if option_type == "CALL" else 0.85)
-    high = stock_price * (1.15 if option_type == "CALL" else 1.10)
+    low = stock_price * (0.88 if option_type == "CALL" else 0.82)
+    high = stock_price * (1.18 if option_type == "CALL" else 1.12)
+
     all_contracts: list[Any] = []
     page_token = None
-    for _ in range(10):
-        request_kwargs: dict[str, Any] = {"underlying_symbols": [symbol], "status": AssetStatus.ACTIVE, "expiration_date_gte": today, "expiration_date_lte": max_expiry, "type": target, "strike_price_gte": f"{low:.2f}", "strike_price_lte": f"{high:.2f}", "limit": 10000}
+    for _ in range(6):
+        request_kwargs = {
+            "underlying_symbols": [symbol],
+            "status": AssetStatus.ACTIVE,
+            "expiration_date_gte": today,
+            "expiration_date_lte": max_expiry,
+            "type": target,
+            "strike_price_gte": f"{low:.2f}",
+            "strike_price_lte": f"{high:.2f}",
+            "limit": 500,
+        }
         if page_token:
             request_kwargs["page_token"] = page_token
-        response = trading_client.get_option_contracts(GetOptionContractsRequest(**request_kwargs))
-        contracts, page_token = _contracts_from_response(response)
+        try:
+            response = trading_client.get_option_contracts(GetOptionContractsRequest(**request_kwargs))
+        except Exception as e:
+            logger.warning("خطأ جلب العقود %s: %s", symbol, e)
+            break
+        contracts = _field(response, "option_contracts", []) or []
+        page_token = _field(response, "next_page_token")
         all_contracts.extend(contracts)
         if not page_token:
             break
+
     if not all_contracts:
         return {}
-    filtered: list[tuple[Any, date, float]] = []
+
+    try:
+        chain = option_client.get_option_chain(
+            OptionChainRequest(
+                underlying_symbol=symbol,
+                type=target,
+                strike_price_gte=low,
+                strike_price_lte=high,
+                expiration_date_gte=today,
+                expiration_date_lte=max_expiry
+            )
+        )
+    except Exception as exc:
+        logger.warning("تعذر جلب snapshots %s: %s", symbol, exc)
+        return {}
+
+    if not isinstance(chain, dict):
+        return {}
+
+    buckets: dict[str, list[dict[str, Any]]] = {"daily": [], "weekly": [], "monthly": []}
     for contract in all_contracts:
         expiry = _as_date(_field(contract, "expiration_date"))
         strike = _as_float(_field(contract, "strike_price"))
         contract_symbol = _field(contract, "symbol")
         if not expiry or not strike or not contract_symbol:
             continue
-        if expiry < today or expiry > max_expiry or not low <= strike <= high:
-            continue
-        filtered.append((contract, expiry, strike))
-    if not filtered:
-        return {}
-    try:
-        chain = option_client.get_option_chain(OptionChainRequest(underlying_symbol=symbol, type=target, strike_price_gte=low, strike_price_lte=high, expiration_date_gte=today, expiration_date_lte=max_expiry))
-    except Exception as exc:
-        logger.warning("تعذر جلب snapshots خيارات %s: %s", symbol, exc)
-        return {}
-    if not isinstance(chain, dict):
-        return {}
-    buckets: dict[str, list[dict[str, Any]]] = {"daily": [], "weekly": [], "monthly": []}
-    for contract, expiry, strike in filtered:
         days_to_expiry = (expiry - today).days
         if 0 <= days_to_expiry <= 7:
             bucket = "daily"
+            max_spread = MAX_SPREAD_DAILY
+            max_diff = 6
         elif 8 <= days_to_expiry <= 14:
             bucket = "weekly"
+            max_spread = MAX_SPREAD_WEEKLY
+            max_diff = 8
         elif 15 <= days_to_expiry <= 45:
             bucket = "monthly"
+            max_spread = MAX_SPREAD_MONTHLY
+            max_diff = 12
         else:
             continue
-        contract_symbol = str(_field(contract, "symbol"))
-        snapshot = chain.get(contract_symbol)
+
+        snapshot = chain.get(str(contract_symbol))
         if snapshot is None:
             continue
         quote = _field(snapshot, "latest_quote")
@@ -315,33 +408,39 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if bid is None or ask is None or bid <= 0 or ask < bid:
             continue
         mid = (bid + ask) / 2
-        # تعديل دقة: افضل العقود فقط
-        if not 0.50 <= mid <= 15:
+        if not 0.30 <= mid <= 18:
             continue
         spread_pct = ((ask - bid) / mid) * 100 if mid else 1000
-        limit_spread = 20 if bucket == "daily" else 25 if bucket == "weekly" else 30
-        if spread_pct > limit_spread:
+        if spread_pct > max_spread:
             continue
         oi = _as_float(_field(contract, "open_interest"), 0.0) or 0.0
-        if oi < 500:
+        if oi < MIN_OI:
             continue
-        oi_date = _as_date(_field(contract, "open_interest_date"))
-        oi_is_recent = oi_date is not None and (today - oi_date).days <= 7
         diff_pct = abs(strike - stock_price) / stock_price * 100
-        if bucket == "daily" and diff_pct > 5:
+        if diff_pct > max_diff:
             continue
-        if bucket == "weekly" and diff_pct > 7:
-            continue
-        if bucket == "monthly" and diff_pct > 10:
-            continue
-        score = spread_pct + 0.35 * diff_pct - 0.4 * min(math.log1p(max(oi, 0)), 12)
-        buckets[bucket].append({"symbol": contract_symbol, "strike": strike, "exp": expiry.isoformat(), "mid": mid, "bid": bid, "ask": ask, "spread_pct": spread_pct, "oi": int(oi) if oi_is_recent else None, "diff": round(diff_pct, 1), "score": score})
-    result: dict[str, dict[str, Any]] = {}
+
+        score = spread_pct + 0.3 * diff_pct - 0.45 * min(math.log1p(max(oi, 0)), 12)
+        buckets[bucket].append({
+            "symbol": str(contract_symbol),
+            "strike": strike,
+            "exp": expiry.isoformat(),
+            "mid": mid,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            "oi": int(oi),
+            "diff": round(diff_pct, 1),
+            "score": score
+        })
+
+    result = {}
     for bucket, candidates in buckets.items():
         if candidates:
-            result[bucket] = min(candidates, key=lambda item: item["score"])
+            result[bucket] = min(candidates, key=lambda x: x["score"])
     return result
 
+# ====================== الرسائل والحالة ======================
 def _load_state() -> dict[str, str]:
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -349,7 +448,7 @@ def _load_state() -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except Exception as exc:
-        logger.warning("تعذر قراءة ملف حالة التنبيهات: %s", exc)
+        logger.warning("تعذر قراءة ملف الحالة: %s", exc)
         return {}
 
 def _save_state(state: dict[str, str]) -> None:
@@ -359,66 +458,91 @@ def _save_state(state: dict[str, str]) -> None:
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(STATE_FILE)
     except Exception as exc:
-        logger.exception("تعذر حفظ حالة التنبيهات: %s", exc)
+        logger.exception("تعذر حفظ الحالة: %s", exc)
 
 def send_telegram(message: str) -> bool:
     try:
-        response = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=20)
-        if not response.ok:
-            return False
-        return response.json().get("ok", False)
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=20
+        )
+        return response.ok and response.json().get("ok", False)
     except Exception:
         return False
 
 def _option_message(label: str, opt: dict[str, Any]) -> str:
-    oi_text = str(opt["oi"]) if opt["oi"] is not None else "غير متاح"
-    return f"{label}\n📅 الانتهاء: {opt['exp']}\n🔹 العقد: {opt['symbol']}\n🎯 سترايك: {opt['strike']:.2f}$\n💵 السعر: {opt['mid']:.2f}$ (شراء {opt['bid']:.2f}$ / بيع {opt['ask']:.2f}$)\n📊 الفائدة: {oi_text} | السبريد: {opt['spread_pct']:.1f}% | البعد: {opt['diff']}%\n"
+    return (
+        f"{label}\n"
+        f"📅 الانتهاء: {opt['exp']}\n"
+        f"🔹 العقد: <code>{opt['symbol']}</code>\n"
+        f"🎯 سترايك: {opt['strike']:.2f}$\n"
+        f"💵 السعر: {opt['mid']:.2f}$ (شراء {opt['bid']:.2f}$ / بيع {opt['ask']:.2f}$)\n"
+        f"📊 OI: {opt['oi']} | السبريد: {opt['spread_pct']:.1f}% | البعد: {opt['diff']}%\n"
+    )
 
-def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str, float], sq: dict[str, Any]) -> str:
+def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str, float], sq: dict[str, Any], signal_type: str = "SQUEEZE") -> str:
     option_type = "CALL" if sq["dir"] == "UP" else "PUT"
     rsi = calc_rsi(hist)
     sma50 = float(hist["Close"].rolling(50, min_periods=50).mean().iloc[-1]) if len(hist) >= 50 else None
     resistance = levels["res"] if option_type == "CALL" else levels["sup"]
     stops = calc_levels(hist, price, is_put=(option_type == "PUT"))
-    liquidity_text, ob_text = calc_liquidity_and_ob(hist, sq["dir"])
-    lines = [f"🚀 انطلاق حقيقي ({option_type}) — {symbol}", f"🕯 شمعة {BAR_MINUTES}د مكتملة | UTC: {sq['bar_time']}", f"💵 السعر: {price:.2f}$", f"📊 RSI: {rsi:.1f}" if rsi is not None else "📊 RSI: غير متاح", f"📉 متوسط 50: {sma50:.2f}$" if sma50 is not None and math.isfinite(sma50) else "📉 متوسط 50: غير كاف", f"🧱 مقاومة/دعم: {resistance:.2f}$", f"{liquidity_text} | OB: {ob_text}", f"📏 عرض BB: {sq.get('bb_width', 0):.2f}% | فوليوم مؤكد"]
+
+    title = "🚀 انطلاق Squeeze" if signal_type == "SQUEEZE" else "💥 كسر + حجم قوي"
+
+    lines = [
+        f"<b>{title} ({option_type}) — {symbol}</b>",
+        f"🕯 شمعة {BAR_MINUTES}د مكتملة",
+        f"💵 السعر: <b>{price:.2f}$</b>",
+        f"📊 RSI: {rsi:.1f}" if rsi is not None else "📊 RSI: غير متاح",
+        f"📉 متوسط 50: {sma50:.2f}$" if sma50 is not None and math.isfinite(sma50) else "📉 متوسط 50: غير كاف",
+        f"🧱 مستوى مهم: {resistance:.2f}$",
+        f"📏 عرض BB: {sq.get('bb_width', 0):.2f}%",
+    ]
     if stops:
         stop, t1, t2, t3 = stops
-        lines.extend(["", f"🛑 وقف: {stop:.2f}$", f"🎯 اهداف: {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$"])
+        lines.extend([
+            "",
+            f"🛑 وقف الخسارة المقترح: <b>{stop:.2f}$</b>",
+            f"🎯 أهداف: {t1:.2f}$  /  {t2:.2f}$  /  {t3:.2f}$"
+        ])
+
     try:
         options = get_option_recommendations(symbol, price, option_type)
     except Exception:
         options = {}
+
     lines.append("")
     if options:
-        labels = {"daily": "⚡ عقد يومي (0-7 أيام)", "weekly": "📅 عقد أسبوعي (8-14 يوم)", "monthly": "🛡️ عقد شهري (15-45 يوم)"}
+        labels = {
+            "daily": "⚡ عقد يومي (0-7 أيام)",
+            "weekly": "📅 عقد أسبوعي (8-14 يوم)",
+            "monthly": "🛡️ عقد شهري (15-45 يوم)"
+        }
         for b in ("daily", "weekly", "monthly"):
             if b in options:
                 lines.append(_option_message(labels[b], options[b]))
     else:
-        lines.append("العقود: لم يوجد عقد يطابق فلتر الدقة العالية.")
-    lines.append("\nتنبيه تعليمي فقط - الخيارات عالية المخاطر.")
+        lines.append("⚠️ لم يتم العثور على عقد مناسب حسب الفلاتر.")
+
+    lines.append("\n⚠️ تنبيه تعليمي فقط - الخيارات عالية المخاطر.")
     return "\n".join(lines)
 
-def build_watch_alert(symbol: str, price: float, hist: pd.DataFrame, sq: dict[str, Any]) -> tuple[str, str]:
+def build_watch_alert(symbol: str, price: float, hist: pd.DataFrame, sq: dict[str, Any]) -> str:
     rsi = calc_rsi(hist)
-    sma20 = float(hist["Close"].rolling(20, min_periods=20).mean().iloc[-1])
-    option_type = "CALL" if float(hist["Close"].iloc[-1]) >= sma20 else "PUT"
     rsi_text = f"{rsi:.1f}" if rsi is not None else "غير متاح"
-    message = f"👀 متابعة حقيقية (3 شموع ضغط) — {symbol}\n🕯 {BAR_MINUTES}د مكتملة | UTC: {sq['bar_time']}\n💵 السعر: {price:.2f}$ | RSI: {rsi_text} | BB: {sq.get('bb_width',0):.2f}%\n🧭 الميل: {option_type}\n\nالسهم في انضغاط حقيقي 15 دقيقة - يجهز لانطلاقة."
-    return message, option_type
+    return (
+        f"👀 <b>متابعة ضغط — {symbol}</b>\n"
+        f"🕯 {BAR_MINUTES} دقائق | السعر: {price:.2f}$\n"
+        f"RSI: {rsi_text} | عرض BB: {sq.get('bb_width', 0):.2f}%\n"
+        f"الميل الحالي: {'CALL' if sq['dir'] == 'UP' else 'PUT'}\n\n"
+        f"السهم في منطقة ضغط، راقب الانطلاق."
+    )
 
-def build_watch_options_message(symbol: str, option_type: str, options: dict[str, dict[str, Any]]) -> str:
-    labels = {"daily": "⚡ عقد يومي (0-7 أيام)", "weekly": "📅 عقد أسبوعي (8-14 يوم)", "monthly": "🛡️ عقد شهري (15-45 يوم)"}
-    lines = [f"📋 {symbol} — افضل عقود {option_type} للمراقبة:"]
-    for b in ("daily", "weekly", "monthly"):
-        if b in options:
-            lines.append(_option_message(labels[b], options[b]))
-    return "\n".join(lines)
-
+# ====================== الحلقة الرئيسية ======================
 def _prune_state(state: dict[str, str]) -> dict[str, str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    kept: dict[str, str] = {}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=5)
+    kept = {}
     for key, value in state.items():
         try:
             stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -426,69 +550,122 @@ def _prune_state(state: dict[str, str]) -> dict[str, str]:
                 stamp = stamp.replace(tzinfo=timezone.utc)
             if stamp >= cutoff:
                 kept[key] = value
-        except:
+        except Exception:
             continue
     return kept
 
 def main_loop() -> None:
     state = _prune_state(_load_state())
-    send_telegram(f"✅ بدأ بوت Squeeze الحقيقي - متابعة حقيقية 3 شموع + انطلاق بفوليوم - افضل العقود فقط (دقة عالية)")
+    last_heartbeat = datetime.now(timezone.utc)
+
+    send_telegram(
+        "✅ <b>بوت Squeeze + Breakout المحسّن اشتغل</b>\n"
+        f"الأسهم: {len(SYMBOLS)} | فريم: {BAR_MINUTES} دقائق\n"
+        "الشروط مخففة قليلاً عشان يطلع تنبيهات مفيدة."
+    )
+
     while True:
         try:
+            if not is_market_open():
+                logger.info("السوق مغلق - انتظار...")
+                time.sleep(60)
+                continue
+
             histories, prices = fetch_market_data()
             state = _prune_state(state)
+            signals_today = 0
+
             for symbol in SYMBOLS:
                 try:
                     hist = histories.get(symbol)
                     price = prices.get(symbol)
-                    if hist is None or price is None or len(hist) < 25:
+                    if hist is None or price is None or len(hist) < 30:
                         continue
+
+                    # 1. Squeeze
                     sq = check_squeeze(hist)
-                    if not sq:
-                        continue
-                    watch_key = f"watch:{symbol}"
-                    fire_key = f"fire:{symbol}"
-                    if sq["squeeze"] and watch_key not in state:
-                        if is_real_squeeze_follow(hist):
-                            watch_message, option_type = build_watch_alert(symbol, price, hist, sq)
-                            if send_telegram(watch_message):
-                                state[watch_key] = sq["bar_time"]
-                                _save_state(state)
-                                try:
-                                    watch_options = get_option_recommendations(symbol, price, option_type)
-                                    if watch_options:
-                                        send_telegram(build_watch_options_message(symbol, option_type, watch_options))
-                                except Exception:
-                                    pass
-                    if sq["firing"] and state.get(fire_key)!= sq["bar_time"]:
-                        if is_real_firing(hist):
+                    if sq:
+                        watch_key = f"watch:{symbol}"
+                        fire_key = f"fire:{symbol}"
+
+                        if sq["squeeze"] and watch_key not in state:
+                            if is_real_squeeze_follow(hist):
+                                msg = build_watch_alert(symbol, price, hist, sq)
+                                if send_telegram(msg):
+                                    state[watch_key] = sq["bar_time"]
+                                    _save_state(state)
+                                    logger.info("Watch sent: %s", symbol)
+
+                        if sq["firing"] and state.get(fire_key) != sq["bar_time"]:
+                            if is_real_firing(hist):
+                                prior = hist.iloc[:-1].tail(20)
+                                levels = {
+                                    "res": float(prior["High"].max()),
+                                    "sup": float(prior["Low"].min())
+                                }
+                                message = build_alert(symbol, price, hist, levels, sq, "SQUEEZE")
+                                if send_telegram(message):
+                                    state[fire_key] = sq["bar_time"]
+                                    state.pop(watch_key, None)
+                                    _save_state(state)
+                                    signals_today += 1
+                                    logger.info("Squeeze Fire: %s", symbol)
+
+                    # 2. Volume Breakout
+                    br = check_volume_breakout(hist)
+                    if br:
+                        br_key = f"break:{symbol}:{br['bar_time']}"
+                        if br_key not in state:
                             prior = hist.iloc[:-1].tail(20)
-                            if len(prior) < 10:
-                                continue
-                            levels = {"res": float(prior["High"].max()), "sup": float(prior["Low"].min())}
-                            message = build_alert(symbol, price, hist, levels, sq)
+                            levels = {
+                                "res": float(prior["High"].max()),
+                                "sup": float(prior["Low"].min())
+                            }
+                            fake_sq = {
+                                "dir": br["dir"],
+                                "bar_time": br["bar_time"],
+                                "bb_width": 0
+                            }
+                            message = build_alert(symbol, price, hist, levels, fake_sq, "BREAKOUT")
                             if send_telegram(message):
-                                state[fire_key] = sq["bar_time"]
-                                state.pop(watch_key, None)
+                                state[br_key] = br["bar_time"]
                                 _save_state(state)
-                    time.sleep(1.0)
+                                signals_today += 1
+                                logger.info("Breakout: %s", symbol)
+
+                    time.sleep(0.4)
+
                 except Exception as exc:
-                    logger.exception("خطأ %s: %s", symbol, exc)
+                    logger.exception("خطأ في %s: %s", symbol, exc)
+
+            # Heartbeat كل ساعة
+            now = datetime.now(timezone.utc)
+            if (now - last_heartbeat).total_seconds() > 3600:
+                send_telegram(f"💓 البوت شغال | إشارات اليوم: {signals_today}")
+                last_heartbeat = now
+
             time.sleep(POLL_SECONDS)
+
         except Exception as exc:
-            logger.exception("خطأ دورة: %s", exc)
-            time.sleep(15)
+            logger.exception("خطأ في الدورة الرئيسية: %s", exc)
+            time.sleep(20)
 
 @app.get("/")
 def home():
-    return "Bot OK - REAL Squeeze + Best Contracts"
+    return "Bot OK - Improved Squeeze + Breakout"
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "symbols": len(SYMBOLS), "bar_minutes": BAR_MINUTES})
+    return jsonify({
+        "status": "ok",
+        "symbols": len(SYMBOLS),
+        "bar_minutes": BAR_MINUTES,
+        "market_open": is_market_open()
+    })
 
 _worker_lock = Lock()
 _worker_started = False
+
 def start_background_worker() -> None:
     global _worker_started
     with _worker_lock:
@@ -498,6 +675,7 @@ def start_background_worker() -> None:
         _worker_started = True
 
 start_background_worker()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
