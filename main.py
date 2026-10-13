@@ -1,6 +1,6 @@
 """
 تنبيهات Squeeze + Breakout للأسهم الأمريكية عبر Alpaca وTelegram.
-محدث خصيصاً للأسهم المجنونة (SNDK, MU, LITE, SMCI) وجميع الشركات الـ 19.
+محدث خصيصاً للنسخة القديمة الممتازة مع تخصيص الأسهم المجنونة (SNDK, MU, LITE, SMCI).
 """
 from __future__ import annotations
 
@@ -39,19 +39,19 @@ TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
 TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
 SYMBOLS = TIER1 + TIER2
 
-# الأسهم المجنونة التي تتطلب حساسية أعلى للرصد الفوري
+# الأسهم المجنونة التي تتطلب حساسية عالية جداً وقنص فوري للاستيمال
 CRAZY_SYMBOLS = {"SNDK", "MU", "LITE", "SMCI"}
 
 BAR_MINUTES = 5
 TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
-POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "30")))
-HISTORY_DAYS = max(8, int(os.getenv("HISTORY_DAYS", "12")))
+POLL_SECONDS = max(15, int(os.getenv("POLL_SECONDS", "20")))
+HISTORY_DAYS = max(8, int(os.getenv("HISTORY_DAYS", "10")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "squeeze_state.json"))
 
-MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "35"))
-MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "40"))
-MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "45"))
-MIN_OI = int(os.getenv("MIN_OI", "100"))
+MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "40"))
+MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "45"))
+MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "50"))
+MIN_OI = int(os.getenv("MIN_OI", "50"))
 
 US_EASTERN = ZoneInfo("America/New_York")
 
@@ -148,14 +148,11 @@ def fetch_market_data() -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
     bar_set = stock_client.get_stock_bars(request)
     raw = bar_set.df
     histories: dict[str, pd.DataFrame] = {}
-    closed_before = now - timedelta(minutes=BAR_MINUTES + 1)
 
     for symbol in SYMBOLS:
         frame = _bar_frame(raw, symbol)
         if not frame.empty:
-            frame = frame.loc[frame.index <= closed_before]
-            if not frame.empty:
-                histories[symbol] = frame
+            histories[symbol] = frame
 
     prices: dict[str, float] = {}
     try:
@@ -213,7 +210,7 @@ def calc_levels(hist: pd.DataFrame, entry: float, is_put: bool = False) -> tuple
         values = (entry - atr, entry + 1.5*atr, entry + 3*atr, entry + 5*atr)
     return tuple(round(x, 2) for x in values)
 
-# ====================== منطق كشف الانضغاط والانفجار ======================
+# ====================== منطق كشف الانضغاط والانفجار المطور للأسهم المجنونة ======================
 def check_signal(symbol: str, hist: pd.DataFrame) -> dict[str, Any] | None:
     if len(hist) < 25:
         return None
@@ -246,9 +243,9 @@ def check_signal(symbol: str, hist: pd.DataFrame) -> dict[str, Any] | None:
 
     direction = "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN"
 
-    # حساسية خاصة للأسهم المجنونة (SNDK, MU, LITE, SMCI) لسرعة التقاط الانفجار
+    # حساسية فائقة للأسهم المجنونة (SNDK, MU, LITE, SMCI) لالتقاط أي انفجار أو نزول مجنون فوراً
     is_crazy = symbol in CRAZY_SYMBOLS
-    vol_multiplier = 1.15 if is_crazy else 1.35
+    vol_multiplier = 1.05 if is_crazy else 1.25
 
     high_prev = float(prev_20["High"].max())
     low_prev = float(prev_20["Low"].min())
@@ -280,15 +277,15 @@ def check_signal(symbol: str, hist: pd.DataFrame) -> dict[str, Any] | None:
 
     return None
 
-# ====================== جلب عقود الأوبشن (يومي، أسبوعي، شهري) ======================
+# ====================== جلب عقود الأوبشن الثلاثة (يومي، أسبوعي، شهري) ======================
 def get_option_recommendations(symbol: str, stock_price: float, option_type: str) -> dict[str, dict[str, Any]]:
     if stock_price <= 0:
         return {}
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
     today = datetime.now(timezone.utc).date()
     max_expiry = today + timedelta(days=45)
-    low = stock_price * (0.82 if option_type == "CALL" else 0.75)
-    high = stock_price * (1.20 if option_type == "CALL" else 1.18)
+    low = stock_price * (0.80 if option_type == "CALL" else 0.70)
+    high = stock_price * (1.25 if option_type == "CALL" else 1.20)
 
     all_contracts: list[Any] = []
     page_token = None
@@ -347,15 +344,15 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if 0 <= days_to_expiry <= 7:
             bucket = "daily"
             max_spread = MAX_SPREAD_DAILY
-            max_diff = 10
-        elif 8 <= days_to_expiry <= 14:
+            max_diff = 12
+        elif 8 <= days_to_expiry <= 20:
             bucket = "weekly"
             max_spread = MAX_SPREAD_WEEKLY
-            max_diff = 14
-        elif 15 <= days_to_expiry <= 45:
+            max_diff = 16
+        elif 21 <= days_to_expiry <= 45:
             bucket = "monthly"
             max_spread = MAX_SPREAD_MONTHLY
-            max_diff = 18
+            max_diff = 22
         else:
             continue
 
@@ -368,11 +365,14 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if bid is None or ask is None or bid <= 0 or ask < bid:
             continue
         mid = (bid + ask) / 2
-        if not 0.20 <= mid <= 30:
+        if not 0.10 <= mid <= 50:
             continue
         spread_pct = ((ask - bid) / mid) * 100
         if spread_pct > max_spread:
             continue
+        
+        greeks = _field(snapshot, "greeks")
+        vol = _as_float(_field(snapshot, "volume"), 0.0) or 0.0
         oi = _as_float(_field(contract, "open_interest"), 0.0) or 0.0
         if oi < MIN_OI:
             continue
@@ -380,7 +380,9 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if diff_pct > max_diff:
             continue
 
+        whale_tag = " 🐋 دخول حيتان" if vol > 5000 or oi > 10000 else ""
         score = spread_pct + 0.3 * diff_pct - 0.5 * min(math.log1p(max(oi, 0)), 12)
+        
         buckets[bucket].append({
             "symbol": str(contract_symbol),
             "strike": strike,
@@ -390,6 +392,8 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
             "ask": ask,
             "spread_pct": spread_pct,
             "oi": int(oi),
+            "vol": int(vol),
+            "whale": whale_tag,
             "diff": round(diff_pct, 1),
             "score": score
         })
@@ -405,8 +409,6 @@ def _load_state() -> dict[str, str]:
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
     except Exception:
         return {}
 
@@ -432,9 +434,8 @@ def send_telegram(message: str) -> bool:
 
 def _option_line(label: str, opt: dict[str, Any]) -> str:
     return (
-        f"{label} ({opt['exp']})\n"
-        f"💰 سترايك {opt['strike']:.2f}$ - سعره {opt['mid']:.2f}$ (شراء {opt['bid']:.2f}$ / بيع {opt['ask']:.2f}$)\n"
-        f"📊 OI: {opt['oi']} | السبريد: {opt['spread_pct']:.1f}% | البعد: {opt['diff']}%\n"
+        f"{label} {opt['exp']}{opt['whale']}\n"
+        f"💰 سترايك {opt['strike']:.1f}$ - سعره {opt['mid']:.1f}$ | فوليوم: {opt['vol']} | OI: {opt['oi']} | فرق: {opt['diff']}%\n"
         f"🔹 العقد: <code>{opt['symbol']}</code>\n"
     )
 
@@ -452,15 +453,16 @@ def build_message(symbol: str, price: float, hist: pd.DataFrame, sig: dict[str, 
     lines = [
         f"{title} {option_type} {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>",
         f"📊 المتوسط 50: {sma50:.2f}$ | المستوى المهم: {resistance:.2f}$ | RSI: {rsi:.1f if rsi else 0}",
-        f"📏 عرض BB: {sig['bb_width']:.2f}%",
+        f"🧱 عرض BB: {sig['bb_width']:.2f}%",
         ""
     ]
 
     if stops:
         stop, t1, t2, t3 = stops
+        atr_val = round(abs(t1 - price) if option_type == "CALL" else abs(price - t1), 2)
         lines.extend([
-            f"🛑 وقف الخسارة: {stop:.2f}$",
-            f"🎯 هدف أول: {t1:.2f}$",
+            f"🛑 وقف الخسارة: {stop:.2f}$ (ATR:{atr_val}$)",
+            f"🎯 هدف اول: {t1:.2f}$",
             f"🎯 هدف ثاني: {t2:.2f}$",
             f"🎯 هدف ثالث: {t3:.2f}$",
             ""
@@ -468,9 +470,9 @@ def build_message(symbol: str, price: float, hist: pd.DataFrame, sig: dict[str, 
 
     options = get_option_recommendations(symbol, price, option_type)
     labels = {
-        "daily": "🔥 عقد يومي (0-7 أيام)",
-        "weekly": "📅 عقد أسبوعي (8-14 يوم)",
-        "monthly": "🛡️ عقد شهري (15-45 يوم)"
+        "daily": "🔥 عقد يومي (0-7 ايام)",
+        "weekly": "📅 عقد أسبوعي (8-20 يوم)",
+        "monthly": "🛡️ عقد شهري (21-45 يوم)"
     }
 
     if options:
@@ -503,9 +505,9 @@ def main_loop() -> None:
     last_heartbeat = datetime.now(timezone.utc)
 
     send_telegram(
-        "✅ <b>تم تشغيل البوت بنجاح</b>\n"
-        f"مراقبة {len(SYMBOLS)} شركة (متضمنة الأسهم المجنونة باحترافية).\n"
-        "إرسال العقود الثلاثة (يومي، أسبوعي، شهري) بدون تكرار."
+        "✅ <b>تم تشغيل النسخة الذهبية للبوت بنجاح</b>\n"
+        f"مراقبة {len(SYMBOLS)} شركة (مع تخصيص الأسهم المجنونة SNDK, MU, LITE, SMCI).\n"
+        "إرسال العقود الثلاثة (يومي، أسبوعي، شهري) مع كشف الحيتان والفوليوم."
     )
 
     while True:
@@ -537,7 +539,7 @@ def main_loop() -> None:
                                 signals_today += 1
                                 logger.info("Signal sent for %s: %s", symbol, sig['type'])
 
-                    time.sleep(0.3)
+                    time.sleep(0.2)
 
                 except Exception as exc:
                     logger.exception("خطأ في معالجة %s: %s", symbol, exc)
@@ -550,12 +552,12 @@ def main_loop() -> None:
             time.sleep(POLL_SECONDS)
 
         except Exception as exc:
-                    logger.exception("خطأ في الحلقة الرئيسية: %s", exc)
-                    time.sleep(20)
+            logger.exception("خطأ في الحلقة الرئيسية: %s", exc)
+            time.sleep(20)
 
 @app.get("/")
 def home():
-    return "Bot OK - Active & Optimized"
+    return "Bot OK - Golden Version Active"
 
 @app.get("/health")
 def health():
