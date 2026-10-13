@@ -1,6 +1,6 @@
 """
 تنبيهات Squeeze + Breakout للأسهم الأمريكية عبر Alpaca وTelegram.
-محدث لإرسال الانضغاط والانفجار بمرونة أكبر.
+محدث خصيصاً للأسهم المجنونة (SNDK, MU, LITE, SMCI) وجميع الشركات الـ 19.
 """
 from __future__ import annotations
 
@@ -39,20 +39,19 @@ TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
 TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
 SYMBOLS = TIER1 + TIER2
 
+# الأسهم المجنونة التي تتطلب حساسية أعلى للرصد الفوري
+CRAZY_SYMBOLS = {"SNDK", "MU", "LITE", "SMCI"}
+
 BAR_MINUTES = 5
 TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
 POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "30")))
 HISTORY_DAYS = max(8, int(os.getenv("HISTORY_DAYS", "12")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "squeeze_state.json"))
 
-# عتبات مخففة عشان يلقر فرصة أسرع
-MIN_SQUEEZE_BARS = int(os.getenv("MIN_SQUEEZE_BARS", "1"))
-VOLUME_MULT = float(os.getenv("VOLUME_MULT", "1.05"))
-BODY_ATR_MULT = float(os.getenv("BODY_ATR_MULT", "0.20"))
-MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "30"))
-MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "35"))
-MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "40"))
-MIN_OI = int(os.getenv("MIN_OI", "150"))
+MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "35"))
+MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "40"))
+MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "45"))
+MIN_OI = int(os.getenv("MIN_OI", "100"))
 
 US_EASTERN = ZoneInfo("America/New_York")
 
@@ -214,8 +213,8 @@ def calc_levels(hist: pd.DataFrame, entry: float, is_put: bool = False) -> tuple
         values = (entry - atr, entry + 1.5*atr, entry + 3*atr, entry + 5*atr)
     return tuple(round(x, 2) for x in values)
 
-# ====================== منطق الإشارات ======================
-def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
+# ====================== منطق كشف الانضغاط والانفجار ======================
+def check_signal(symbol: str, hist: pd.DataFrame) -> dict[str, Any] | None:
     if len(hist) < 25:
         return None
     close = hist["Close"]
@@ -234,63 +233,62 @@ def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
     upper_kc = mid + 1.5 * atr
     lower_kc = mid - 1.5 * atr
 
-    values = [
-        upper_bb.iloc[-1], lower_bb.iloc[-1],
-        upper_kc.iloc[-1], lower_kc.iloc[-1],
-        upper_bb.iloc[-2], lower_bb.iloc[-2],
-        upper_kc.iloc[-2], lower_kc.iloc[-2],
-        mid.iloc[-1]
-    ]
-    if any(pd.isna(v) for v in values):
+    if any(pd.isna([upper_bb.iloc[-1], lower_bb.iloc[-1], upper_kc.iloc[-1], lower_kc.iloc[-1], mid.iloc[-1]])):
         return None
 
     squeeze_now = lower_bb.iloc[-1] > lower_kc.iloc[-1] and upper_bb.iloc[-1] < upper_kc.iloc[-1]
-    squeeze_prev = lower_bb.iloc[-2] > lower_kc.iloc[-2] and upper_bb.iloc[-2] < upper_kc.iloc[-2]
-    bb_width = float((upper_bb.iloc[-1] - lower_bb.iloc[-1]) / mid.iloc[-1] * 100) if mid.iloc[-1] else 999
+    bb_width = float((upper_bb.iloc[-1] - lower_bb.iloc[-1]) / mid.iloc[-1] * 100)
 
-    return {
-        "squeeze": bool(squeeze_now),
-        "firing": bool(squeeze_prev and not squeeze_now),
-        "dir": "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN",
-        "bar_time": hist.index[-1].isoformat(),
-        "bb_width": bb_width
-    }
-
-def is_real_squeeze_follow(hist: pd.DataFrame) -> bool:
-    return len(hist) >= 20
-
-def is_real_firing(hist: pd.DataFrame) -> bool:
-    return len(hist) >= 20
-
-def check_volume_breakout(hist: pd.DataFrame) -> dict[str, Any] | None:
-    if len(hist) < 30:
-        return None
     last = hist.iloc[-1]
-    prev = hist.iloc[-21:-1]
+    prev_20 = hist.iloc[-21:-1]
     avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
     curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
 
-    if avg_vol <= 0 or curr_vol < avg_vol * 1.2:
-        return None
+    direction = "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN"
 
-    high_prev = float(prev["High"].max())
-    low_prev = float(prev["Low"].min())
+    # حساسية خاصة للأسهم المجنونة (SNDK, MU, LITE, SMCI) لسرعة التقاط الانفجار
+    is_crazy = symbol in CRAZY_SYMBOLS
+    vol_multiplier = 1.15 if is_crazy else 1.35
 
-    if last["Close"] > high_prev:
-        return {"type": "BREAKOUT_UP", "dir": "UP", "bar_time": hist.index[-1].isoformat()}
-    if last["Close"] < low_prev:
-        return {"type": "BREAKOUT_DOWN", "dir": "DOWN", "bar_time": hist.index[-1].isoformat()}
+    high_prev = float(prev_20["High"].max())
+    low_prev = float(prev_20["Low"].min())
+
+    is_breakout_up = last["Close"] > high_prev and (curr_vol > avg_vol * vol_multiplier if avg_vol > 0 else True)
+    is_breakout_down = last["Close"] < low_prev and (curr_vol > avg_vol * vol_multiplier if avg_vol > 0 else True)
+
+    if squeeze_now:
+        return {
+            "type": "SQUEEZE",
+            "dir": direction,
+            "bar_time": hist.index[-1].isoformat(),
+            "bb_width": bb_width
+        }
+    elif is_breakout_up:
+        return {
+            "type": "BREAKOUT",
+            "dir": "UP",
+            "bar_time": hist.index[-1].isoformat(),
+            "bb_width": bb_width
+        }
+    elif is_breakout_down:
+        return {
+            "type": "BREAKOUT",
+            "dir": "DOWN",
+            "bar_time": hist.index[-1].isoformat(),
+            "bb_width": bb_width
+        }
+
     return None
 
-# ====================== الخيارات ======================
+# ====================== جلب عقود الأوبشن (يومي، أسبوعي، شهري) ======================
 def get_option_recommendations(symbol: str, stock_price: float, option_type: str) -> dict[str, dict[str, Any]]:
     if stock_price <= 0:
         return {}
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
     today = datetime.now(timezone.utc).date()
     max_expiry = today + timedelta(days=45)
-    low = stock_price * (0.85 if option_type == "CALL" else 0.78)
-    high = stock_price * (1.20 if option_type == "CALL" else 1.15)
+    low = stock_price * (0.82 if option_type == "CALL" else 0.75)
+    high = stock_price * (1.20 if option_type == "CALL" else 1.18)
 
     all_contracts: list[Any] = []
     page_token = None
@@ -309,8 +307,7 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
             request_kwargs["page_token"] = page_token
         try:
             response = trading_client.get_option_contracts(GetOptionContractsRequest(**request_kwargs))
-        except Exception as e:
-            logger.warning("خطأ جلب العقود %s: %s", symbol, e)
+        except Exception:
             break
         contracts = _field(response, "option_contracts", []) or []
         page_token = _field(response, "next_page_token")
@@ -332,8 +329,7 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
                 expiration_date_lte=max_expiry
             )
         )
-    except Exception as exc:
-        logger.warning("تعذر جلب snapshots %s: %s", symbol, exc)
+    except Exception:
         return {}
 
     if not isinstance(chain, dict):
@@ -347,18 +343,19 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if not expiry or not strike or not contract_symbol:
             continue
         days_to_expiry = (expiry - today).days
+
         if 0 <= days_to_expiry <= 7:
             bucket = "daily"
             max_spread = MAX_SPREAD_DAILY
-            max_diff = 8
+            max_diff = 10
         elif 8 <= days_to_expiry <= 14:
             bucket = "weekly"
             max_spread = MAX_SPREAD_WEEKLY
-            max_diff = 12
+            max_diff = 14
         elif 15 <= days_to_expiry <= 45:
             bucket = "monthly"
             max_spread = MAX_SPREAD_MONTHLY
-            max_diff = 16
+            max_diff = 18
         else:
             continue
 
@@ -371,9 +368,9 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if bid is None or ask is None or bid <= 0 or ask < bid:
             continue
         mid = (bid + ask) / 2
-        if not 0.20 <= mid <= 25:
+        if not 0.20 <= mid <= 30:
             continue
-        spread_pct = ((ask - bid) / mid) * 100 if mid else 1000
+        spread_pct = ((ask - bid) / mid) * 100
         if spread_pct > max_spread:
             continue
         oi = _as_float(_field(contract, "open_interest"), 0.0) or 0.0
@@ -383,7 +380,7 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if diff_pct > max_diff:
             continue
 
-        score = spread_pct + 0.3 * diff_pct - 0.45 * min(math.log1p(max(oi, 0)), 12)
+        score = spread_pct + 0.3 * diff_pct - 0.5 * min(math.log1p(max(oi, 0)), 12)
         buckets[bucket].append({
             "symbol": str(contract_symbol),
             "strike": strike,
@@ -403,15 +400,14 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
             result[bucket] = min(candidates, key=lambda x: x["score"])
     return result
 
-# ====================== الرسائل والحالة ======================
+# ====================== بناء الرسائل والحالة ======================
 def _load_state() -> dict[str, str]:
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
-    except Exception as exc:
-        logger.warning("تعذر قراءة ملف الحالة: %s", exc)
+    except Exception:
         return {}
 
 def _save_state(state: dict[str, str]) -> None:
@@ -420,8 +416,8 @@ def _save_state(state: dict[str, str]) -> None:
         temporary = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(STATE_FILE)
-    except Exception as exc:
-        logger.exception("تعذر حفظ الحالة: %s", exc)
+    except Exception:
+        pass
 
 def send_telegram(message: str) -> bool:
     try:
@@ -434,77 +430,62 @@ def send_telegram(message: str) -> bool:
     except Exception:
         return False
 
-def _option_message(label: str, opt: dict[str, Any]) -> str:
+def _option_line(label: str, opt: dict[str, Any]) -> str:
     return (
-        f"{label}\n"
-        f"📅 الانتهاء: {opt['exp']}\n"
-        f"🔹 العقد: <code>{opt['symbol']}</code>\n"
-        f"🎯 سترايك: {opt['strike']:.2f}$\n"
-        f"💵 السعر: {opt['mid']:.2f}$ (شراء {opt['bid']:.2f}$ / بيع {opt['ask']:.2f}$)\n"
+        f"{label} ({opt['exp']})\n"
+        f"💰 سترايك {opt['strike']:.2f}$ - سعره {opt['mid']:.2f}$ (شراء {opt['bid']:.2f}$ / بيع {opt['ask']:.2f}$)\n"
         f"📊 OI: {opt['oi']} | السبريد: {opt['spread_pct']:.1f}% | البعد: {opt['diff']}%\n"
+        f"🔹 العقد: <code>{opt['symbol']}</code>\n"
     )
 
-def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str, float], sq: dict[str, Any], signal_type: str = "SQUEEZE") -> str:
-    option_type = "CALL" if sq["dir"] == "UP" else "PUT"
+def build_message(symbol: str, price: float, hist: pd.DataFrame, sig: dict[str, Any]) -> str:
+    option_type = "CALL" if sig["dir"] == "UP" else "PUT"
     rsi = calc_rsi(hist)
-    sma50 = float(hist["Close"].rolling(50, min_periods=50).mean().iloc[-1]) if len(hist) >= 50 else None
-    resistance = levels["res"] if option_type == "CALL" else levels["sup"]
+    sma50 = float(hist["Close"].rolling(50, min_periods=50).mean().iloc[-1]) if len(hist) >= 50 else price
+    prior = hist.iloc[:-1].tail(20)
+    resistance = float(prior["High"].max()) if option_type == "CALL" else float(prior["Low"].min())
     stops = calc_levels(hist, price, is_put=(option_type == "PUT"))
 
-    title = "🚀 انفجار Squeeze" if signal_type == "SQUEEZE" else "💥 كسر + حجم قوي"
+    title = "⚠️ انضغاط" if sig["type"] == "SQUEEZE" else "🚀 انفجار قوي"
+    emoji = "🟢" if option_type == "CALL" else "🔴"
 
     lines = [
-        f"<b>{title} ({option_type}) — {symbol}</b>",
-        f"🕯 شمعة {BAR_MINUTES}د مكتملة",
-        f"💵 السعر: <b>{price:.2f}$</b>",
-        f"📊 RSI: {rsi:.1f}" if rsi is not None else "📊 RSI: غير متاح",
-        f"📉 متوسط 50: {sma50:.2f}$" if sma50 is not None and math.isfinite(sma50) else "📉 متوسط 50: غير كاف",
-        f"🧱 مستوى مهم: {resistance:.2f}$",
-        f"📏 عرض BB: {sq.get('bb_width', 0):.2f}%",
+        f"{title} {option_type} {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>",
+        f"📊 المتوسط 50: {sma50:.2f}$ | المستوى المهم: {resistance:.2f}$ | RSI: {rsi:.1f if rsi else 0}",
+        f"📏 عرض BB: {sig['bb_width']:.2f}%",
+        ""
     ]
+
     if stops:
         stop, t1, t2, t3 = stops
         lines.extend([
-            "",
-            f"🛑 وقف الخسارة المقترح: <b>{stop:.2f}$</b>",
-            f"🎯 أهداف: {t1:.2f}$  /  {t2:.2f}$  /  {t3:.2f}$"
+            f"🛑 وقف الخسارة: {stop:.2f}$",
+            f"🎯 هدف أول: {t1:.2f}$",
+            f"🎯 هدف ثاني: {t2:.2f}$",
+            f"🎯 هدف ثالث: {t3:.2f}$",
+            ""
         ])
 
-    try:
-        options = get_option_recommendations(symbol, price, option_type)
-    except Exception:
-        options = {}
+    options = get_option_recommendations(symbol, price, option_type)
+    labels = {
+        "daily": "🔥 عقد يومي (0-7 أيام)",
+        "weekly": "📅 عقد أسبوعي (8-14 يوم)",
+        "monthly": "🛡️ عقد شهري (15-45 يوم)"
+    }
 
-    lines.append("")
     if options:
-        labels = {
-            "daily": "⚡ عقد يومي (0-7 أيام)",
-            "weekly": "📅 عقد أسبوعي (8-14 يوم)",
-            "monthly": "🛡️ عقد شهري (15-45 يوم)"
-        }
         for b in ("daily", "weekly", "monthly"):
             if b in options:
-                lines.append(_option_message(labels[b], options[b]))
+                lines.append(_option_line(labels[b], options[b]))
     else:
-        lines.append("⚠️ لم يتم العثور على عقد مناسب حسب الفلاتر.")
+        lines.append("⚠️ لم يتم العثور على عقد مناسب ضمن الشروط الحالية.")
 
     lines.append("\n⚠️ تنبيه تعليمي فقط - الخيارات عالية المخاطر.")
     return "\n".join(lines)
 
-def build_watch_alert(symbol: str, price: float, hist: pd.DataFrame, sq: dict[str, Any]) -> str:
-    rsi = calc_rsi(hist)
-    rsi_text = f"{rsi:.1f}" if rsi is not None else "غير متاح"
-    return (
-        f"👀 <b>متابعة انضغاط (Squeeze) — {symbol}</b>\n"
-        f"🕯 {BAR_MINUTES} دقائق | السعر: {price:.2f}$\n"
-        f"RSI: {rsi_text} | عرض BB: {sq.get('bb_width', 0):.2f}%\n"
-        f"الميل الحالي: {'CALL' if sq['dir'] == 'UP' else 'PUT'}\n\n"
-        f"السهم في حالة انضغاط، استعد للانفجار القادم."
-    )
-
 # ====================== الحلقة الرئيسية ======================
 def _prune_state(state: dict[str, str]) -> dict[str, str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
     kept = {}
     for key, value in state.items():
         try:
@@ -522,9 +503,9 @@ def main_loop() -> None:
     last_heartbeat = datetime.now(timezone.utc)
 
     send_telegram(
-        "✅ <b>بوت الانضغاط والانفجار اشتغل</b>\n"
-        f"الأسهم: {len(SYMBOLS)} | فريم: {BAR_MINUTES} دقائق\n"
-        "تم تفعيل رصد الانضغاط وتنبيهات الانفجار بنجاح."
+        "✅ <b>تم تشغيل البوت بنجاح</b>\n"
+        f"مراقبة {len(SYMBOLS)} شركة (متضمنة الأسهم المجنونة باحترافية).\n"
+        "إرسال العقود الثلاثة (يومي، أسبوعي، شهري) بدون تكرار."
     )
 
     while True:
@@ -545,59 +526,21 @@ def main_loop() -> None:
                     if hist is None or price is None or len(hist) < 30:
                         continue
 
-                    sq = check_squeeze(hist)
-                    if sq:
-                        watch_key = f"watch:{symbol}:{sq['bar_time']}"
-                        fire_key = f"fire:{symbol}:{sq['bar_time']}"
-
-                        # 1. إرسال الانضغاط (Watch)
-                        if sq["squeeze"] and watch_key not in state:
-                            msg = build_watch_alert(symbol, price, hist, sq)
+                    sig = check_signal(symbol, hist)
+                    if sig:
+                        signal_key = f"{symbol}:{sig['type']}:{sig['dir']}:{sig['bar_time']}"
+                        if signal_key not in state:
+                            msg = build_message(symbol, price, hist, sig)
                             if send_telegram(msg):
-                                state[watch_key] = sq["bar_time"]
-                                _save_state(state)
-                                logger.info("Watch Squeeze sent: %s", symbol)
-
-                        # 2. إرسال الانفجار (Firing)
-                        if sq["firing"] and fire_key not in state:
-                            prior = hist.iloc[:-1].tail(20)
-                            levels = {
-                                "res": float(prior["High"].max()),
-                                "sup": float(prior["Low"].min())
-                            }
-                            message = build_alert(symbol, price, hist, levels, sq, "SQUEEZE")
-                            if send_telegram(message):
-                                state[fire_key] = sq["bar_time"]
+                                state[signal_key] = sig["bar_time"]
                                 _save_state(state)
                                 signals_today += 1
-                                logger.info("Squeeze Fire sent: %s", symbol)
+                                logger.info("Signal sent for %s: %s", symbol, sig['type'])
 
-                    # 3. حجم قوي Breakout
-                    br = check_volume_breakout(hist)
-                    if br:
-                        br_key = f"break:{symbol}:{br['bar_time']}"
-                        if br_key not in state:
-                            prior = hist.iloc[:-1].tail(20)
-                            levels = {
-                                "res": float(prior["High"].max()),
-                                "sup": float(prior["Low"].min())
-                            }
-                            fake_sq = {
-                                "dir": br["dir"],
-                                "bar_time": br["bar_time"],
-                                "bb_width": 0
-                            }
-                            message = build_alert(symbol, price, hist, levels, fake_sq, "BREAKOUT")
-                            if send_telegram(message):
-                                state[br_key] = br["bar_time"]
-                                _save_state(state)
-                                signals_today += 1
-                                logger.info("Breakout sent: %s", symbol)
-
-                    time.sleep(0.4)
+                    time.sleep(0.3)
 
                 except Exception as exc:
-                    logger.exception("خطأ في %s: %s", symbol, exc)
+                    logger.exception("خطأ في معالجة %s: %s", symbol, exc)
 
             now = datetime.now(timezone.utc)
             if (now - last_heartbeat).total_seconds() > 3600:
@@ -607,19 +550,18 @@ def main_loop() -> None:
             time.sleep(POLL_SECONDS)
 
         except Exception as exc:
-            logger.exception("خطأ في الدورة الرئيسية: %s", exc)
-            time.sleep(20)
+                    logger.exception("خطأ في الحلقة الرئيسية: %s", exc)
+                    time.sleep(20)
 
 @app.get("/")
 def home():
-    return "Bot OK - Squeeze + Breakout Active"
+    return "Bot OK - Active & Optimized"
 
 @app.get("/health")
 def health():
     return jsonify({
         "status": "ok",
         "symbols": len(SYMBOLS),
-        "bar_minutes": BAR_MINUTES,
         "market_open": is_market_open()
     })
 
