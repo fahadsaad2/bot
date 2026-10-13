@@ -1,8 +1,6 @@
 """
 تنبيهات Squeeze + Breakout للأسهم الأمريكية عبر Alpaca وTelegram.
-مهم: هذا البوت يرسل تنبيهات تحليلية فقط، ولا ينفذ أوامر تداول.
-الإشارات تعتمد على شموع مكتملة مدتها 5 دقائق.
-نسخة محسّنة
+محدث لإرسال الانضغاط والانفجار بمرونة أكبر.
 """
 from __future__ import annotations
 
@@ -37,25 +35,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 
-# نفس الأسهم الـ 19 الأصلية بالضبط
 TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
 TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
 SYMBOLS = TIER1 + TIER2
 
 BAR_MINUTES = 5
 TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
-POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "45")))
+POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "30")))
 HISTORY_DAYS = max(8, int(os.getenv("HISTORY_DAYS", "12")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "squeeze_state.json"))
 
-# عتبات قابلة للتعديل
-MIN_SQUEEZE_BARS = int(os.getenv("MIN_SQUEEZE_BARS", "2"))
-VOLUME_MULT = float(os.getenv("VOLUME_MULT", "1.15"))
-BODY_ATR_MULT = float(os.getenv("BODY_ATR_MULT", "0.35"))
-MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "25"))
-MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "30"))
-MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "35"))
-MIN_OI = int(os.getenv("MIN_OI", "300"))
+# عتبات مخففة عشان يلقر فرصة أسرع
+MIN_SQUEEZE_BARS = int(os.getenv("MIN_SQUEEZE_BARS", "1"))
+VOLUME_MULT = float(os.getenv("VOLUME_MULT", "1.05"))
+BODY_ATR_MULT = float(os.getenv("BODY_ATR_MULT", "0.20"))
+MAX_SPREAD_DAILY = float(os.getenv("MAX_SPREAD_DAILY", "30"))
+MAX_SPREAD_WEEKLY = float(os.getenv("MAX_SPREAD_WEEKLY", "35"))
+MAX_SPREAD_MONTHLY = float(os.getenv("MAX_SPREAD_MONTHLY", "40"))
+MIN_OI = int(os.getenv("MIN_OI", "150"))
 
 US_EASTERN = ZoneInfo("America/New_York")
 
@@ -260,44 +257,10 @@ def check_squeeze(hist: pd.DataFrame) -> dict[str, Any] | None:
     }
 
 def is_real_squeeze_follow(hist: pd.DataFrame) -> bool:
-    if len(hist) < 30:
-        return False
-    close = hist["Close"]
-    mid = close.rolling(20).mean()
-    std = close.rolling(20).std(ddof=0)
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        hist["High"] - hist["Low"],
-        (hist["High"] - prev_close).abs(),
-        (hist["Low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(20).mean()
-    upper_bb = mid + 2 * std
-    lower_bb = mid - 2 * std
-    upper_kc = mid + 1.5 * atr
-    lower_kc = mid - 1.5 * atr
-
-    count = 0
-    for i in range(1, MIN_SQUEEZE_BARS + 2):
-        try:
-            if lower_bb.iloc[-i] > lower_kc.iloc[-i] and upper_bb.iloc[-i] < upper_kc.iloc[-i]:
-                count += 1
-        except Exception:
-            break
-    return count >= MIN_SQUEEZE_BARS
+    return len(hist) >= 20
 
 def is_real_firing(hist: pd.DataFrame) -> bool:
-    if len(hist) < 25:
-        return False
-    last = hist.iloc[-1]
-    avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
-    curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
-    vol_ok = curr_vol > avg_vol * VOLUME_MULT if avg_vol > 0 else True
-
-    body = abs(float(last["Close"] - last["Open"]))
-    atr = calc_atr(hist)
-    body_ok = body > (atr * BODY_ATR_MULT) if atr else True
-    return vol_ok and body_ok
+    return len(hist) >= 20
 
 def check_volume_breakout(hist: pd.DataFrame) -> dict[str, Any] | None:
     if len(hist) < 30:
@@ -307,15 +270,15 @@ def check_volume_breakout(hist: pd.DataFrame) -> dict[str, Any] | None:
     avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
     curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
 
-    if avg_vol <= 0 or curr_vol < avg_vol * 1.8:
+    if avg_vol <= 0 or curr_vol < avg_vol * 1.2:
         return None
 
     high_prev = float(prev["High"].max())
     low_prev = float(prev["Low"].min())
 
-    if last["Close"] > high_prev and last["Close"] > last["Open"]:
+    if last["Close"] > high_prev:
         return {"type": "BREAKOUT_UP", "dir": "UP", "bar_time": hist.index[-1].isoformat()}
-    if last["Close"] < low_prev and last["Close"] < last["Open"]:
+    if last["Close"] < low_prev:
         return {"type": "BREAKOUT_DOWN", "dir": "DOWN", "bar_time": hist.index[-1].isoformat()}
     return None
 
@@ -326,8 +289,8 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
     today = datetime.now(timezone.utc).date()
     max_expiry = today + timedelta(days=45)
-    low = stock_price * (0.88 if option_type == "CALL" else 0.82)
-    high = stock_price * (1.18 if option_type == "CALL" else 1.12)
+    low = stock_price * (0.85 if option_type == "CALL" else 0.78)
+    high = stock_price * (1.20 if option_type == "CALL" else 1.15)
 
     all_contracts: list[Any] = []
     page_token = None
@@ -387,15 +350,15 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if 0 <= days_to_expiry <= 7:
             bucket = "daily"
             max_spread = MAX_SPREAD_DAILY
-            max_diff = 6
+            max_diff = 8
         elif 8 <= days_to_expiry <= 14:
             bucket = "weekly"
             max_spread = MAX_SPREAD_WEEKLY
-            max_diff = 8
+            max_diff = 12
         elif 15 <= days_to_expiry <= 45:
             bucket = "monthly"
             max_spread = MAX_SPREAD_MONTHLY
-            max_diff = 12
+            max_diff = 16
         else:
             continue
 
@@ -408,7 +371,7 @@ def get_option_recommendations(symbol: str, stock_price: float, option_type: str
         if bid is None or ask is None or bid <= 0 or ask < bid:
             continue
         mid = (bid + ask) / 2
-        if not 0.30 <= mid <= 18:
+        if not 0.20 <= mid <= 25:
             continue
         spread_pct = ((ask - bid) / mid) * 100 if mid else 1000
         if spread_pct > max_spread:
@@ -488,7 +451,7 @@ def build_alert(symbol: str, price: float, hist: pd.DataFrame, levels: dict[str,
     resistance = levels["res"] if option_type == "CALL" else levels["sup"]
     stops = calc_levels(hist, price, is_put=(option_type == "PUT"))
 
-    title = "🚀 انطلاق Squeeze" if signal_type == "SQUEEZE" else "💥 كسر + حجم قوي"
+    title = "🚀 انفجار Squeeze" if signal_type == "SQUEEZE" else "💥 كسر + حجم قوي"
 
     lines = [
         f"<b>{title} ({option_type}) — {symbol}</b>",
@@ -532,16 +495,16 @@ def build_watch_alert(symbol: str, price: float, hist: pd.DataFrame, sq: dict[st
     rsi = calc_rsi(hist)
     rsi_text = f"{rsi:.1f}" if rsi is not None else "غير متاح"
     return (
-        f"👀 <b>متابعة ضغط — {symbol}</b>\n"
+        f"👀 <b>متابعة انضغاط (Squeeze) — {symbol}</b>\n"
         f"🕯 {BAR_MINUTES} دقائق | السعر: {price:.2f}$\n"
         f"RSI: {rsi_text} | عرض BB: {sq.get('bb_width', 0):.2f}%\n"
         f"الميل الحالي: {'CALL' if sq['dir'] == 'UP' else 'PUT'}\n\n"
-        f"السهم في منطقة ضغط، راقب الانطلاق."
+        f"السهم في حالة انضغاط، استعد للانفجار القادم."
     )
 
 # ====================== الحلقة الرئيسية ======================
 def _prune_state(state: dict[str, str]) -> dict[str, str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=5)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
     kept = {}
     for key, value in state.items():
         try:
@@ -559,9 +522,9 @@ def main_loop() -> None:
     last_heartbeat = datetime.now(timezone.utc)
 
     send_telegram(
-        "✅ <b>بوت Squeeze + Breakout المحسّن اشتغل</b>\n"
+        "✅ <b>بوت الانضغاط والانفجار اشتغل</b>\n"
         f"الأسهم: {len(SYMBOLS)} | فريم: {BAR_MINUTES} دقائق\n"
-        "الشروط مخففة قليلاً عشان يطلع تنبيهات مفيدة."
+        "تم تفعيل رصد الانضغاط وتنبيهات الانفجار بنجاح."
     )
 
     while True:
@@ -582,36 +545,34 @@ def main_loop() -> None:
                     if hist is None or price is None or len(hist) < 30:
                         continue
 
-                    # 1. Squeeze
                     sq = check_squeeze(hist)
                     if sq:
-                        watch_key = f"watch:{symbol}"
-                        fire_key = f"fire:{symbol}"
+                        watch_key = f"watch:{symbol}:{sq['bar_time']}"
+                        fire_key = f"fire:{symbol}:{sq['bar_time']}"
 
+                        # 1. إرسال الانضغاط (Watch)
                         if sq["squeeze"] and watch_key not in state:
-                            if is_real_squeeze_follow(hist):
-                                msg = build_watch_alert(symbol, price, hist, sq)
-                                if send_telegram(msg):
-                                    state[watch_key] = sq["bar_time"]
-                                    _save_state(state)
-                                    logger.info("Watch sent: %s", symbol)
+                            msg = build_watch_alert(symbol, price, hist, sq)
+                            if send_telegram(msg):
+                                state[watch_key] = sq["bar_time"]
+                                _save_state(state)
+                                logger.info("Watch Squeeze sent: %s", symbol)
 
-                        if sq["firing"] and state.get(fire_key) != sq["bar_time"]:
-                            if is_real_firing(hist):
-                                prior = hist.iloc[:-1].tail(20)
-                                levels = {
-                                    "res": float(prior["High"].max()),
-                                    "sup": float(prior["Low"].min())
-                                }
-                                message = build_alert(symbol, price, hist, levels, sq, "SQUEEZE")
-                                if send_telegram(message):
-                                    state[fire_key] = sq["bar_time"]
-                                    state.pop(watch_key, None)
-                                    _save_state(state)
-                                    signals_today += 1
-                                    logger.info("Squeeze Fire: %s", symbol)
+                        # 2. إرسال الانفجار (Firing)
+                        if sq["firing"] and fire_key not in state:
+                            prior = hist.iloc[:-1].tail(20)
+                            levels = {
+                                "res": float(prior["High"].max()),
+                                "sup": float(prior["Low"].min())
+                            }
+                            message = build_alert(symbol, price, hist, levels, sq, "SQUEEZE")
+                            if send_telegram(message):
+                                state[fire_key] = sq["bar_time"]
+                                _save_state(state)
+                                signals_today += 1
+                                logger.info("Squeeze Fire sent: %s", symbol)
 
-                    # 2. Volume Breakout
+                    # 3. حجم قوي Breakout
                     br = check_volume_breakout(hist)
                     if br:
                         br_key = f"break:{symbol}:{br['bar_time']}"
@@ -631,14 +592,13 @@ def main_loop() -> None:
                                 state[br_key] = br["bar_time"]
                                 _save_state(state)
                                 signals_today += 1
-                                logger.info("Breakout: %s", symbol)
+                                logger.info("Breakout sent: %s", symbol)
 
                     time.sleep(0.4)
 
                 except Exception as exc:
                     logger.exception("خطأ في %s: %s", symbol, exc)
 
-            # Heartbeat كل ساعة
             now = datetime.now(timezone.utc)
             if (now - last_heartbeat).total_seconds() > 3600:
                 send_telegram(f"💓 البوت شغال | إشارات اليوم: {signals_today}")
@@ -652,7 +612,7 @@ def main_loop() -> None:
 
 @app.get("/")
 def home():
-    return "Bot OK - Improved Squeeze + Breakout"
+    return "Bot OK - Squeeze + Breakout Active"
 
 @app.get("/health")
 def health():
