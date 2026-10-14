@@ -1,17 +1,14 @@
 """
-ماسح الانضغاط والانفجار - تقرير كل 60 دقيقة لكل سهم
-5m + 15m + Daily - نفس الشركات
+تنبيهات Squeeze + Breakout - النسخة ثلاثية الفريمات بدرجات
+5m + 15m + Daily - بدون حذف شركات ولا تغيير رسالة
 
-كل ساعة، لكل سهم يرسل:
-- قوة الانضغاط (0-100)
-- قوة الانفجار (0-100)
-- الفوليوم النسبي الحقيقي (اليوم + آخر 15 دقيقة)
-- الاتجاه المرجّح من الفريمات الثلاثة
-- أفضل عقد يومي وأسبوعي وشهري مع فوليوم العقد و OI
-
-ملاحظة عن البيانات: الخطة المجانية في Alpaca تعطي فوليوم IEX فقط (جزء صغير من السوق).
-لذلك الأرقام النسبية (× المعتاد) تبقى مفيدة، لكن الأرقام المطلقة أقل من الواقع.
-لاستخدام بيانات SIP الكاملة (تحتاج اشتراك) ضع STOCK_FEED=sip في المتغيرات.
+التعديلات في هذه النسخة:
+1) إصلاح خطأ صيغة RSI في الرسالة (كان يمنع إرسال أي تنبيه)
+2) حذف limit=1000 لأن Alpaca يحسبه على مجموع الرموز فتضيع بيانات أغلب الشركات
+3) تخفيف فلاتر العقود (سبريد، OI، نطاق السعر، البعد عن السعر)
+4) قراءة الفوليوم من الشمعة اليومية للعقد
+5) إضافة مؤشر النشاط غير العادي (الفوليوم مقارنة بـ OI) ورفع ترتيب هذه العقود
+6) إظهار الأخطاء في اللوق بدل ابتلاعها بصمت
 """
 from __future__ import annotations
 import json, logging, math, os, time
@@ -23,7 +20,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 from flask import Flask, jsonify
-from alpaca.data.enums import DataFeed
 from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest, StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -37,32 +33,28 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 
-# الشركات (نفس القائمة بدون تغيير)
+# الشركات (نفس القائمة بدون أي تغيير)
 TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
 TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
 SYMBOLS = TIER1 + TIER2
+CRAZY_SYMBOLS = {"SNDK", "MU", "LITE", "SMCI"}
 
+BAR_MINUTES = 5
 TIMEFRAME_5M = TimeFrame(5, TimeFrameUnit.Minute)
 TIMEFRAME_15M = TimeFrame(15, TimeFrameUnit.Minute)
 TIMEFRAME_1D = TimeFrame(1, TimeFrameUnit.Day)
+POLL_SECONDS = max(15, int(os.getenv("POLL_SECONDS", "20")))
 HISTORY_DAYS = 10
 STATE_FILE = Path("squeeze_state.json")
 
-REPORT_EVERY_MINUTES = int(os.getenv("REPORT_EVERY_MINUTES", "60"))   # الفاصل بين تقارير كل سهم
-MIN_REPORT_SCORE = int(os.getenv("MIN_REPORT_SCORE", "0"))            # 0 = أرسل كل الأسهم، ارفعه لتصفية الضعيف
-SEND_GAP_SECONDS = 3.5                                                # فاصل بين الرسائل (حد تيليجرام)
-
-_feed_env = os.getenv("STOCK_FEED", "").strip().lower()
-STOCK_FEED = DataFeed.SIP if _feed_env == "sip" else DataFeed.IEX if _feed_env == "iex" else None
-
-# فلاتر العقود
+# فلاتر العقود (مخففة)
 MAX_SPREAD_DAILY = 60
 MAX_SPREAD_WEEKLY = 60
 MAX_SPREAD_MONTHLY = 60
 MIN_OI = 10
-MIN_MID = 0.5
-MAX_MID = 15.0
-MAX_DIFF_PCT = 8
+MIN_MID = 0.5        # أقل سعر للعقد
+MAX_MID = 15.0       # أعلى سعر للعقد
+MAX_DIFF_PCT = 8     # أقصى بعد للسترايك عن سعر السهم (%)
 US_EASTERN = ZoneInfo("America/New_York")
 
 app = Flask(__name__)
@@ -126,31 +118,29 @@ def _bar_frame_multi(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 
 # ===================== جلب بيانات السوق =====================
-def _fetch_frames(symbols, timeframe, days):
+def _fetch_frames(timeframe, days):
+    """يجلب الشموع لكل الرموز بدون limit حتى لا تُقطع البيانات"""
     now = datetime.now(timezone.utc)
-    kwargs = {"symbol_or_symbols": symbols, "timeframe": timeframe, "start": now - timedelta(days=days)}
-    if STOCK_FEED is not None:
-        kwargs["feed"] = STOCK_FEED
-    raw = stock_client.get_stock_bars(StockBarsRequest(**kwargs)).df
+    bar_set = stock_client.get_stock_bars(
+        StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=timeframe, start=now - timedelta(days=days))
+    )
+    raw = bar_set.df
     out = {}
-    for s in symbols:
+    for s in SYMBOLS:
         f = _bar_frame_multi(raw, s)
         if not f.empty:
             out[s] = f
     return out
 
 
-def fetch_market_data(symbols):
-    h5 = _fetch_frames(symbols, TIMEFRAME_5M, HISTORY_DAYS)
-    h15 = _fetch_frames(symbols, TIMEFRAME_15M, HISTORY_DAYS)
-    hD = _fetch_frames(symbols, TIMEFRAME_1D, 60)
+def fetch_market_data():
+    h5 = _fetch_frames(TIMEFRAME_5M, HISTORY_DAYS)
+    h15 = _fetch_frames(TIMEFRAME_15M, HISTORY_DAYS)
+    hD = _fetch_frames(TIMEFRAME_1D, 60)
     prices = {}
     try:
-        kwargs = {"symbol_or_symbols": symbols}
-        if STOCK_FEED is not None:
-            kwargs["feed"] = STOCK_FEED
-        latest = stock_client.get_stock_latest_trade(StockLatestTradeRequest(**kwargs))
-        for s in symbols:
+        latest = stock_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=SYMBOLS))
+        for s in SYMBOLS:
             t = latest.get(s) if isinstance(latest, dict) else None
             p = _as_float(_field(t, "price"))
             if p and p > 0:
@@ -197,120 +187,42 @@ def calc_levels(hist, entry, is_put=False):
     return tuple(round(x, 2) for x in vals)
 
 
-# ===================== قوة الانضغاط =====================
-def squeeze_metrics(hist, n=20):
-    """
-    قوة الانضغاط من 0 إلى 100 تعتمد على:
-    - 40%: ضيق عرض البولنجر مقارنة بآخر 10 أيام
-    - 40%: عدد الشموع المتتالية داخل الانضغاط (بولنجر داخل كيلتنر)
-    - 20%: نسبة عرض البولنجر إلى كيلتنر (كلما قلت زاد الانضغاط)
-    """
-    if hist is None or len(hist) < n + 30:
+# ===================== إشارة الانضغاط / الانفجار =====================
+def check_signal(symbol, hist):
+    if len(hist) < 25:
         return None
     close = hist["Close"]
-    mid = close.rolling(n).mean()
-    std = close.rolling(n).std(ddof=0)
-    pc = close.shift(1)
-    tr = pd.concat([hist["High"] - hist["Low"], (hist["High"] - pc).abs(), (hist["Low"] - pc).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(n).mean()
-    ub, lb = mid + 2 * std, mid - 2 * std
-    uk, lk = mid + 1.5 * atr, mid - 1.5 * atr
-    in_sq = (lb > lk) & (ub < uk)
-    width = (ub - lb) / mid * 100
-    kcw = (uk - lk) / mid * 100
-    valid = width.dropna()
-    if valid.empty or pd.isna(kcw.iloc[-1]) or kcw.iloc[-1] <= 0:
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std(ddof=0)
+    prev_close = close.shift(1)
+    tr = pd.concat([hist["High"] - hist["Low"], (hist["High"] - prev_close).abs(), (hist["Low"] - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(20).mean()
+    upper_bb = mid + 2 * std
+    lower_bb = mid - 2 * std
+    upper_kc = mid + 1.5 * atr
+    lower_kc = mid - 1.5 * atr
+    if any(pd.isna([upper_bb.iloc[-1], lower_bb.iloc[-1], upper_kc.iloc[-1], lower_kc.iloc[-1]])):
         return None
-    cur = float(valid.iloc[-1])
-    pct = float((valid <= cur).mean())          # قريب من 0 = ضيق جداً
-    bars = 0
-    for v in reversed(in_sq.values):
-        if v:
-            bars += 1
-        else:
-            break
-    ratio = float(width.iloc[-1] / kcw.iloc[-1])
-    score = (
-        0.4 * (1 - pct) * 100
-        + 0.4 * min(bars / 15, 1) * 100
-        + 0.2 * max(0.0, min(1.0, (1 - ratio) / 0.3)) * 100
-    )
-    return {"in_squeeze": bool(in_sq.iloc[-1]), "bars": bars, "tight_pct": (1 - pct) * 100, "score": int(round(score))}
-
-
-# ===================== قوة الانفجار =====================
-def breakout_metrics(hist, direction):
-    """
-    قوة الانفجار من 0 إلى 100 تعتمد على:
-    - 40%: الفوليوم النسبي (آخر 3 شموع مقابل متوسط 20 شمعة)، الحد الأعلى عند ضعفين
-    - 35%: القرب من كسر أعلى/أسفل آخر 20 شمعة (أو الكسر الفعلي)
-    - 25%: إغلاق الشمعة الأخيرة قرب قمتها (صعود) أو قاعها (هبوط)
-    """
-    if hist is None or len(hist) < 25 or "Volume" not in hist.columns:
-        return None
+    squeeze_now = lower_bb.iloc[-1] > lower_kc.iloc[-1] and upper_bb.iloc[-1] < upper_kc.iloc[-1]
+    bb_width = float((upper_bb.iloc[-1] - lower_bb.iloc[-1]) / mid.iloc[-1] * 100)
     last = hist.iloc[-1]
-    prior = hist.iloc[-21:-1]
-    atr = calc_atr(hist)
-    avg_vol = float(prior["Volume"].mean())
-    rec_vol = float(hist["Volume"].tail(3).mean())
-    rvol = rec_vol / avg_vol if avg_vol > 0 else 0.0
-    hi, lo = float(prior["High"].max()), float(prior["Low"].min())
-    price = float(last["Close"])
-    if direction == "UP":
-        broke = price > hi
-        dist = (hi - price) / atr if atr else 99.0
-    else:
-        broke = price < lo
-        dist = (price - lo) / atr if atr else 99.0
-    rng = float(last["High"] - last["Low"])
-    pos = (price - float(last["Low"])) / rng if rng > 0 else 0.5
-    align = pos if direction == "UP" else 1 - pos
-    prox = 1.0 if broke else max(0.0, 1 - max(dist, 0) / 2)
-    score = 40 * min(rvol / 2, 1) + 35 * prox + 25 * align
-    return {"rvol": rvol, "broke": broke, "dist": max(dist, 0), "score": int(round(score))}
-
-
-def day_rvol(hD, symbol):
-    """فوليوم اليوم حتى الآن مقابل المتوسط اليومي (20 يوم) بعد تعديله بنسبة الوقت المنقضي من الجلسة"""
-    f = hD.get(symbol)
-    if f is None or len(f) < 6:
-        return None
-    now_et = datetime.now(US_EASTERN)
-    if f.index[-1].date() != now_et.date():
-        return None
-    avg = float(f["Volume"].iloc[-21:-1].mean())
-    if avg <= 0:
-        return None
-    open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    elapsed = (now_et - open_et).total_seconds() / 60
-    frac = min(max(elapsed, 5) / 390, 1.0)
-    return float(f["Volume"].iloc[-1]) / (avg * frac)
-
-
-# ===================== الاتجاه المرجّح من الفريمات =====================
-def pick_direction(symbol, h5, h15, hD):
-    up = total = 0
-    try:
-        c = h5[symbol]["Close"]
-        total += 1
-        up += 1 if c.iloc[-1] >= c.rolling(20).mean().iloc[-1] else 0
-    except Exception:
-        pass
-    try:
-        if len(h15[symbol]) >= 30:
-            c = h15[symbol]["Close"]
-            total += 1
-            up += 1 if c.ewm(span=9).mean().iloc[-1] > c.ewm(span=20).mean().iloc[-1] else 0
-    except Exception:
-        pass
-    try:
-        if len(hD[symbol]) >= 50:
-            c = hD[symbol]["Close"]
-            total += 1
-            up += 1 if c.iloc[-1] > c.ewm(span=50).mean().iloc[-1] else 0
-    except Exception:
-        pass
-    return "UP" if up * 2 >= total else "DOWN"
+    prev_20 = hist.iloc[-21:-1]
+    avg_vol = hist["Volume"].tail(20).mean() if "Volume" in hist.columns else 0
+    curr_vol = float(last["Volume"]) if "Volume" in hist.columns else 0
+    direction = "UP" if close.iloc[-1] >= mid.iloc[-1] else "DOWN"
+    is_crazy = symbol in CRAZY_SYMBOLS
+    vol_multiplier = 0.8 if is_crazy else 0.9
+    high_prev = float(prev_20["High"].max())
+    low_prev = float(prev_20["Low"].min())
+    is_breakout_up = last["Close"] > high_prev and (curr_vol > avg_vol * vol_multiplier if avg_vol > 0 else True)
+    is_breakout_down = last["Close"] < low_prev and (curr_vol > avg_vol * vol_multiplier if avg_vol > 0 else True)
+    if is_breakout_up:
+        return {"type": "BREAKOUT", "dir": "UP", "bar_time": hist.index[-1].isoformat(), "bb_width": bb_width}
+    if is_breakout_down:
+        return {"type": "BREAKOUT", "dir": "DOWN", "bar_time": hist.index[-1].isoformat(), "bb_width": bb_width}
+    if squeeze_now:
+        return {"type": "SQUEEZE", "dir": direction, "bar_time": hist.index[-1].isoformat(), "bb_width": bb_width}
+    return None
 
 
 def get_trend_strength(symbol, h5, h15, hD, sig_dir):
@@ -345,7 +257,7 @@ def get_trend_strength(symbol, h5, h15, hD, sig_dir):
                 details.append("15m عكس")
     except Exception as e:
         logger.warning(f"خطأ فريم 15 دقيقة {symbol}: {e}")
-    details.insert(0, "5m")
+    details.insert(0, "5m انفجار")
     return score, details
 
 
@@ -435,11 +347,13 @@ def get_option_recommendations(symbol, stock_price, option_type):
         oi = _as_float(_field(contract, "open_interest"), 0) or 0
         if oi < MIN_OI:
             continue
+        # الفوليوم من الشمعة اليومية للعقد
         daily = _field(snap, "daily_bar")
         vol = (_as_float(_field(daily, "volume"), 0) if daily else 0) or 0
         diff_pct = abs(strike - stock_price) / stock_price * 100
         if diff_pct > MAX_DIFF_PCT:
             continue
+        # مؤشر النشاط غير العادي: فوليوم أعلى من OI يعني مراكز جديدة
         ratio = vol / max(oi, 1)
         unusual = " 🔥 نشاط غير عادي" if ratio >= 2 and vol >= 100 else ""
         whale_tag = (" 🐋 دخول حيتان" if vol > 5000 or oi > 10000 else "") + unusual
@@ -475,32 +389,6 @@ def _save_state(state):
         logger.warning(f"فشل حفظ الحالة: {e}")
 
 
-def _prune_state(state):
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
-    kept = {}
-    for k, v in state.items():
-        try:
-            stamp = datetime.fromisoformat(v.replace("Z", "+00:00"))
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=timezone.utc)
-            if stamp >= cutoff:
-                kept[k] = v
-        except Exception:
-            continue
-    return kept
-
-
-def _last_sent(state, symbol):
-    v = state.get(f"sent:{symbol}")
-    if not v:
-        return None
-    try:
-        d = datetime.fromisoformat(v.replace("Z", "+00:00"))
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
 def send_telegram(msg):
     try:
         r = requests.post(
@@ -525,52 +413,27 @@ def _option_line(label, opt):
     )
 
 
-def _strength_label(score):
-    if score >= 70:
-        return "قوي 🔥"
-    if score >= 40:
-        return "متوسط"
-    return "ضعيف"
-
-
-# ===================== بناء التقرير =====================
-def build_report(symbol, price, hist, direction, sq, bo, drvol, trend_score, trend_details):
-    option_type = "CALL" if direction == "UP" else "PUT"
-    emoji = "🟢" if option_type == "CALL" else "🔴"
+# ===================== بناء الرسالة (نفس الشكل) =====================
+def build_message(symbol, price, hist, sig, score=1, trend_details=None):
+    option_type = "CALL" if sig["dir"] == "UP" else "PUT"
     rsi = calc_rsi(hist)
-    rsi_txt = f"{rsi:.1f}" if rsi is not None else "N/A"
+    rsi_txt = f"{rsi:.1f}" if rsi is not None else "N/A"   # إصلاح خطأ الصيغة
     sma50 = float(hist["Close"].rolling(50, min_periods=50).mean().iloc[-1]) if len(hist) >= 50 else price
     prior = hist.iloc[:-1].tail(20)
     resistance = float(prior["High"].max()) if option_type == "CALL" else float(prior["Low"].min())
     stops = calc_levels(hist, price, is_put=(option_type == "PUT"))
+    if score == 3:
+        title = f"🚀🚀🚀 انفجار ثلاثي مؤكد {option_type} 🔥🔥🔥 [3/3]"
+    elif score == 2:
+        title = f"🚀🚀 انفجار جيد {option_type} ⭐⭐ [2/3]"
+    else:
+        base = "⚠️ انضغاط" if sig["type"] == "SQUEEZE" else "🚀 انفجار قوي"
+        title = f"{base} {option_type} ⚡ [1/3]"
+    emoji = "🟢" if option_type == "CALL" else "🔴"
     gamma_bar = round(price * 1.035, 2) if option_type == "CALL" else round(price * 0.965, 2)
-
-    lines = [f"📡 تقرير الساعة {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>"]
-
-    if sq:
-        state_txt = f"منضغط منذ {sq['bars']} شمعة" if sq["in_squeeze"] else "غير منضغط حالياً"
-        lines.append(
-            f"🗜️ قوة الانضغاط: <b>{sq['score']}/100</b> ({_strength_label(sq['score'])}) - {state_txt} | "
-            f"أضيق من {sq['tight_pct']:.0f}% من آخر 10 أيام"
-        )
-    else:
-        lines.append("🗜️ قوة الانضغاط: بيانات غير كافية")
-
-    if bo:
-        status = "تم الكسر ✅" if bo["broke"] else f"يبعد {bo['dist']:.1f} ATR عن الكسر"
-        lines.append(f"💥 قوة الانفجار: <b>{bo['score']}/100</b> ({_strength_label(bo['score'])}) - {status}")
-    else:
-        lines.append("💥 قوة الانفجار: بيانات غير كافية")
-
-    vol_parts = []
-    if drvol is not None:
-        vol_parts.append(f"اليوم {drvol:.1f}× المعتاد")
-    if bo:
-        vol_parts.append(f"آخر 15 دقيقة {bo['rvol']:.1f}× المعتاد")
-    if vol_parts:
-        lines.append(f"📊 الفوليوم: {' | '.join(vol_parts)}")
-
-    lines.append(f"🧭 الاتجاه المرجّح: {option_type} | الفريمات: {' + '.join(trend_details)} | القوة {trend_score}/3")
+    lines = [f"{title} {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>"]
+    if trend_details:
+        lines.append(f"📈 الفريمات: {' + '.join(trend_details)} | القوة {score}/3")
     lines.extend([
         f"📊 المتوسط 50: {sma50:.2f}$ | المقاومة: {resistance:.2f}$ | RSI: {rsi_txt}",
         f"🧱 حاجز غاما: {gamma_bar}$",
@@ -603,57 +466,60 @@ def build_report(symbol, price, hist, direction, sq, bo, drvol, trend_score, tre
     return "\n".join(lines)
 
 
+def _prune_state(state):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+    kept = {}
+    for k, v in state.items():
+        try:
+            stamp = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if stamp >= cutoff:
+                kept[k] = v
+        except Exception:
+            continue
+    return kept
+
+
 # ===================== الحلقة الرئيسية =====================
 def main_loop():
     state = _prune_state(_load_state())
     last_heartbeat = datetime.now(timezone.utc)
     send_telegram(
-        "✅ <b>تم تشغيل الماسح الساعي</b>\n"
+        "✅ <b>تم تشغيل النسخة الثلاثية</b>\n"
         f"مراقبة {len(SYMBOLS)} شركة - 5m+15m+Daily\n"
-        f"تقرير كل {REPORT_EVERY_MINUTES} دقيقة لكل سهم: قوة الانضغاط + قوة الانفجار + الفوليوم + أفضل العقود"
+        f"عقود {MIN_MID:g}$-{MAX_MID:g}$ - نظام درجات 1/3 - 3/3"
     )
     while True:
         try:
             if not is_market_open():
                 time.sleep(60)
                 continue
-            now = datetime.now(timezone.utc)
+            h5, h15, hD, prices = fetch_market_data()
             state = _prune_state(state)
-            due = []
-            for s in SYMBOLS:
-                ls = _last_sent(state, s)
-                if ls is None or (now - ls).total_seconds() >= REPORT_EVERY_MINUTES * 60:
-                    due.append(s)
-
-            if due:
-                h5, h15, hD, prices = fetch_market_data(due)
-                for symbol in due:
-                    try:
-                        hist = h5.get(symbol)
-                        price = prices.get(symbol)
-                        if hist is None or price is None or len(hist) < 30:
-                            continue
-                        direction = pick_direction(symbol, h5, h15, hD)
-                        sq = squeeze_metrics(hist)
-                        bo = breakout_metrics(hist, direction)
-                        drvol = day_rvol(hD, symbol)
-                        best = max(sq["score"] if sq else 0, bo["score"] if bo else 0)
-                        if best >= MIN_REPORT_SCORE:
-                            tscore, tdetails = get_trend_strength(symbol, h5, h15, hD, direction)
-                            msg = build_report(symbol, price, hist, direction, sq, bo, drvol, tscore, tdetails)
-                            if not send_telegram(msg):
-                                continue
-                            time.sleep(SEND_GAP_SECONDS)
-                        state[f"sent:{symbol}"] = datetime.now(timezone.utc).isoformat()
-                        _save_state(state)
-                    except Exception as e:
-                        logger.exception(f"خطأ {symbol}: {e}")
-
+            for symbol in SYMBOLS:
+                try:
+                    hist = h5.get(symbol)
+                    price = prices.get(symbol)
+                    if hist is None or price is None or len(hist) < 30:
+                        continue
+                    sig = check_signal(symbol, hist)
+                    if sig:
+                        key = f"{symbol}:{sig['type']}:{sig['dir']}:{sig['bar_time']}"
+                        if key not in state:
+                            score, details = get_trend_strength(symbol, h5, h15, hD, sig["dir"])
+                            msg = build_message(symbol, price, hist, sig, score=score, trend_details=details)
+                            if send_telegram(msg):
+                                state[key] = sig["bar_time"]
+                                _save_state(state)
+                    time.sleep(0.2)
+                except Exception as e:
+                    logger.exception(f"خطأ {symbol}: {e}")
             now = datetime.now(timezone.utc)
             if (now - last_heartbeat).total_seconds() > 3600:
-                send_telegram("💓 البوت شغال - تقارير ساعية")
+                send_telegram("💓 البوت شغال - ثلاث فريمات")
                 last_heartbeat = now
-            time.sleep(30)
+            time.sleep(POLL_SECONDS)
         except Exception as e:
             logger.exception(f"خطأ رئيسي: {e}")
             time.sleep(20)
@@ -662,7 +528,7 @@ def main_loop():
 # ===================== خادم Flask =====================
 @app.get("/")
 def home():
-    return "Bot OK - Hourly Scanner Active"
+    return "Bot OK - 3 Frames Active"
 
 
 @app.get("/health")
