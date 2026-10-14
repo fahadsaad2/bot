@@ -153,7 +153,7 @@ def check_signal(symbol, hist):
     curr_vol=float(last["Volume"]) if "Volume" in hist.columns else 0
     direction="UP" if close.iloc[-1]>=mid.iloc[-1] else "DOWN"
     is_crazy=symbol in CRAZY_SYMBOLS
-    vol_multiplier=1.0 if is_crazy else 1.15
+    vol_multiplier=0.8 if is_crazy else 0.9
     high_prev=float(prev_20["High"].max()); low_prev=float(prev_20["Low"].min())
     is_breakout_up=last["Close"]>high_prev and (curr_vol>avg_vol*vol_multiplier if avg_vol>0 else True)
     is_breakout_down=last["Close"]<low_prev and (curr_vol>avg_vol*vol_multiplier if avg_vol>0 else True)
