@@ -1,5 +1,6 @@
 """
-تنبيهات Squeeze + Breakout - النسخة المضبوطة للمجانين
+تنبيهات Squeeze + Breakout - النسخة ثلاثية الفريمات بدرجات
+5m + 15m + Daily - بدون حذف شركات ولا تغيير رسالة
 """
 from __future__ import annotations
 import json, logging, math, os, time
@@ -29,7 +30,9 @@ SYMBOLS = TIER1 + TIER2
 CRAZY_SYMBOLS = {"SNDK", "MU", "LITE", "SMCI"}
 
 BAR_MINUTES = 5
-TIMEFRAME = TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
+TIMEFRAME_5M = TimeFrame(5, TimeFrameUnit.Minute)
+TIMEFRAME_15M = TimeFrame(15, TimeFrameUnit.Minute)
+TIMEFRAME_1D = TimeFrame(1, TimeFrameUnit.Day)
 POLL_SECONDS = max(15, int(os.getenv("POLL_SECONDS", "20")))
 HISTORY_DAYS = 10
 STATE_FILE = Path("squeeze_state.json")
@@ -64,7 +67,7 @@ def is_market_open() -> bool:
     if now.weekday() >= 5: return False
     return now.replace(hour=9,minute=30,second=0) <= now <= now.replace(hour=16,minute=0,second=0)
 
-def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def _bar_frame_multi(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     frame = raw.copy()
     if isinstance(frame.index, pd.MultiIndex):
         try: frame = frame.xs(symbol, level=0)
@@ -81,12 +84,24 @@ def _bar_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 def fetch_market_data():
     now=datetime.now(timezone.utc)
-    bar_set=stock_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=TIMEFRAME, start=now-timedelta(days=HISTORY_DAYS), limit=1000))
-    raw=bar_set.df
-    histories={}
+    bar_set_5 = stock_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=TIMEFRAME_5M, start=now-timedelta(days=HISTORY_DAYS), limit=1000))
+    raw5 = bar_set_5.df
+    h5 = {}
     for s in SYMBOLS:
-        f=_bar_frame(raw,s)
-        if not f.empty: histories[s]=f
+        f=_bar_frame_multi(raw5,s)
+        if not f.empty: h5[s]=f
+    bar_set_15 = stock_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=TIMEFRAME_15M, start=now-timedelta(days=HISTORY_DAYS), limit=1000))
+    raw15 = bar_set_15.df
+    h15 = {}
+    for s in SYMBOLS:
+        f=_bar_frame_multi(raw15,s)
+        if not f.empty: h15[s]=f
+    bar_set_d = stock_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=SYMBOLS, timeframe=TIMEFRAME_1D, start=now-timedelta(days=60), limit=1000))
+    rawD = bar_set_d.df
+    hD = {}
+    for s in SYMBOLS:
+        f=_bar_frame_multi(rawD,s)
+        if not f.empty: hD[s]=f
     prices={}
     try:
         latest=stock_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=SYMBOLS))
@@ -95,9 +110,9 @@ def fetch_market_data():
             p=_as_float(_field(t,"price"))
             if p and p>0: prices[s]=p
     except: pass
-    for s,f in histories.items():
+    for s,f in h5.items():
         if s not in prices and len(f): prices[s]=float(f["Close"].iloc[-1])
-    return histories, prices
+    return h5, h15, hD, prices
 
 def calc_rsi(hist, period=14):
     if len(hist)<period+1: return None
@@ -142,18 +157,45 @@ def check_signal(symbol, hist):
     high_prev=float(prev_20["High"].max()); low_prev=float(prev_20["Low"].min())
     is_breakout_up=last["Close"]>high_prev and (curr_vol>avg_vol*vol_multiplier if avg_vol>0 else True)
     is_breakout_down=last["Close"]<low_prev and (curr_vol>avg_vol*vol_multiplier if avg_vol>0 else True)
-    # انفجار أول
     if is_breakout_up: return {"type":"BREAKOUT","dir":"UP","bar_time":hist.index[-1].isoformat(),"bb_width":bb_width}
     if is_breakout_down: return {"type":"BREAKOUT","dir":"DOWN","bar_time":hist.index[-1].isoformat(),"bb_width":bb_width}
     if squeeze_now: return {"type":"SQUEEZE","dir":direction,"bar_time":hist.index[-1].isoformat(),"bb_width":bb_width}
     return None
+
+def get_trend_strength(symbol, h5, h15, hD, sig_dir):
+    score = 1
+    details = []
+    try:
+        if symbol in hD and len(hD[symbol])>=50:
+            dc = hD[symbol]["Close"]
+            ema50 = dc.ewm(span=50).mean().iloc[-1]
+            if sig_dir=="UP" and dc.iloc[-1] > ema50:
+                score+=1; details.append("يومي صاعد")
+            elif sig_dir=="DOWN" and dc.iloc[-1] < ema50:
+                score+=1; details.append("يومي هابط")
+            else:
+                details.append("يومي عكس")
+    except: pass
+    try:
+        if symbol in h15 and len(h15[symbol])>=30:
+            c = h15[symbol]["Close"]
+            e9 = c.ewm(span=9).mean().iloc[-1]
+            e20 = c.ewm(span=20).mean().iloc[-1]
+            if sig_dir=="UP" and e9 > e20:
+                score+=1; details.append("15m صاعد")
+            elif sig_dir=="DOWN" and e9 < e20:
+                score+=1; details.append("15m هابط")
+            else:
+                details.append("15m عكس")
+    except: pass
+    details.insert(0,"5m انفجار")
+    return score, details
 
 def get_option_recommendations(symbol, stock_price, option_type):
     if stock_price<=0: return {}
     target=ContractType.CALL if option_type=="CALL" else ContractType.PUT
     today=datetime.now(timezone.utc).date()
     max_expiry=today+timedelta(days=45)
-    # OTM خفيف 0-4% فقط عشان الربح نسبة
     if option_type=="CALL":
         low=stock_price*0.99; high=stock_price*1.04
     else:
@@ -190,7 +232,7 @@ def get_option_recommendations(symbol, stock_price, option_type):
         ask=_as_float(_field(quote,"ask_price")) if quote else None
         if bid is None or ask is None or bid<=0 or ask<bid: continue
         mid=(bid+ask)/2
-        if not 1.0<=mid<=10.0: continue # عقود 1-10 دولار فقط
+        if not 1.0<=mid<=10.0: continue
         spread_pct=((ask-bid)/mid)*100
         if spread_pct>max_spread: continue
         oi=_as_float(_field(contract,"open_interest"),0) or 0
@@ -224,16 +266,25 @@ def send_telegram(msg):
 def _option_line(label, opt):
     return f"{label} {opt['exp']}{opt['whale']}\n💰 سترايك {opt['strike']:.1f}$ - سعره {opt['mid']:.1f}$ | فوليوم: {opt['vol']} | OI: {opt['oi']} | فرق: {opt['diff']}%\n🔹 العقد: <code>{opt['symbol']}</code>\n"
 
-def build_message(symbol, price, hist, sig):
+def build_message(symbol, price, hist, sig, score=1, trend_details=None):
     option_type="CALL" if sig["dir"]=="UP" else "PUT"
     rsi=calc_rsi(hist); sma50=float(hist["Close"].rolling(50,min_periods=50).mean().iloc[-1]) if len(hist)>=50 else price
     prior=hist.iloc[:-1].tail(20)
     resistance=float(prior["High"].max()) if option_type=="CALL" else float(prior["Low"].min())
     stops=calc_levels(hist, price, is_put=(option_type=="PUT"))
-    title="⚠️ انضغاط" if sig["type"]=="SQUEEZE" else "🚀 انفجار قوي"
+    if score==3:
+        title=f"🚀🚀🚀 انفجار ثلاثي مؤكد {option_type} 🔥🔥🔥 [3/3]"
+    elif score==2:
+        title=f"🚀🚀 انفجار جيد {option_type} ⭐⭐ [2/3]"
+    else:
+        base="⚠️ انضغاط" if sig["type"]=="SQUEEZE" else "🚀 انفجار قوي"
+        title=f"{base} {option_type} ⚡ [1/3]"
     emoji="🟢" if option_type=="CALL" else "🔴"
     gamma_bar=round(price*1.035,2) if option_type=="CALL" else round(price*0.965,2)
-    lines=[f"{title} {option_type} {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>", f"📊 المتوسط 50: {sma50:.2f}$ | المقاومة: {resistance:.2f}$ | RSI: {rsi:.1f if rsi else 0}", f"🧱 حاجز غاما: {gamma_bar}$", "", f"🚀 دخول {option_type}: {price:.2f}$"]
+    lines=[f"{title} {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>"]
+    if trend_details:
+        lines.append(f"📈 الفريمات: {' + '.join(trend_details)} | القوة {score}/3")
+    lines.extend([f"📊 المتوسط 50: {sma50:.2f}$ | المقاومة: {resistance:.2f}$ | RSI: {rsi:.1f if rsi else 0}", f"🧱 حاجز غاما: {gamma_bar}$", "", f"🚀 دخول {option_type}: {price:.2f}$"])
     if stops:
         stop,t1,t2,t3=stops; atr_val=round(abs(t1-price),2)
         lines.extend([f"🛑 وقف الخسارة: {stop:.2f}$ (ATR:{atr_val}$)", f"🎯 هدف اول: {t1:.2f}$", f"🎯 هدف ثاني: {t2:.2f}$", f"🎯 هدف ثالث: {t3:.2f}$", ""])
@@ -258,35 +309,36 @@ def _prune_state(state):
 
 def main_loop():
     state=_prune_state(_load_state()); last_heartbeat=datetime.now(timezone.utc)
-    send_telegram("✅ <b>تم تشغيل النسخة المضبوطة</b>\nمراقبة 19 شركة - المجانين بفوليوم 1.0x\nعقود 1$-10$ - 3 عقود بنفس الرسالة")
+    send_telegram("✅ <b>تم تشغيل النسخة الثلاثية</b>\nمراقبة 19 شركة - 5m+15m+Daily\nعقود 1$-10$ - نظام درجات 1/3 - 3/3")
     while True:
         try:
             if not is_market_open():
                 time.sleep(60); continue
-            histories, prices = fetch_market_data()
+            h5, h15, hD, prices = fetch_market_data()
             state=_prune_state(state)
             for symbol in SYMBOLS:
                 try:
-                    hist=histories.get(symbol); price=prices.get(symbol)
+                    hist=h5.get(symbol); price=prices.get(symbol)
                     if hist is None or price is None or len(hist)<30: continue
                     sig=check_signal(symbol, hist)
                     if sig:
                         key=f"{symbol}:{sig['type']}:{sig['dir']}:{sig['bar_time']}"
                         if key not in state:
-                            msg=build_message(symbol, price, hist, sig)
+                            score, details = get_trend_strength(symbol, h5, h15, hD, sig["dir"])
+                            msg=build_message(symbol, price, hist, sig, score=score, trend_details=details)
                             if send_telegram(msg):
                                 state[key]=sig["bar_time"]; _save_state(state)
                     time.sleep(0.2)
                 except Exception as e: logger.exception(f"خطأ {symbol}: {e}")
             now=datetime.now(timezone.utc)
             if (now-last_heartbeat).total_seconds()>3600:
-                send_telegram(f"💓 البوت شغال"); last_heartbeat=now
+                send_telegram(f"💓 البوت شغال - ثلاث فريمات"); last_heartbeat=now
             time.sleep(POLL_SECONDS)
         except Exception as e:
             logger.exception(f"خطأ رئيسي: {e}"); time.sleep(20)
 
 @app.get("/")
-def home(): return "Bot OK - Fixed Version Active"
+def home(): return "Bot OK - 3 Frames Active"
 @app.get("/health")
 def health(): return jsonify({"status":"ok","symbols":len(SYMBOLS),"market_open":is_market_open()})
 
