@@ -1,7 +1,3 @@
-"""
-ماسح الانضغاط والانفجار + القاب - قبل السوق وبعد السوق
-5m + 15m + Daily - نفس الشركات 19
-"""
 from __future__ import annotations
 import json, logging, math, os, time
 from datetime import date, datetime, timedelta, timezone
@@ -402,13 +398,14 @@ def main_loop():
     state = _prune_state(_load_state())
     last_heartbeat = datetime.now(timezone.utc)
     pre_sent = {}
-    send_telegram(f"✅ <b>تم تشغيل الماسح + تنبيه قبل السوق</b>\nمراقبة {len(SYMBOLS)} شركة - نفس القائمة\n📡 تقرير كل {REPORT_EVERY_MINUTES} دقيقة بعد الافتتاح\n⏰ تنبيه قاب قبل الافتتاح 3:30-4:30 عصراً الرياض")
+    send_telegram(f"✅ <b>تم تشغيل الماسح + تنبيه البري ماركت الشامل (4:00 - 9:30 ص)</b>\nمراقبة {len(SYMBOLS)} شركة\n📡 تقرير كل {REPORT_EVERY_MINUTES} دقيقة بعد الافتتاح")
     while True:
         try:
             now_et = datetime.now(US_EASTERN)
             now_utc = datetime.now(timezone.utc)
-            # === قبل السوق 8:30-9:30 نيويورك ===
-            if now_et.weekday() < 5 and ((now_et.hour == 8 and now_et.minute >= 30) or (now_et.hour == 9 and now_et.minute < 30)):
+            
+            # === البري ماركت (من الساعة 4:00 صباحاً وحتى 9:30 صباحاً بتوقيت نيويورك ET) ===
+            if now_et.weekday() < 5 and (4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)):
                 h5, h15, hD, prices = fetch_market_data(SYMBOLS)
                 for symbol in SYMBOLS:
                     price = prices.get(symbol)
@@ -419,8 +416,20 @@ def main_loop():
                     atr_val = calc_atr(hist) if hist is not None else 1.0
                     if not atr_val: atr_val = 1.0
                     gap_info = calc_gap_metrics(symbol, hD, price, atr_val)
+                    
+                    # حساب مستويات القاما في البري ماركت
+                    is_up_pre = gap_info["is_up"] if gap_info else True
+                    gamma_bar = round(price * 1.035, 2) if is_up_pre else round(price * 0.965, 2)
+                    gamma_crossed = price >= gamma_bar if is_up_pre else price <= gamma_bar
+                    gamma_txt = f"{gamma_bar}$ - {'اختراق غاما ✅' if gamma_crossed else f'تحت الحاجز باقي {abs(gamma_bar-price):.2f}$'}"
+
                     if gap_info and gap_info["is_valid"]:
-                        msg = f"⏰ <b>تنبيه قاب قبل الافتتاح {symbol}</b>\n💰 بري ماركت: {price:.2f}$\n🔍 القاب: {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} ATR)\n"
+                        msg = (
+                            f"⏰ <b>تنبيه قاب وقاما قبل الافتتاح {symbol}</b>\n"
+                            f"💰 بري ماركت: {price:.2f}$\n"
+                            f"🔍 القاب: {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} ATR)\n"
+                            f"🧱 <b>غاما بري ماركت:</b> {gamma_txt}\n"
+                        )
                         if abs(gap_info['gap_points']) >= 40:
                             msg += "⚠️ قاب كبير جداً - لا تدخل أول 15 دقيقة بعد الافتتاح\n"
                         msg += "⏳ جهز العقد وانتظر تأكيد أول 5 دقايق"
@@ -428,6 +437,7 @@ def main_loop():
                         pre_sent[key] = True
                         time.sleep(SEND_GAP_SECONDS)
                 if len(pre_sent) > 100: pre_sent.clear()
+            
             # === بعد الافتتاح ===
             if not is_market_open():
                 time.sleep(60)
@@ -470,7 +480,7 @@ def main_loop():
             time.sleep(20)
 
 @app.get("/")
-def home(): return "Bot OK - Premarket + Hourly + Gap"
+def home(): return "Bot OK - Premarket Gamma + Hourly + Gap"
 @app.get("/health")
 def health(): return jsonify({"status": "ok", "symbols": len(SYMBOLS), "market_open": is_market_open()})
 _worker_lock = Lock()
