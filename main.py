@@ -12,7 +12,7 @@ from threading import Lock, Thread
 from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest, StockBarsRequest, StockLatestTradeRequest
@@ -499,6 +499,7 @@ def format_gex_line(gex, price):
 # ==========================================================================
 EXPL_BODY_MULT = 1.8                 # الانفجار: الجسم > 1.8 ضعف متوسط آخر 20 جسم
 EXPL_LOOKBACK = {"W": 3, "D": 8}     # كم شمعة أخيرة نبحث فيها عن الانفجار
+EXPL_TIMEFRAMES = ("W", "D")          # كل إطار يرسل تنبيهه لحاله: ("D",) يومي فقط | ("W",) أسبوعي فقط
 ZONE_FRAC = 0.30                     # النقطة الدافعة = 30% من الجسم عند الافتتاح
 CONF_TOL = 0.004                     # 0.4% تسامح للفواصل
 MM_TOL = 0.008                       # 0.8% تسامح لجدران الغاما (السترايكات متباعدة)
@@ -563,7 +564,10 @@ def explosion_setup(symbol, price, hD, hW, atr_daily, gex_fn):
     """الشروط الثلاثة: انفجار + نقطة دافعة على فاصل + تمركز صانع (غاما). يرجع setup أو None"""
     fD = _completed(hD.get(symbol), "D")
     fW = _completed(hW.get(symbol), "W")
+    found = []  # كل إطار (أسبوعي/يومي) يعطي setup مستقل
     for kind, fc in (("W", fW), ("D", fD)):
+        if kind not in EXPL_TIMEFRAMES:
+            continue
         ex = find_explosion(fc, EXPL_LOOKBACK[kind])
         if not ex:
             continue
@@ -586,9 +590,13 @@ def explosion_setup(symbol, price, hD, hW, atr_daily, gex_fn):
         lv = _levels_before(fc, ex["ts"], "أسبوعي" if kind == "W" else "يومي", 2 if kind == "W" else 1)
         if kind == "D" and fW is not None and len(fW) >= 3:
             lv.update(_levels_before(fW, fW.index[-1] + pd.Timedelta(days=1), "أسبوعي", 2))
+        if kind == "W" and fD is not None and len(fD) >= 3:
+            lv.update(_levels_before(fD, fD.index[-1] + pd.Timedelta(days=1), "يومي", 1))
         sep_hits = [(n, v, w) for n, (v, w) in lv.items()
                     if lo * (1 - CONF_TOL) <= v <= hi * (1 + CONF_TOL)]
         sep_score = sum(w for _, _, w in sep_hits)
+        both = (any(n.startswith("يومي") for n, _, _ in sep_hits)
+                and any(n.startswith("أسبوعي") for n, _, _ in sep_hits))
         if sep_score < SEP_MIN_SCORE:
             continue
 
@@ -609,22 +617,43 @@ def explosion_setup(symbol, price, hD, hW, atr_daily, gex_fn):
         sgn = -1 if d == "DOWN" else 1
         stop = (hi + 0.25 * atr) if d == "DOWN" else (lo - 0.25 * atr)
         targets = [round(o + sgn * b * m, 2) for m in TARGET_EXT]
-        return {"kind": kind, "dir": d, "ts": ex["ts"], "lo": lo, "hi": hi,
-                "sep_hits": sep_hits, "sep_score": sep_score, "mm_hits": mm_hits,
-                "gex": gex, "stop": round(stop, 2), "targets": targets}
-    return None
+        found.append({"kind": kind, "dir": d, "ts": ex["ts"], "lo": lo, "hi": hi,
+                      "sep_hits": sep_hits, "sep_score": sep_score, "both": both, "mm_hits": mm_hits,
+                      "gex": gex, "stop": round(stop, 2), "targets": targets})
+    return found
+
+
+def _merge_setups(w, d):
+    """دمج انفجار أسبوعي ويومي متقاطعين (نفس الاتجاه والمنطقة) في تنبيه واحد"""
+    names = {n for n, _, _ in w["sep_hits"]}
+    sep = list(w["sep_hits"]) + [x for x in d["sep_hits"] if x[0] not in names]
+    mm_names = {n for n, _ in w["mm_hits"]}
+    mm = list(w["mm_hits"]) + [x for x in d["mm_hits"] if x[0] not in mm_names]
+    up = d["dir"] == "UP"
+    stop = min(w["stop"], d["stop"]) if up else max(w["stop"], d["stop"])  # الأوسع
+    both = (any(n.startswith("يومي") for n, _, _ in sep)
+            and any(n.startswith("أسبوعي") for n, _, _ in sep))
+    return {"kind": "WD", "dir": d["dir"], "ts": d["ts"], "ts_w": w["ts"],
+            "lo": min(w["lo"], d["lo"]), "hi": max(w["hi"], d["hi"]),
+            "sep_hits": sep, "sep_score": sum(x[2] for x in sep), "both": both,
+            "mm_hits": mm, "gex": w["gex"] or d["gex"], "stop": round(stop, 2),
+            "targets": d["targets"], "targets_w": w["targets"]}
 
 
 def build_explosion_msg(symbol, price, s, atr_d):
     is_up = s["dir"] == "UP"
     emoji = "🟢" if is_up else "🔴"
-    tf = "أسبوعية" if s["kind"] == "W" else "يومية"
+    tf = {"W": "أسبوعية", "D": "يومية", "WD": "أسبوعية + يومية (مدمج)"}[s["kind"]]
+    candle = (f"شمعة أسبوعية {s['ts_w'].date()} + يومية {s['ts'].date()}" if s["kind"] == "WD"
+              else f"شمعة {s['ts'].date()}")
     otype = "كول" if is_up else "بوت"
     lines = [
         f"💣 {emoji} <b>{html.escape(symbol)}</b> إعادة اختبار منطقة انفجار {tf} - السعر <b>{price:.2f}$</b>",
-        f"📍 النقطة الدافعة: {s['lo']:.2f} - {s['hi']:.2f}$ (شمعة {s['ts'].date()} {'صاعدة' if is_up else 'هابطة'})",
+        f"📍 النقطة الدافعة: {s['lo']:.2f} - {s['hi']:.2f}$ ({candle} {'صاعدة' if is_up else 'هابطة'})",
         "📏 فواصل عند المنطقة: " + " | ".join(f"{n} {v:.2f}$" for n, v, _ in s["sep_hits"]),
     ]
+    if s.get("both"):
+        lines.insert(1, "⭐ <b>تقاطع فاصل يومي + أسبوعي عند نفس المنطقة - إشارة قوية</b>")
     if s["mm_hits"]:
         lines.append("🏦 تمركز صانع السوق عند المنطقة: " + " | ".join(f"{n} {v:.1f}$" for n, v in s["mm_hits"]))
     if s["gex"]:
@@ -632,7 +661,12 @@ def build_explosion_msg(symbol, price, s, atr_d):
     t1, t2, t3 = s["targets"]
     lines.append(f"\n🚀 دخول {otype}: {price:.2f}$")
     lines.append(f"🛑 وقف (خلف المنطقة): {s['stop']:.2f}$")
-    lines.append(f"🎯 أهداف (امتداد الشمعة): {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$")
+    if s.get("targets_w"):
+        w1, w2, w3 = s["targets_w"]
+        lines.append(f"🎯 أهداف يومية: {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$")
+        lines.append(f"🎯 أهداف أسبوعية: {w1:.2f}$ / {w2:.2f}$ / {w3:.2f}$")
+    else:
+        lines.append(f"🎯 أهداف (امتداد الشمعة): {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$")
     lv = (s["stop"], t1, t2, t3)
     try:
         opts = get_option_recommendations(symbol, price, "CALL" if is_up else "PUT", atr_d,
@@ -657,15 +691,29 @@ def run_explosion_scan(state, hD, hW, prices):
             if not price:
                 continue
             atr_d = calc_atr(hD.get(symbol))
-            s = explosion_setup(symbol, price, hD, hW, atr_d, compute_gex)
-            if not s:
-                continue
-            key = f"expl:{symbol}:{s['kind']}:{s['ts'].date()}:{today}"
-            if key in state:
-                continue
-            if send_telegram(build_explosion_msg(symbol, price, s, atr_d)):
-                _mark(state, key)
-            time.sleep(SEND_GAP_SECONDS)
+            setups = explosion_setup(symbol, price, hD, hW, atr_d, compute_gex)
+            by = {x["kind"]: x for x in setups}
+            w, d = by.get("W"), by.get("D")
+            if (w and d and w["dir"] == d["dir"]
+                    and w["lo"] <= d["hi"] * (1 + CONF_TOL) and d["lo"] <= w["hi"] * (1 + CONF_TOL)):
+                setups = [_merge_setups(w, d)]  # الاثنين سوا → رسالة واحدة
+            for s in setups:
+                if s["kind"] == "WD":
+                    key = f"expl:{symbol}:WD:{s['ts_w'].date()}:{s['ts'].date()}:{today}"
+                    extra = [f"expl:{symbol}:W:{s['ts_w'].date()}:{today}",
+                             f"expl:{symbol}:D:{s['ts'].date()}:{today}"]
+                    if all(k in state for k in extra):
+                        continue  # انرسلوا منفصلين اليوم، لا نكررهم مدمجين
+                else:
+                    key = f"expl:{symbol}:{s['kind']}:{s['ts'].date()}:{today}"
+                    extra = []
+                if key in state:
+                    continue
+                if send_telegram(build_explosion_msg(symbol, price, s, atr_d)):
+                    _mark(state, key)
+                    for k in extra:
+                        _mark(state, k)
+                time.sleep(SEND_GAP_SECONDS)
         except Exception as e:
             logger.exception(f"خطأ انفجار {symbol}: {e}")
 # ===================== نهاية قسم الانفجار =====================
@@ -992,6 +1040,89 @@ def build_weekly_report(results):
     lines.append("\n⚠️ تعليمي فقط")
     return "\n".join(lines)
 
+# ============ تقرير بداية الأسبوع: اتجاه كل الشركات من شمعة الجمعة الأسبوعية ============
+MONDAY_REPORT_AT = (9, 0)  # وقت الإرسال يوم الاثنين بتوقيت نيويورك (الافتتاح 9:30). مثال: (9, 30) = مع الافتتاح، (8, 0) = قبله بساعة ونصف
+def weekly_direction(symbol, hD, hW):
+    """اتجاه الشركة من شمعة الأسبوع المنتهي (الجمعة) + متوسطات. يرجع dict أو None"""
+    fW = _completed(hW.get(symbol), "W")
+    fD = _completed(hD.get(symbol), "D")
+    if fW is None or len(fW) < 12:
+        return None
+    last, prev = fW.iloc[-1], fW.iloc[-2]
+    o, h, l, c = (float(last[k]) for k in ("Open", "High", "Low", "Close"))
+    rng = h - l
+    pos = (c - l) / rng if rng > 0 else 0.5
+    body_pct = (c - o) / o * 100 if o else 0.0
+    ema10 = float(fW["Close"].ewm(span=10, adjust=False).mean().iloc[-1])
+    checks = [c > o, c > float(prev["Close"]), c > ema10]
+    if fD is not None and len(fD) >= 50:
+        ema50 = float(fD["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        checks.append(float(fD["Close"].iloc[-1]) > ema50)
+    up_n, tot = sum(checks), len(checks)
+    if up_n * 4 >= tot * 3: direction = "UP"
+    elif up_n * 4 <= tot * 1: direction = "DOWN"
+    else: direction = "NEUTRAL"
+    _, desc, _ = weekly_score(fW)
+    brk = ""
+    if c > float(prev["High"]): brk = "أغلق فوق قمة الأسبوع السابق ✅"
+    elif c < float(prev["Low"]): brk = "أغلق تحت قاع الأسبوع السابق ❌"
+    return {"direction": direction, "up_n": up_n, "tot": tot, "o": o, "h": h, "l": l, "c": c,
+            "pos": pos, "body_pct": body_pct, "desc": desc, "brk": brk,
+            "ex": find_explosion(fW, 2)}
+
+
+def build_monday_report(rows, prices):
+    order = {"UP": 0, "DOWN": 1, "NEUTRAL": 2}
+    rows = sorted(rows, key=lambda r: (order[r["direction"]],
+                                       -r["up_n"] if r["direction"] == "UP" else r["up_n"]))
+    cnt = {k: sum(1 for r in rows if r["direction"] == k) for k in order}
+    lines = [f"🗓️ <b>تقرير بداية الأسبوع - اتجاه {len(rows)} شركة</b>",
+             "مبني على شمعة الأسبوع المنتهي (الجمعة) + المتوسطات",
+             f"🟢 صاعد {cnt['UP']} | 🔴 هابط {cnt['DOWN']} | ⚪ محايد {cnt['NEUTRAL']}", ""]
+    labels = {"UP": ("🟢", "صاعد"), "DOWN": ("🔴", "هابط"), "NEUTRAL": ("⚪", "محايد")}
+    for r in rows:
+        emoji, lab = labels[r["direction"]]
+        px = r.get("price") or r["c"]
+        lines.append(f"{emoji} <b>{html.escape(r['symbol'])}</b> {px:.2f}$ - {lab} ({r['up_n']}/{r['tot']})")
+        pat = f" | {html.escape(r['desc'])}" if r["desc"] else ""
+        lines.append(f"   📊 الأسبوعية {r['body_pct']:+.1f}% | الإغلاق عند {r['pos'] * 100:.0f}% من المدى{pat}")
+        if r["brk"]:
+            lines.append(f"   {r['brk']}")
+        lines.append(f"   📏 فواصل الأسبوع الجديد: قمة {r['h']:.2f} | قاع {r['l']:.2f} | إغلاق {r['c']:.2f}")
+        ex = r.get("ex")
+        if ex:
+            lines.append(f"   💣 انفجار أسبوعي {'صاعد' if ex['dir'] == 'UP' else 'هابط'} - منطقة {ex['lo']:.2f} - {ex['hi']:.2f}$")
+        g = r.get("gex")
+        if g:
+            lines.append(f"   🧱 جدار كول {g['call_wall']:.0f}$ | جدار بوت {g['put_wall']:.0f}$")
+        lines.append("")
+    lines.append("⚠️ تعليمي فقط - الاتجاه من الشموع والمتوسطات وليس توصية")
+    return "\n".join(lines)
+
+
+def send_monday_report(force_slow=True):
+    """يجلب الشموع ويرسل تقرير الاتجاه لكل الشركات. يرجع True لو انرسل"""
+    h5, h15, hD, hW, prices = fetch_market_data(SYMBOLS, force_slow=force_slow)
+    rows = []
+    for sym in SYMBOLS:
+        try:
+            r = weekly_direction(sym, hD, hW)
+            if not r:
+                continue
+            r["symbol"] = sym
+            r["price"] = prices.get(sym)
+            try:
+                r["gex"] = compute_gex(sym, r["price"] or r["c"])
+            except Exception:
+                r["gex"] = None
+            rows.append(r)
+        except Exception as e:
+            logger.warning(f"خطأ تقرير الاثنين {sym}: {e}")
+    if not rows:
+        return False
+    return send_telegram(build_monday_report(rows, prices))
+
+
 # ============ الحلقة الرئيسية ============
 def main_loop():
     state = _prune_state(_load_state())
@@ -1042,6 +1173,17 @@ def main_loop():
                 except Exception as e:
                     logger.exception(f"خطأ تقرير الجمعة: {e}")
                     _mark(state, weekly_key)
+
+            # === جديد: تقرير بداية الأسبوع - الاثنين (قبل الافتتاح حسب MONDAY_REPORT_AT)، اتجاه كل الشركات من شمعة الجمعة ===
+            monday_key = f"monday:{now_et.date()}"
+            if (now_et.weekday() == 0 and monday_key not in state
+                    and (now_et.hour, now_et.minute) >= MONDAY_REPORT_AT
+                    and (is_premarket_trading_day() or is_market_open())):
+                try:
+                    send_monday_report()
+                except Exception as e:
+                    logger.exception(f"خطأ تقرير الاثنين: {e}")
+                _mark(state, monday_key)  # محاولة وحدة فقط (للإرسال اليدوي استخدم /weekly_now)
 
             # === البري ماركت (4:00 - 9:30) - مرة كل 5 دقايق ===
             if ((4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30))
@@ -1182,6 +1324,13 @@ def home(): return "Bot OK - كسر مبكر + انفجار + تقرير جمع�
 def health(): return jsonify({"status": "ok", "symbols": len(SYMBOLS), "market_open": is_market_open()})
 @app.get("/stats")
 def stats(): return jsonify(compute_stats())
+@app.get("/weekly_now")
+def weekly_now():
+    """إرسال تقرير الاتجاه فوراً: /weekly_now?key=<ADMIN_KEY> (يتطلب ضبط ADMIN_KEY)"""
+    admin = os.getenv("ADMIN_KEY", "").strip()
+    if not admin or request.args.get("key", "") != admin:
+        return jsonify({"error": "ضع متغير ADMIN_KEY ومرره في الرابط ?key="}), 403
+    return jsonify({"sent": bool(send_monday_report())})
 
 # ============ تشغيل العامل (نسخة وحدة فقط) ============
 _worker_lock = Lock()
