@@ -1,9 +1,14 @@
+# -*- coding: utf-8 -*-
+# بوت سكويز - نسخة عربية معدلة + شرط الانفجار والنقطة الدافعة
+# الفكرة: ينبه وقت الكسر على شموع مكتملة فقط
+# الجمعة: تقرير أسبوعي بعد الإغلاق، باقي الأيام: تنبيه فوري لأقوى شركة
+# جديد: تنبيه "انفجار + نقطة دافعة + فاصل + غاما" (راجع قسم الانفجار أسفل دالة format_gex_line)
+
 from __future__ import annotations
-import json, logging, math, os, time
+import html, json, logging, math, os, time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
 from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
@@ -16,29 +21,38 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetStatus, ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
 
+# ============ الإعدادات ============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").strip().lower() != "false"
 
-TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]
-TIER2 = ["SMCI", "MSTR", "COIN", "AAPL", "AMD", "AMZN", "PLTR", "APP", "ARM", "AVGO", "MU", "LITE", "RDDT", "SNDK"]
-SYMBOLS = TIER1 + TIER2
+TIER1 = ["NVDA", "TSLA", "GOOGL", "META", "MSFT"]  # الكبار - 1%
+TIER_MID = ["AAPL", "AMZN", "AMD", "AVGO", "MU"]  # الوسط - 2%
+TIER_VOL = ["SMCI", "MSTR", "COIN", "PLTR", "APP", "ARM", "LITE", "RDDT", "SNDK"]  # المتقلبة - 5%
+SYMBOLS = TIER1 + TIER_MID + TIER_VOL
 
 TIMEFRAME_5M = TimeFrame(5, TimeFrameUnit.Minute)
 TIMEFRAME_15M = TimeFrame(15, TimeFrameUnit.Minute)
 TIMEFRAME_1D = TimeFrame(1, TimeFrameUnit.Day)
+TIMEFRAME_1W = TimeFrame(1, TimeFrameUnit.Week)
+
 HISTORY_DAYS = 10
-HISTORY_DAYS_DAILY = 150          # كان 60 (لا يكفي لـ EMA50 اليومي)
+HISTORY_DAYS_DAILY = 150
+HISTORY_DAYS_WEEKLY = 365
+SLOW_CACHE_TTL = 1800  # اليومي والأسبوعي يتحدثون كل 30 دقيقة فقط
+
 STATE_FILE = Path("squeeze_state.json")
 SIGNALS_FILE = Path("signals_log.json")
-REPORT_EVERY_MINUTES = int(os.getenv("REPORT_EVERY_MINUTES", "60"))
-MIN_REPORT_SCORE = int(os.getenv("MIN_REPORT_SCORE", "0"))
 SEND_GAP_SECONDS = 3.5
+RESEND_BLOCK_SECONDS = 7200  # لا يعيد التنبيه لنفس الشركة قبل ساعتين
+STATE_RETENTION_HOURS = 30
+MIN_SCORE = 50
+
 _feed_env = os.getenv("STOCK_FEED", "").strip().lower()
 STOCK_FEED = DataFeed.SIP if _feed_env == "sip" else DataFeed.IEX if _feed_env == "iex" else None
 
-# --- فلتر العقود (أشد من قبل) ---
 MAX_SPREAD_DAILY = 15
 MAX_SPREAD_WEEKLY = 12
 MAX_SPREAD_MONTHLY = 10
@@ -46,21 +60,18 @@ MIN_OI = 100
 MIN_MID = 0.5
 MAX_MID = 15.0
 MAX_DIFF_PCT = 8
-MAX_BE_RATIO = 1.2                # أقصى مسافة تعادل نسبةً للحركة المتوقعة حتى الانتهاء
+MAX_BE_RATIO = 1.2
 TARGET_DELTA = 0.40
 
-# --- القاب ---
 US_EASTERN = ZoneInfo("America/New_York")
 GAP_MIN_PCT = 2.0
 GAP_MAX_PCT = 8.0
-BIG_GAP_PCT = 5.0                 # بدل 40$ ثابتة
-GAP_RULE_WINDOW_MIN = 60          # قانون القاب يعمل فقط في أول ساعة بعد الافتتاح (وفي البري ماركت)
+BIG_GAP_PCT = 5.0
+GAP_RULE_WINDOW_MIN = 60
 
-# --- الوقف والأهداف ---
-STOP_ATR_MULT = 1.5               # على ATR شمعة 15 دقيقة
+STOP_ATR_MULT = 1.5
 R_MULTS = (1.5, 3.0, 5.0)
 
-# --- GEX ---
 GEX_MAX_DTE = 30
 GEX_CACHE_TTL = 600
 RISK_FREE = 0.04
@@ -70,33 +81,59 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("squeeze_bot")
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
 
-
-# ====================== أدوات عامة ======================
-def _field(obj: Any, name: str, default: Any = None) -> Any:
+# ============ أدوات عامة ============
+def _field(obj, name, default=None):
     return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
-def _as_float(v: Any, d=None):
+def _as_float(v, d=None):
     try:
         r = float(v)
         return r if math.isfinite(r) else d
     except Exception:
         return d
-def _as_date(v: Any):
+def _as_date(v):
     if isinstance(v, datetime): return v.date()
     if isinstance(v, date): return v
     try: return date.fromisoformat(str(v)[:10])
     except Exception: return None
-def is_market_open() -> bool:
+
+# --- حالة السوق من Alpaca (تعرف الإجازات والإغلاق المبكر) مع كاش دقيقة ---
+_clock_cache = {"ts": 0.0, "is_open": None, "next_open": None}
+def _get_clock():
+    if time.time() - _clock_cache["ts"] < 60 and _clock_cache["is_open"] is not None:
+        return _clock_cache
+    try:
+        c = trading_client.get_clock()
+        _clock_cache.update(ts=time.time(), is_open=bool(c.is_open), next_open=c.next_open)
+    except Exception as e:
+        logger.warning(f"فشل جلب ساعة السوق: {e}")
+        _clock_cache.update(ts=time.time(), is_open=None, next_open=None)
+    return _clock_cache
+def _time_based_open() -> bool:
     now = datetime.now(US_EASTERN)
     if now.weekday() >= 5: return False
-    return now.replace(hour=9, minute=30, second=0) <= now <= now.replace(hour=16, minute=0, second=0)
+    return now.replace(hour=9, minute=30, second=0, microsecond=0) <= now < now.replace(hour=16, minute=0, second=0, microsecond=0)
+def is_market_open() -> bool:
+    c = _get_clock()
+    return c["is_open"] if c["is_open"] is not None else _time_based_open()
+def is_premarket_trading_day() -> bool:
+    # يوم تداول اليوم ولسا ما فتح السوق
+    now = datetime.now(US_EASTERN)
+    if now.weekday() >= 5: return False
+    c = _get_clock()
+    if c["is_open"] is None: return True
+    if c["is_open"]: return False
+    no = c.get("next_open")
+    try: return no is not None and no.astimezone(US_EASTERN).date() == now.date()
+    except Exception: return True
 def minutes_since_open():
     now = datetime.now(US_EASTERN)
     if now.weekday() >= 5: return None
     open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
     if now < open_t: return None
     return (now - open_t).total_seconds() / 60
+
 def _bar_frame_multi(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     frame = raw.copy()
     if isinstance(frame.index, pd.MultiIndex):
@@ -121,10 +158,32 @@ def _fetch_frames(symbols, timeframe, days):
         f = _bar_frame_multi(raw, s)
         if not f.empty: out[s] = f
     return out
-def fetch_market_data(symbols):
-    h5 = _fetch_frames(symbols, TIMEFRAME_5M, HISTORY_DAYS)
-    h15 = _fetch_frames(symbols, TIMEFRAME_15M, HISTORY_DAYS)
+
+def _closed_only(frames, minutes):
+    """يحذف الشمعة الجارية - نستخدم الشموع المكتملة فقط (إصلاح الإشارات الكاذبة)"""
+    now = pd.Timestamp.now(tz="UTC")
+    delta = pd.Timedelta(minutes=minutes)
+    out = {}
+    for s, f in frames.items():
+        g = f[f.index + delta <= now]
+        if len(g): out[s] = g
+    return out
+
+_slow_cache = {"ts": 0.0, "symbols": None, "hD": {}, "hW": {}}
+def _get_slow_frames(symbols, force=False):
+    key = tuple(symbols)
+    if (not force and _slow_cache["symbols"] == key and time.time() - _slow_cache["ts"] < SLOW_CACHE_TTL
+            and _slow_cache["hD"]):
+        return _slow_cache["hD"], _slow_cache["hW"]
     hD = _fetch_frames(symbols, TIMEFRAME_1D, HISTORY_DAYS_DAILY)
+    hW = _fetch_frames(symbols, TIMEFRAME_1W, HISTORY_DAYS_WEEKLY)
+    _slow_cache.update(ts=time.time(), symbols=key, hD=hD, hW=hW)
+    return hD, hW
+
+def fetch_market_data(symbols, force_slow=False):
+    h5 = _closed_only(_fetch_frames(symbols, TIMEFRAME_5M, HISTORY_DAYS), 5)
+    h15 = _closed_only(_fetch_frames(symbols, TIMEFRAME_15M, HISTORY_DAYS), 15)
+    hD, hW = _get_slow_frames(symbols, force_slow)
     prices = {}
     try:
         kwargs = {"symbol_or_symbols": symbols}
@@ -137,10 +196,9 @@ def fetch_market_data(symbols):
     except Exception as e: logger.warning(f"فشل جلب آخر الأسعار: {e}")
     for s, f in h5.items():
         if s not in prices and len(f): prices[s] = float(f["Close"].iloc[-1])
-    return h5, h15, hD, prices
+    return h5, h15, hD, hW, prices
 
-
-# ====================== المؤشرات ======================
+# ============ المؤشرات ============
 def calc_rsi(hist, period=14):
     if len(hist) < period + 1: return None
     delta = hist["Close"].diff()
@@ -157,7 +215,6 @@ def calc_atr(hist, period=14):
     v = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1]
     return float(v) if pd.notna(v) and v > 0 else None
 def calc_levels(atr, entry, is_put=False):
-    """وقف = 1.5 × ATR(15m). الأهداف = مضاعفات R من مسافة الوقف."""
     if not atr or entry <= 0: return None
     risk = STOP_ATR_MULT * atr
     if is_put:
@@ -165,8 +222,42 @@ def calc_levels(atr, entry, is_put=False):
     else:
         vals = (entry - risk, *[entry + m * risk for m in R_MULTS])
     return tuple(round(x, 2) for x in vals)
+
+def min_move_for_symbol(symbol):
+    if symbol in TIER1: return 1.0
+    if symbol in TIER_MID: return 2.0
+    return 5.0
+
+def is_marubozu(row):
+    body = abs(row["Close"] - row["Open"])
+    rng = row["High"] - row["Low"]
+    if rng <= 0: return False
+    return body / rng > 0.70
+
+def aligned_marubozu(row, direction):
+    """ماروبوزو باتجاه الإشارة (صاعدة لـ UP وهابطة لـ DOWN)"""
+    if not is_marubozu(row): return False
+    return row["Close"] > row["Open"] if direction == "UP" else row["Close"] < row["Open"]
+
+def weekly_score(hW_sym):
+    """يرجع (القوة، الوصف، اتجاه الشمعة). الابتلاعية تتطلب أن السابقة عكسها"""
+    if hW_sym is None or len(hW_sym) < 3: return 0, "", None
+    last, prev = hW_sym.iloc[-1], hW_sym.iloc[-2]
+    last_up = last["Close"] > last["Open"]
+    last_down = last["Close"] < last["Open"]
+    prev_up = prev["Close"] > prev["Open"]
+    prev_down = prev["Close"] < prev["Open"]
+    w_dir = "UP" if last_up else "DOWN" if last_down else None
+    score = 0; txt = []
+    if is_marubozu(last):
+        score += 40; txt.append("ماروبوزو أسبوعي ✅")
+    if last_up and prev_down and last["Close"] >= prev["Open"] and last["Open"] <= prev["Close"]:
+        score += 30; txt.append("ابتلاعية صاعدة ✅")
+    if last_down and prev_up and last["Close"] <= prev["Open"] and last["Open"] >= prev["Close"]:
+        score += 30; txt.append("ابتلاعية هابطة ✅")
+    return score, " | ".join(txt), w_dir
+
 def calc_gap_metrics(symbol, hD, current_price, atr_daily):
-    """القاب الحقيقي = افتتاح اليوم - إغلاق أمس. قبل الافتتاح: سعر البري ماركت - إغلاق أمس."""
     try:
         f = hD.get(symbol)
         if f is None or len(f) < 2: return None
@@ -192,6 +283,7 @@ def calc_gap_metrics(symbol, hD, current_price, atr_daily):
     except Exception as e:
         logger.warning(f"خطأ حساب القاب {symbol}: {e}")
         return None
+
 def squeeze_metrics(hist, n=20):
     if hist is None or len(hist) < n + 30: return None
     close = hist["Close"]
@@ -216,7 +308,9 @@ def squeeze_metrics(hist, n=20):
     ratio = float(width.iloc[-1] / kcw.iloc[-1])
     score = (0.4 * (1 - pct) * 100 + 0.4 * min(bars / 15, 1) * 100 + 0.2 * max(0.0, min(1.0, (1 - ratio) / 0.3)) * 100)
     return {"in_squeeze": bool(in_sq.iloc[-1]), "bars": bars, "tight_pct": (1 - pct) * 100, "score": int(round(score))}
+
 def breakout_metrics(hist, direction):
+    # ملاحظة: المستوى هنا = أعلى/أدنى آخر 20 شمعة 5 دقايق (مو 20 يوم)
     if hist is None or len(hist) < 25 or "Volume" not in hist.columns: return None
     last = hist.iloc[-1]
     prior = hist.iloc[-21:-1]
@@ -234,11 +328,13 @@ def breakout_metrics(hist, direction):
     prox = 1.0 if broke else max(0.0, 1 - max(dist, 0) / 2)
     score = 40 * min(rvol / 2, 1) + 35 * prox + 25 * align
     return {"rvol": rvol, "broke": broke, "dist": max(dist, 0), "score": int(round(score))}
+
 def breakout_for(hist, direction):
     if direction in ("UP", "DOWN"): return breakout_metrics(hist, direction)
     a, b = breakout_metrics(hist, "UP"), breakout_metrics(hist, "DOWN")
     if a and b: return a if a["score"] >= b["score"] else b
     return a or b
+
 def day_rvol(hD, symbol):
     f = hD.get(symbol)
     if f is None or len(f) < 6: return None
@@ -250,15 +346,15 @@ def day_rvol(hD, symbol):
     elapsed = (now_et - open_et).total_seconds() / 60
     frac = min(max(elapsed, 5) / 390, 1.0)
     return float(f["Volume"].iloc[-1]) / (avg * frac)
+
 def daily_levels(f):
-    """دعم/مقاومة آخر 20 يوم + SMA50 يومي (من الشموع اليومية، مو الـ5 دقائق)."""
     if f is None or len(f) < 22: return None
     today = datetime.now(US_EASTERN).date()
     prior = f.iloc[:-1].tail(20) if f.index[-1].date() == today else f.tail(20)
     sma50 = float(f["Close"].rolling(50).mean().iloc[-1]) if len(f) >= 50 else None
     return {"hi20": float(prior["High"].max()), "lo20": float(prior["Low"].min()), "sma50": sma50}
+
 def pick_direction(symbol, h5, h15, hD):
-    """UP / DOWN / NEUTRAL. التعادل صار محايد (كان يميل لـ UP)."""
     up = total = 0
     try:
         c = h5[symbol]["Close"]; total += 1; up += 1 if c.iloc[-1] >= c.rolling(20).mean().iloc[-1] else 0
@@ -275,8 +371,8 @@ def pick_direction(symbol, h5, h15, hD):
     if up * 2 > total: return "UP"
     if up * 2 < total: return "DOWN"
     return "NEUTRAL"
+
 def get_trend_strength(symbol, h5, h15, hD, sig_dir):
-    """القوة = عدد الأطر الموافقة فعلياً للاتجاه (0 إلى 3). بدون نقطة مجانية."""
     if sig_dir not in ("UP", "DOWN"): return 0, []
     want_up = sig_dir == "UP"
     score = 0; details = []
@@ -287,14 +383,14 @@ def get_trend_strength(symbol, h5, h15, hD, sig_dir):
         details.append(f"{label}{'✅' if ok else '❌'}")
     try:
         c = h5[symbol]["Close"]
-        add("5m", c.iloc[-1] >= c.rolling(20).mean().iloc[-1])
-    except Exception: details.append("5m؟")
+        add("5د", c.iloc[-1] >= c.rolling(20).mean().iloc[-1])
+    except Exception: details.append("5د؟")
     try:
         if len(h15[symbol]) >= 30:
             c = h15[symbol]["Close"]
-            add("15m", c.ewm(span=9).mean().iloc[-1] > c.ewm(span=20).mean().iloc[-1])
-        else: details.append("15m؟")
-    except Exception: details.append("15m؟")
+            add("15د", c.ewm(span=9).mean().iloc[-1] > c.ewm(span=20).mean().iloc[-1])
+        else: details.append("15د؟")
+    except Exception: details.append("15د؟")
     try:
         if len(hD[symbol]) >= 50:
             c = hD[symbol]["Close"]
@@ -303,8 +399,7 @@ def get_trend_strength(symbol, h5, h15, hD, sig_dir):
     except Exception: details.append("يومي؟")
     return score, details
 
-
-# ====================== GEX الحقيقي ======================
+# ============ غاما ============
 _gex_cache: dict = {}
 def _norm_pdf(x): return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 def _bs_gamma(S, K, T, iv, r=RISK_FREE):
@@ -329,7 +424,6 @@ def _list_contracts(symbol, today, max_exp, low, high, ctype=None):
         if not page_token: break
     return out
 def compute_gex(symbol, spot):
-    """GEX حقيقي من الـ OI والـ IV: Call Wall / Put Wall / Gamma Flip / صافي GEX (بالدولار لكل 1%)."""
     cached = _gex_cache.get(symbol)
     if cached and time.time() - cached[0] < GEX_CACHE_TTL and abs(cached[2] - spot) / spot < 0.02:
         return cached[1]
@@ -360,14 +454,12 @@ def compute_gex(symbol, spot):
             T = max(secs, 1800) / 31536000.0
             rows.append((ctype.startswith("c"), strike, T, iv, oi))
         if len(rows) < 20: return None
-
         def net_at(S):
             tot = 0.0
             for is_call, K, T, iv, oi in rows:
                 g = _bs_gamma(S, K, T, iv) * oi * 100 * S * S * 0.01
                 tot += g if is_call else -g
             return tot
-
         per_strike = {}
         for is_call, K, T, iv, oi in rows:
             g = _bs_gamma(spot, K, T, iv) * oi * 100 * spot * spot * 0.01
@@ -378,7 +470,6 @@ def compute_gex(symbol, spot):
         below = {k: v[1] for k, v in per_strike.items() if k <= spot}
         call_wall = max(above, key=above.get) if above and max(above.values()) > 0 else max(per_strike, key=lambda k: per_strike[k][0])
         put_wall = max(below, key=below.get) if below and max(below.values()) > 0 else max(per_strike, key=lambda k: per_strike[k][1])
-
         net_now = net_at(spot)
         grid = [spot * (0.85 + 0.005 * i) for i in range(61)]
         vals = [net_at(s) for s in grid]
@@ -392,20 +483,196 @@ def compute_gex(symbol, spot):
         _gex_cache[symbol] = (time.time(), res, spot)
         return res
     except Exception as e:
-        logger.warning(f"فشل حساب GEX {symbol}: {e}")
+        logger.warning(f"فشل حساب غاما {symbol}: {e}")
         return None
 def format_gex_line(gex, price):
-    if not gex: return "🧱 غاما: غير متاح (بيانات الخيارات غير كافية)"
-    parts = [f"Call Wall {gex['call_wall']:.0f}$", f"Put Wall {gex['put_wall']:.0f}$"]
-    if gex.get("flip"): parts.append(f"Flip {gex['flip']:.1f}$")
-    regime = "جاما موجبة ✅ (تهدئة)" if gex["net_gex"] > 0 else "جاما سالبة ⚠️ (تضخيم)"
+    if not gex: return "🧱 غاما: غير متاح"
+    parts = [f"جدار كول {gex['call_wall']:.0f}$", f"جدار بوت {gex['put_wall']:.0f}$"]
+    if gex.get("flip"): parts.append(f"فليب {gex['flip']:.1f}$")
+    regime = "غاما موجبة ✅ (تهدئة)" if gex["net_gex"] > 0 else "غاما سالبة ⚠️ (تضخيم)"
     pos = ""
-    if gex.get("flip"): pos = " | السعر فوق الـ Flip" if price > gex["flip"] else " | السعر تحت الـ Flip"
-    return f"🧱 غاما: {' | '.join(parts)}\n    {regime} ({gex['net_gex'] / 1e6:+.1f}M){pos}"
+    if gex.get("flip"): pos = " | السعر فوق الفليب" if price > gex["flip"] else " | السعر تحت الفليب"
+    return f"🧱 غاما: {' | '.join(parts)}\n    {regime} ({gex['net_gex'] / 1e6:+.1f}مليون){pos}"
+
+# ==========================================================================
+# ===== جديد: انفجار سعري + نقطة دافعة + فاصل يومي/أسبوعي + تمركز صانع =====
+# ==========================================================================
+EXPL_BODY_MULT = 1.8                 # الانفجار: الجسم > 1.8 ضعف متوسط آخر 20 جسم
+EXPL_LOOKBACK = {"W": 3, "D": 8}     # كم شمعة أخيرة نبحث فيها عن الانفجار
+ZONE_FRAC = 0.30                     # النقطة الدافعة = 30% من الجسم عند الافتتاح
+CONF_TOL = 0.004                     # 0.4% تسامح للفواصل
+MM_TOL = 0.008                       # 0.8% تسامح لجدران الغاما (السترايكات متباعدة)
+SEP_MIN_SCORE = 1                    # أقل وزن فواصل (أسبوعي=2، يومي=1)
+TARGET_EXT = (1.0, 1.272, 1.618)     # امتدادات الأهداف من نقطة الافتتاح
 
 
-# ====================== العقود ======================
-def get_option_recommendations(symbol, stock_price, option_type, atr_daily, t1=None, stop=None):
+def _completed(f, kind):
+    """يحذف الشمعة اليومية/الأسبوعية الجارية - المكتملة فقط"""
+    if f is None or len(f) < 2:
+        return f
+    now = datetime.now(US_EASTERN)
+    last_d = f.index[-1].tz_convert(US_EASTERN).date()
+    if kind == "D":
+        if last_d == now.date() and now.hour < 16:
+            return f.iloc[:-1]
+    else:
+        monday = now.date() - timedelta(days=now.weekday())
+        week_done = now.weekday() >= 5 or (now.weekday() == 4 and now.hour >= 16)
+        # الشمعة الأسبوعية قد تُختم الأحد بتوقيت نيويورك، لذلك نطرح يوماً
+        if last_d >= monday - timedelta(days=1) and not week_done:
+            return f.iloc[:-1]
+    return f
+
+
+def find_explosion(f, lookback):
+    """آخر شمعة انفجار + منطقتها الدافعة (عند الافتتاح)"""
+    if f is None or len(f) < 25:
+        return None
+    body = (f["Close"] - f["Open"]).abs()
+    avg = body.rolling(20).mean().shift(1)
+    for ts in reversed(list(f.index[-lookback:])):
+        a = avg.loc[ts]
+        if pd.notna(a) and a > 0 and body.loc[ts] > EXPL_BODY_MULT * a:
+            r = f.loc[ts]
+            o, c = float(r["Open"]), float(r["Close"])
+            b = abs(c - o)
+            if c < o:
+                d, lo, hi = "DOWN", o - ZONE_FRAC * b, o
+            else:
+                d, lo, hi = "UP", o, o + ZONE_FRAC * b
+            return {"ts": ts, "dir": d, "lo": lo, "hi": hi, "open": o, "close": c, "body": b}
+    return None
+
+
+def _levels_before(f, ts, tag, w):
+    """فواصل: فتح/إغلاق/قمة/قاع الشمعة السابقة + قمة/قاع 20 شمعة (قبل ts)"""
+    lv = {}
+    before = f.loc[f.index < ts]
+    if len(before) < 2:
+        return lv
+    p = before.iloc[-1]
+    for k, n in (("High", "قمة"), ("Low", "قاع"), ("Open", "فتح"), ("Close", "إغلاق")):
+        lv[f"{tag} {n} سابق"] = (float(p[k]), w)
+    t = before.tail(20)
+    lv[f"{tag} قمة 20"] = (float(t["High"].max()), w)
+    lv[f"{tag} قاع 20"] = (float(t["Low"].min()), w)
+    return lv
+
+
+def explosion_setup(symbol, price, hD, hW, atr_daily, gex_fn):
+    """الشروط الثلاثة: انفجار + نقطة دافعة على فاصل + تمركز صانع (غاما). يرجع setup أو None"""
+    fD = _completed(hD.get(symbol), "D")
+    fW = _completed(hW.get(symbol), "W")
+    for kind, fc in (("W", fW), ("D", fD)):
+        ex = find_explosion(fc, EXPL_LOOKBACK[kind])
+        if not ex:
+            continue
+        lo, hi, d = ex["lo"], ex["hi"], ex["dir"]
+
+        # إلغاء المنطقة: إغلاق خارجها عكس الاتجاه بعد الانفجار
+        after = fc.loc[fc.index > ex["ts"]]
+        if len(after):
+            if d == "DOWN" and float(after["Close"].max()) > hi * (1 + CONF_TOL):
+                continue
+            if d == "UP" and float(after["Close"].min()) < lo * (1 - CONF_TOL):
+                continue
+
+        # السعر الحالي يعيد اختبار المنطقة
+        pad = max(price * CONF_TOL, 0.25 * (atr_daily or 0))
+        if not (lo - pad <= price <= hi + pad):
+            continue
+
+        # الفواصل الكبيرة عند المنطقة
+        lv = _levels_before(fc, ex["ts"], "أسبوعي" if kind == "W" else "يومي", 2 if kind == "W" else 1)
+        if kind == "D" and fW is not None and len(fW) >= 3:
+            lv.update(_levels_before(fW, fW.index[-1] + pd.Timedelta(days=1), "أسبوعي", 2))
+        sep_hits = [(n, v, w) for n, (v, w) in lv.items()
+                    if lo * (1 - CONF_TOL) <= v <= hi * (1 + CONF_TOL)]
+        sep_score = sum(w for _, _, w in sep_hits)
+        if sep_score < SEP_MIN_SCORE:
+            continue
+
+        # تمركز صانع السوق (يُحسب فقط بعد نجاح الشروط السابقة لتوفير الطلبات)
+        gex = gex_fn(symbol, price)
+        mm_hits = []
+        if gex:
+            for n, key in (("جدار كول", "call_wall"), ("جدار بوت", "put_wall"), ("فليب", "flip")):
+                v = gex.get(key)
+                if v and lo * (1 - MM_TOL) <= v <= hi * (1 + MM_TOL):
+                    mm_hits.append((n, float(v)))
+        # بدون غاما متاحة نطلب فواصل أقوى (وزن 3+)
+        if not mm_hits and not (gex is None and sep_score >= 3):
+            continue
+
+        atr = atr_daily or 0
+        b, o = ex["body"], ex["open"]
+        sgn = -1 if d == "DOWN" else 1
+        stop = (hi + 0.25 * atr) if d == "DOWN" else (lo - 0.25 * atr)
+        targets = [round(o + sgn * b * m, 2) for m in TARGET_EXT]
+        return {"kind": kind, "dir": d, "ts": ex["ts"], "lo": lo, "hi": hi,
+                "sep_hits": sep_hits, "sep_score": sep_score, "mm_hits": mm_hits,
+                "gex": gex, "stop": round(stop, 2), "targets": targets}
+    return None
+
+
+def build_explosion_msg(symbol, price, s, atr_d):
+    is_up = s["dir"] == "UP"
+    emoji = "🟢" if is_up else "🔴"
+    tf = "أسبوعية" if s["kind"] == "W" else "يومية"
+    otype = "كول" if is_up else "بوت"
+    lines = [
+        f"💣 {emoji} <b>{html.escape(symbol)}</b> إعادة اختبار منطقة انفجار {tf} - السعر <b>{price:.2f}$</b>",
+        f"📍 النقطة الدافعة: {s['lo']:.2f} - {s['hi']:.2f}$ (شمعة {s['ts'].date()} {'صاعدة' if is_up else 'هابطة'})",
+        "📏 فواصل عند المنطقة: " + " | ".join(f"{n} {v:.2f}$" for n, v, _ in s["sep_hits"]),
+    ]
+    if s["mm_hits"]:
+        lines.append("🏦 تمركز صانع السوق عند المنطقة: " + " | ".join(f"{n} {v:.1f}$" for n, v in s["mm_hits"]))
+    if s["gex"]:
+        lines.append(format_gex_line(s["gex"], price))
+    t1, t2, t3 = s["targets"]
+    lines.append(f"\n🚀 دخول {otype}: {price:.2f}$")
+    lines.append(f"🛑 وقف (خلف المنطقة): {s['stop']:.2f}$")
+    lines.append(f"🎯 أهداف (امتداد الشمعة): {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$")
+    lv = (s["stop"], t1, t2, t3)
+    try:
+        opts = get_option_recommendations(symbol, price, "CALL" if is_up else "PUT", atr_d,
+                                          levels_intraday=lv, levels_swing=lv)
+    except Exception:
+        opts = {}
+    for b, lab in (("daily", "🔥 يومي"), ("weekly", "📅 أسبوعي"), ("monthly", "🛡️ شهري")):
+        o = opts.get(b)
+        if o:
+            lines.append(f"\n{lab} {o['exp']} سترايك {o['strike']:.1f}$ بسعر {o['mid']:.2f}$ | "
+                         f"سبريد {o['spread_pct']:.0f}% | OI {o['oi']}\n<code>{html.escape(o['symbol'])}</code>")
+    lines.append("\n⚠️ تعليمي فقط - مو نصيحة مالية")
+    return "\n".join(lines)
+
+
+def run_explosion_scan(state, hD, hW, prices):
+    """يُستدعى مرة كل 5 دقايق من main_loop. تنبيه واحد لكل شركة/منطقة في اليوم"""
+    today = datetime.now(US_EASTERN).date()
+    for symbol in SYMBOLS:
+        try:
+            price = prices.get(symbol)
+            if not price:
+                continue
+            atr_d = calc_atr(hD.get(symbol))
+            s = explosion_setup(symbol, price, hD, hW, atr_d, compute_gex)
+            if not s:
+                continue
+            key = f"expl:{symbol}:{s['kind']}:{s['ts'].date()}:{today}"
+            if key in state:
+                continue
+            if send_telegram(build_explosion_msg(symbol, price, s, atr_d)):
+                _mark(state, key)
+            time.sleep(SEND_GAP_SECONDS)
+        except Exception as e:
+            logger.exception(f"خطأ انفجار {symbol}: {e}")
+# ===================== نهاية قسم الانفجار =====================
+
+# ============ العقود ============
+def get_option_recommendations(symbol, stock_price, option_type, atr_daily, levels_intraday=None, levels_swing=None):
+    """levels_* = (stop, t1, t2, t3). اليومي يستخدم مستويات 15د، الأسبوعي والشهري يستخدمون مستويات اليومي (أوسع)"""
     if stock_price <= 0: return {}
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
     today = datetime.now(timezone.utc).date()
@@ -442,8 +709,6 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, t1=N
         vol = (_as_float(_field(daily, "volume"), 0) if daily else 0) or 0
         diff_pct = abs(strike - stock_price) / stock_price * 100
         if diff_pct > MAX_DIFF_PCT: continue
-
-        # --- نقطة التعادل مقابل الحركة المتوقعة حتى الانتهاء ---
         if option_type == "CALL":
             be = strike + mid; be_move = max(0.0, be - stock_price)
         else:
@@ -451,18 +716,18 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, t1=N
         exp_move = (atr_daily or 0) * math.sqrt(max(dte, 1))
         be_ratio = (be_move / exp_move) if exp_move > 0 else 0.0
         if exp_move > 0 and be_ratio > MAX_BE_RATIO: continue
-
         greeks = _field(snap, "greeks")
         delta = _as_float(_field(greeks, "delta")) if greeks else None
         gamma = _as_float(_field(greeks, "gamma")) if greeks else None
-
-        def est_pct(px):
-            if px is None or delta is None: return None
+        lv = levels_intraday if bucket == "daily" else (levels_swing or levels_intraday)
+        t1 = lv[1] if lv else None
+        stop = lv[0] if lv else None
+        def est_pct(px, _delta=delta, _gamma=gamma, _mid=mid):
+            if px is None or _delta is None: return None
             mv = px - stock_price
-            val = max(0.0, mid + delta * mv + 0.5 * (gamma or 0.0) * mv * mv)
-            return (val - mid) / mid * 100
+            val = max(0.0, _mid + _delta * mv + 0.5 * (_gamma or 0.0) * mv * mv)
+            return (val - _mid) / _mid * 100
         est_t1 = est_pct(t1); est_stop = est_pct(stop)
-
         ratio = vol / max(oi, 1)
         unusual = " 🔥 نشاط غير عادي" if ratio >= 2 and vol >= 100 else ""
         whale_tag = (" 🐋 دخول حيتان" if vol > 5000 or oi > 10000 else "") + unusual
@@ -477,8 +742,7 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, t1=N
         if cands: result[b] = min(cands, key=lambda x: x["score"])
     return result
 
-
-# ====================== الحالة وتسجيل الإشارات ======================
+# ============ الحالة (تنحفظ في ملف عشان تتحمل إعادة التشغيل) ============
 def _load_state():
     try: data = json.loads(STATE_FILE.read_text(encoding="utf-8")); return data if isinstance(data, dict) else {}
     except Exception: return {}
@@ -490,23 +754,27 @@ def _save_state(state):
         tmp.replace(STATE_FILE)
     except Exception as e: logger.warning(f"فشل حفظ الحالة: {e}")
 def _prune_state(state):
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STATE_RETENTION_HOURS)
     kept = {}
     for k, v in state.items():
         try:
-            stamp = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            stamp = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
             if stamp.tzinfo is None: stamp = stamp.replace(tzinfo=timezone.utc)
             if stamp >= cutoff: kept[k] = v
         except Exception: continue
     return kept
+def _mark(state, key):
+    state[key] = datetime.now(timezone.utc).isoformat()
+    _save_state(state)
 def _last_sent(state, symbol):
     v = state.get(f"sent:{symbol}")
     if not v: return None
     try:
-        d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception: return None
 
+# ============ سجل الإشارات والتتبع ============
 _sig_lock = Lock()
 def _load_signals():
     try:
@@ -530,8 +798,13 @@ def _close_signal(s, outcome, exit_price):
     s["status"] = "closed"; s["outcome"] = outcome; s["exit_price"] = round(float(exit_price), 2)
     sign = 1 if s["dir"] == "UP" else -1
     s["pnl_pct"] = round((exit_price - s["entry"]) / s["entry"] * 100 * sign, 2)
+def _active_stop(s):
+    # وقف متحرك: بعد هدف1 يصير على الدخول، بعد هدف2 يصير على هدف1
+    b = s["best"]
+    if b == 0: return s["stop"]
+    if b == 1: return s["entry"]
+    return s["targets"][b - 2]
 def track_open_signals():
-    """يفحص الإشارات المفتوحة على شموع 5د المكتملة: أي هدف تحقق أولاً أو الوقف. الوقف يُفحص قبل الهدف داخل نفس الشمعة (تحفظ)."""
     with _sig_lock:
         open_syms = sorted({s["symbol"] for s in _load_signals() if s["status"] == "open"})
     if not open_syms: return
@@ -543,62 +816,81 @@ def track_open_signals():
         sigs = _load_signals(); changed = False
         for s in sigs:
             if s["status"] != "open": continue
+            sig_date = datetime.fromisoformat(s["ts"]).astimezone(US_EASTERN).date()
+            eod = now_et.date() > sig_date or now_et.hour >= 16
             f = frames.get(s["symbol"])
-            if f is None: continue
+            if f is None or not len(f):
+                if eod:
+                    _close_signal(s, "EOD", s["entry"]); changed = True
+                continue
             long = s["dir"] == "UP"
             new = f[f.index > pd.Timestamp(s["last_ts"])]
             new = new[new.index + pd.Timedelta(minutes=5) <= now_utc]
             for ts, row in new.iterrows():
                 hi, lo = float(row["High"]), float(row["Low"])
                 s["last_ts"] = ts.isoformat(); changed = True
-                if (lo <= s["stop"]) if long else (hi >= s["stop"]):
-                    if s["best"] == 0: _close_signal(s, "STOP", s["stop"])
-                    else: _close_signal(s, f"T{s['best']}", s["targets"][s["best"] - 1])
+                stop = _active_stop(s)
+                if (lo <= stop) if long else (hi >= stop):
+                    _close_signal(s, "STOP" if s["best"] == 0 else f"TRAIL{s['best']}", stop)
                     break
                 for i, t in enumerate(s["targets"], 1):
                     if i > s["best"] and ((hi >= t) if long else (lo <= t)): s["best"] = i
                 if s["best"] == len(s["targets"]):
                     _close_signal(s, f"T{s['best']}", s["targets"][-1]); break
-            if s["status"] == "open":
-                sig_date = datetime.fromisoformat(s["ts"]).astimezone(US_EASTERN).date()
-                if now_et.date() > sig_date or now_et.hour >= 16:
-                    last_px = float(f["Close"].iloc[-1]) if len(f) else s["entry"]
-                    if s["best"] > 0: _close_signal(s, f"T{s['best']}", s["targets"][s["best"] - 1])
-                    else: _close_signal(s, "EOD", last_px)
-                    changed = True
+            if s["status"] == "open" and eod:
+                closed_f = f[f.index + pd.Timedelta(minutes=5) <= now_utc]
+                last_px = float(closed_f["Close"].iloc[-1]) if len(closed_f) else s["entry"]
+                _close_signal(s, "EOD", last_px); changed = True
         if changed: _save_signals(sigs)
 def compute_stats():
     with _sig_lock: sigs = _load_signals()
     closed = [s for s in sigs if s["status"] == "closed"]
     counts = {}
     for s in closed: counts[s["outcome"]] = counts.get(s["outcome"], 0) + 1
-    wins = sum(1 for s in closed if s["outcome"] in ("T1", "T2", "T3"))
     pnl = [s["pnl_pct"] for s in closed if s.get("pnl_pct") is not None]
+    wins = sum(1 for p in pnl if p > 0)
+    hit_t1 = sum(1 for s in closed if s.get("best", 0) >= 1)
     return {"total": len(sigs), "open": len(sigs) - len(closed), "closed": len(closed), "outcomes": counts,
-            "hit_t1_rate_pct": round(wins / len(closed) * 100, 1) if closed else None,
+            "hit_t1_rate_pct": round(hit_t1 / len(closed) * 100, 1) if closed else None,
+            "win_rate_pct": round(wins / len(pnl) * 100, 1) if pnl else None,
             "avg_stock_pnl_pct": round(sum(pnl) / len(pnl), 2) if pnl else None}
 
-
-# ====================== تيليجرام والتقرير ======================
+# ============ تيليجرام والتقرير ============
+def _chunk_message(msg, limit=3900):
+    if len(msg) <= limit: return [msg]
+    chunks, cur = [], ""
+    for line in msg.split("\n"):
+        if len(cur) + len(line) + 1 > limit and cur:
+            chunks.append(cur); cur = ""
+        cur += line + "\n"
+    if cur: chunks.append(cur)
+    return chunks
 def send_telegram(msg):
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=20)
-        ok = r.ok and r.json().get("ok", False)
-        if not ok: logger.warning(f"تيليجرام رفض الرسالة: {r.text[:200]}")
-        return ok
-    except Exception as e: logger.warning(f"فشل إرسال تيليجرام: {e}"); return False
+    ok_all = True
+    for chunk in _chunk_message(msg):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}, timeout=20)
+            ok = r.ok and r.json().get("ok", False)
+            if not ok: logger.warning(f"تيليجرام رفض الرسالة: {r.text[:200]}")
+            ok_all = ok_all and ok
+        except Exception as e:
+            logger.warning(f"فشل إرسال تيليجرام: {e}"); ok_all = False
+    return ok_all
+
 def _strength_label(score):
     if score >= 70: return "قوي 🔥"
     if score >= 40: return "متوسط"
     return "ضعيف"
-def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, trend_score, trend_details, gap_info, atr_daily, gex):
+
+def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, trend_score, trend_details, gap_info, atr_daily, gex, reason=""):
     is_neutral = direction not in ("UP", "DOWN") or trend_score < 2
     if is_neutral: option_type = "محايد ⏸️"; emoji = "⚪"
-    else: option_type = "CALL" if direction == "UP" else "PUT"; emoji = "🟢" if option_type == "CALL" else "🔴"
+    else: option_type = "كول" if direction == "UP" else "بوت"; emoji = "🟢" if option_type == "كول" else "🔴"
     rsi = calc_rsi(hist)
-    rsi_txt = f"{rsi:.1f}" if rsi is not None else "N/A"
+    rsi_txt = f"{rsi:.1f}" if rsi is not None else "غير متوفر"
     dl = daily_levels(hDsym)
-    sma_txt = f"SMA50 يومي: {dl['sma50']:.2f}$" if dl and dl["sma50"] else "SMA50 يومي: N/A"
+    sma_txt = f"متوسط 50 يومي: {dl['sma50']:.2f}$" if dl and dl["sma50"] else "متوسط 50 يومي: غير متوفر"
     if dl and direction == "UP":
         lv = dl["hi20"]
         lvl_txt = f"تم كسر مقاومة 20 يوم {lv:.2f}$ ✅" if price > lv else f"مقاومة 20 يوم {lv:.2f}$ (يبعد {lv - price:.2f}$)"
@@ -606,56 +898,63 @@ def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, t
         lv = dl["lo20"]
         lvl_txt = f"تم كسر دعم 20 يوم {lv:.2f}$ ✅" if price < lv else f"دعم 20 يوم {lv:.2f}$ (يبعد {price - lv:.2f}$)"
     else:
-        lvl_txt = "مستويات 20 يوم: N/A"
+        lvl_txt = "مستويات 20 يوم: غير متوفر"
     atr15 = calc_atr(h15sym) or ((calc_atr(hist) or 0) * 2) or None
-    stops = None if is_neutral else calc_levels(atr15, price, is_put=(direction == "DOWN"))
-
-    lines = [f"📡 تقرير الساعة {emoji} <b>{symbol}</b> سعره <b>{price:.2f}$</b>"]
+    is_put = direction == "DOWN"
+    stops = None if is_neutral else calc_levels(atr15, price, is_put=is_put)
+    swing = None if is_neutral else calc_levels(atr_daily, price, is_put=is_put)
+    lines = [f"📡 تنبيه فوري {emoji} <b>{html.escape(symbol)}</b> سعره <b>{price:.2f}$</b>"]
+    if reason:
+        lines.append(f"⚡ <b>سبب التنبيه:</b> {html.escape(reason)}")
     if gap_info:
         src = gap_info["source"]
         if gap_info["is_big"]:
             lines.append(f"⚠️ <b>قاب كبير جداً ({src}) {gap_info['gap_points']:+.2f}$ ({gap_info['gap_pct']:.1f}%) - لا تدخل أول 15 دقيقة</b>")
         else:
             valid_txt = "✅ صالح" if gap_info["is_valid"] else "❌ غير صالح"
-            lines.append(f"🔍 <b>القاب ({src}):</b> {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} ATR يومي) - {valid_txt}")
+            lines.append(f"🔍 <b>القاب ({src}):</b> {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} متوسط يومي) - {valid_txt}")
         if gap_info["is_valid"] and not gap_info["in_window"]:
             lines.append("⌛ انتهت نافذة قانون القاب - القاب للمعلومة فقط")
         if gap_info["active"] and not is_neutral:
-            lines.append(f"⚡ <b>قانون القاب:</b> {'CALL' if gap_info['is_up'] else 'PUT'} باتجاه القاب (نافذة أول {GAP_RULE_WINDOW_MIN} دقيقة)")
+            lines.append(f"⚡ <b>قانون القاب:</b> {'كول' if gap_info['is_up'] else 'بوت'} باتجاه القاب (نافذة أول {GAP_RULE_WINDOW_MIN} دقيقة)")
     else:
         lines.append("🔍 <b>القاب:</b> لا يوجد")
     if sq:
         state_txt = f"منضغط منذ {sq['bars']} شمعة" if sq["in_squeeze"] else "غير منضغط"
         lines.append(f"🗜️ الانضغاط: <b>{sq['score']}/100</b> ({_strength_label(sq['score'])}) - {state_txt} | أضيق من {sq['tight_pct']:.0f}%")
     if bo:
-        status = "تم الكسر ✅" if bo["broke"] else f"يبعد {bo['dist']:.1f} ATR"
+        status = "تم الكسر ✅ (قمة/قاع آخر 20 شمعة 5د)" if bo["broke"] else f"يبعد {bo['dist']:.1f} متوسط"
         lines.append(f"💥 الانفجار: <b>{bo['score']}/100</b> - {status}")
-    vol_day = f"اليوم {drvol:.1f}×" if drvol is not None else "اليوم N/A"
-    vol_15 = f"آخر 15د {bo['rvol']:.1f}×" if bo else "آخر 15د N/A"
+    vol_day = f"اليوم {drvol:.1f}×" if drvol is not None else "اليوم غير متوفر"
+    vol_15 = f"آخر 15د {bo['rvol']:.1f}×" if bo else "آخر 15د غير متوفر"
     lines.append(f"📊 الفوليوم: {vol_day} | {vol_15}")
     if is_neutral:
         lines.append(f"🧭 الاتجاه: محايد ⏸️ ({' '.join(trend_details) if trend_details else 'لا إجماع'}) - لا تدخل")
     else:
         lines.append(f"🧭 الاتجاه: {option_type} | {' '.join(trend_details)} | القوة {trend_score}/3")
-    lines.append(f"📊 {sma_txt} | {lvl_txt} | RSI(5د): {rsi_txt}")
+    lines.append(f"📊 {sma_txt} | {lvl_txt} | مؤشر القوة (5د): {rsi_txt}")
     lines.append(format_gex_line(gex, price))
     if gex and stops and not is_neutral:
         t1 = stops[1]
         if direction == "DOWN" and gex["put_wall"] < price and t1 < gex["put_wall"]:
-            lines.append("⚠️ الهدف 1 تحت Put Wall (دعم قوي قبله)")
+            lines.append("⚠️ الهدف 1 تحت جدار البوت (دعم قوي قبله)")
         if direction == "UP" and gex["call_wall"] > price and t1 > gex["call_wall"]:
-            lines.append("⚠️ الهدف 1 فوق Call Wall (مقاومة قوية قبله)")
-
+            lines.append("⚠️ الهدف 1 فوق جدار الكول (مقاومة قوية قبله)")
     info = {"option_type": None, "stops": stops, "option": None}
     if is_neutral:
         lines.append("\n⏸️ محايد - انتظر")
     else:
-        info["option_type"] = option_type
+        info["option_type"] = "CALL" if direction == "UP" else "PUT"
         lines.append(f"\n🚀 دخول {option_type}: {price:.2f}$")
         if stops:
             stop, t1, t2, t3 = stops
-            lines.extend([f"🛑 وقف: {stop:.2f}$ (1.5 ATR على 15د)", f"🎯 أهداف: {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$"])
-        options = get_option_recommendations(symbol, price, option_type, atr_daily, t1=stops[1] if stops else None, stop=stops[0] if stops else None)
+            lines.extend([f"🛑 وقف (يومي/مضاربة): {stop:.2f}$ (1.5 متوسط على 15د)",
+                          f"🎯 أهداف: {t1:.2f}$ / {t2:.2f}$ / {t3:.2f}$",
+                          "🔁 بعد هدف1 حرّك الوقف للدخول"])
+        if swing:
+            lines.append(f"🛡️ للعقود الأسبوعي والشهري - وقف أوسع على اليومي: {swing[0]:.2f}$ | هدف1 {swing[1]:.2f}$")
+        options = get_option_recommendations(symbol, price, info["option_type"], atr_daily,
+                                             levels_intraday=stops, levels_swing=swing)
         labels = {"daily": "🔥 يومي", "weekly": "📅 أسبوعي", "monthly": "🛡️ شهري"}
         if options:
             for b in ("daily", "weekly", "monthly"):
@@ -667,120 +966,247 @@ def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, t
                     elif spread_d < 0.6: liq = f"سيولة متوسطة ⚠️ سبريد ${spread_d:.2f}"
                     else: liq = f"سيولة ضعيفة ❌ سبريد ${spread_d:.2f}"
                     txt = (f"{labels[b]} {o['exp']} ({o['dte']} يوم) {o['whale']}\n"
-                           f"💰 سترايك {o['strike']:.1f}$ - {o['mid']:.1f}$ | {liq} | فوليوم {o['vol']} OI {o['oi']}\n"
+                           f"💰 سترايك {o['strike']:.1f}$ - {o['mid']:.1f}$ | {liq} | فوليوم {o['vol']} مصلحة مفتوحة {o['oi']}\n"
                            f"⚖️ تعادل {o['be']:.2f}$ (يحتاج {o['be_move_pct']:.1f}%) | الحركة المتوقعة ±{o['exp_move']:.1f}$")
                     if o["est_t1"] is not None and o["est_stop"] is not None:
                         txt += f"\n📐 تقدير العقد: عند هدف1 {o['est_t1']:+.0f}% | عند الوقف {o['est_stop']:+.0f}% (بدون ثيتا)"
                     if o["dte"] <= 2: txt += "\n⏳ ينتهي قريب جداً - ثيتا عالية"
-                    txt += f"\n🔹 <code>{o['symbol']}</code>\n"
+                    txt += f"\n🔹 <code>{html.escape(o['symbol'])}</code>\n"
                     lines.append(txt)
         else:
             lines.append("\n❌ ما فيه عقد يحقق شروط السيولة ونقطة التعادل")
-    lines.append("\n⚠️ تعليمي فقط")
+    lines.append("\n⚠️ تعليمي فقط - مو نصيحة مالية")
     return "\n".join(lines), info
 
+def build_weekly_report(results):
+    lines = ["📊 <b>تقرير الجمعة الأسبوعي - خطة الأسبوع الجاي</b>", ""]
+    if not results:
+        lines.append("هذا الأسبوع ما فيه ولا شركة قوية على الأسبوعي - لا تدخل، انتظر")
+        return "\n".join(lines)
+    for i, r in enumerate(results[:3], 1):
+        lines.append(f"<b>{i}. {html.escape(r['symbol'])} - {r['price']:.2f}$ - قوة أسبوعية {r['w_score']}/100</b>")
+        lines.append(f"   {html.escape(r['w_desc'])}")
+        lines.append(f"   الاتجاه: {r['direction']} | دخول {r['option_type']} | وقف {r['stop']:.2f}$ | هدف {r['t1']:.2f}$ (مستويات يومية)")
+        lines.append("")
+    lines.append("الباقي: ما فيها فرصة أسبوعية، تجاهلها")
+    lines.append("\n⚠️ تعليمي فقط")
+    return "\n".join(lines)
 
-# ====================== الحلقة الرئيسية ======================
+# ============ الحلقة الرئيسية ============
 def main_loop():
     state = _prune_state(_load_state())
-    pre_sent = {}
     last_track = 0.0
-    send_telegram(f"✅ <b>تم تشغيل الماسح (نسخة مصححة: GEX حقيقي + قاب فعلي + تسجيل الإشارات)</b>\nمراقبة {len(SYMBOLS)} شركة\n📡 تقرير كل {REPORT_EVERY_MINUTES} دقيقة بعد الافتتاح")
+    last_pre_bucket = None
+    last_scan_bucket = None
+    send_telegram("✅ <b>تم تشغيل البوت - نسخة معدلة</b>\n"
+                  f"مراقبة {len(SYMBOLS)} شركة\n"
+                  "📡 فحص مع كل إغلاق شمعة 5 دقايق - شموع مكتملة فقط\n"
+                  "💣 جديد: تنبيه انفجار + نقطة دافعة + فاصل + غاما\n"
+                  "📊 تقرير الجمعة الأسبوعي بعد الإغلاق")
     while True:
         try:
             now_et = datetime.now(US_EASTERN)
-
-            # === تتبع نتائج الإشارات كل 5 دقائق ===
             if time.time() - last_track >= 300:
                 track_open_signals(); last_track = time.time()
+            bucket = (now_et.date(), now_et.hour, now_et.minute // 5)
 
-            # === البري ماركت (4:00 - 9:30 ET) ===
-            if now_et.weekday() < 5 and (4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)):
-                h5, h15, hD, prices = fetch_market_data(SYMBOLS)
+            # === تقرير الجمعة - بعد 4:15 عصراً نيويورك، مرة وحدة ===
+            weekly_key = f"weekly:{now_et.date()}"
+            if (now_et.weekday() == 4 and (now_et.hour, now_et.minute) >= (16, 15)
+                    and weekly_key not in state and not _time_based_open()):
+                try:
+                    h5, h15, hD, hW, prices = fetch_market_data(SYMBOLS, force_slow=True)
+                    today = now_et.date()
+                    traded_today = any(f.index[-1].date() == today for f in hD.values() if len(f))
+                    if traded_today:
+                        results = []
+                        for symbol in SYMBOLS:
+                            price = prices.get(symbol)
+                            if not price: continue
+                            w_score, w_desc, w_dir = weekly_score(hW.get(symbol))
+                            if w_score < 40: continue
+                            direction = pick_direction(symbol, h5, h15, hD)
+                            if direction == "NEUTRAL" or w_dir != direction: continue
+                            atr_d = calc_atr(hD.get(symbol))
+                            stops = calc_levels(atr_d, price, is_put=(direction == "DOWN"))
+                            if not stops: continue
+                            results.append({"symbol": symbol, "price": price, "w_score": w_score, "w_desc": w_desc,
+                                            "direction": "صاعد" if direction == "UP" else "هابط",
+                                            "option_type": "كول" if direction == "UP" else "بوت",
+                                            "stop": stops[0], "t1": stops[1]})
+                        results.sort(key=lambda x: x["w_score"], reverse=True)
+                        if send_telegram(build_weekly_report(results)):
+                            _mark(state, weekly_key)
+                    else:
+                        _mark(state, weekly_key)  # الجمعة إجازة
+                except Exception as e:
+                    logger.exception(f"خطأ تقرير الجمعة: {e}")
+                    _mark(state, weekly_key)
+
+            # === البري ماركت (4:00 - 9:30) - مرة كل 5 دقايق ===
+            if ((4 <= now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30))
+                    and bucket != last_pre_bucket and now_et.second >= 15 and is_premarket_trading_day()):
+                last_pre_bucket = bucket
+                h5, h15, hD, hW, prices = fetch_market_data(SYMBOLS)
                 for symbol in SYMBOLS:
                     price = prices.get(symbol)
                     if not price: continue
                     key = f"pre:{symbol}:{now_et.date()}"
-                    if key in pre_sent: continue
+                    if key in state: continue
                     atr_d = calc_atr(hD.get(symbol))
                     gap_info = calc_gap_metrics(symbol, hD, price, atr_d)
                     if gap_info and gap_info["is_valid"]:
                         gex = compute_gex(symbol, price)
                         msg = (
-                            f"⏰ <b>تنبيه قاب وغاما قبل الافتتاح {symbol}</b>\n"
+                            f"⏰ <b>تنبيه قاب وغاما قبل الافتتاح {html.escape(symbol)}</b>\n"
                             f"💰 بري ماركت: {price:.2f}$ (إغلاق أمس {gap_info['prev_close']:.2f}$)\n"
-                            f"🔍 القاب: {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} ATR يومي)\n"
+                            f"🔍 القاب: {gap_info['gap_type']} {gap_info['gap_pct']:.2f}% = {gap_info['gap_points']:+.2f}$ ({gap_info['gap_atr']:.1f} متوسط يومي)\n"
                             f"{format_gex_line(gex, price)}\n"
                         )
                         if gap_info["is_big"]:
                             msg += "⚠️ قاب كبير جداً - لا تدخل أول 15 دقيقة بعد الافتتاح\n"
                         msg += "⏳ جهز العقد وانتظر تأكيد أول 5 دقايق"
-                        send_telegram(msg)
-                        pre_sent[key] = True
+                        if send_telegram(msg):
+                            _mark(state, key)
                         time.sleep(SEND_GAP_SECONDS)
-                if len(pre_sent) > 100: pre_sent.clear()
 
-            # === بعد الافتتاح ===
+            # === داخل السوق ===
             if not is_market_open():
-                time.sleep(60)
+                state = _prune_state(state)
+                time.sleep(30)
                 continue
+
+            # نفحص مرة وحدة لكل شمعة 5د مكتملة (بعد 15 ثانية من الإغلاق)
+            if bucket == last_scan_bucket or now_et.second < 15:
+                time.sleep(5)
+                continue
+            last_scan_bucket = bucket
+
+            h5, h15, hD, hW, prices = fetch_market_data(SYMBOLS)
+
+            # === جديد: شرط الانفجار + النقطة الدافعة + الفاصل + غاما (مستقل عن السكويز) ===
+            run_explosion_scan(state, hD, hW, prices)
+
+            candidates = []
+            for symbol in SYMBOLS:
+                try:
+                    hist = h5.get(symbol)
+                    hist15 = h15.get(symbol)
+                    price = prices.get(symbol)
+                    if hist is None or hist15 is None or price is None or len(hist) < 30: continue
+
+                    last_sent = _last_sent(state, symbol)
+                    if last_sent and (datetime.now(timezone.utc) - last_sent).total_seconds() < RESEND_BLOCK_SECONDS:
+                        continue
+
+                    atr_daily = calc_atr(hD.get(symbol))
+                    gap_info = calc_gap_metrics(symbol, hD, price, atr_daily)
+                    direction = pick_direction(symbol, h5, h15, hD)
+                    if gap_info and gap_info["active"]:
+                        direction = "UP" if gap_info["is_up"] else "DOWN"
+                    if direction == "NEUTRAL": continue
+
+                    sq = squeeze_metrics(hist)
+                    bo = breakout_for(hist, direction)
+                    if not bo: continue
+
+                    last15 = hist15.iloc[-1]  # آخر شمعة 15د مكتملة
+                    last5 = hist.iloc[-1]     # آخر شمعة 5د مكتملة
+                    mar15 = aligned_marubozu(last15, direction)
+                    mar5 = aligned_marubozu(last5, direction)
+
+                    fD = hD.get(symbol)
+                    open_today = float(fD["Open"].iloc[-1]) if fD is not None and len(fD) else price
+                    move_today_pct = abs(price - open_today) / open_today * 100 if open_today else 0
+                    min_move = min_move_for_symbol(symbol)
+
+                    dl = daily_levels(fD)
+                    daily_broke = bool(dl and ((price > dl["hi20"]) if direction == "UP" else (price < dl["lo20"])))
+
+                    score = (sq["score"] if sq else 0) * 0.4 + bo["score"] * 0.6
+                    is_breakout = bo["broke"] and (mar15 or mar5) and bo["rvol"] >= 1.2
+                    is_strong_enough = is_breakout or (move_today_pct >= min_move and bo["broke"] and bo["rvol"] >= 1.0)
+
+                    if not is_strong_enough: continue
+                    if score < MIN_SCORE: continue  # الفلتر يطبق على الكل بدون استثناء
+
+                    parts = []
+                    if is_breakout and move_today_pct < min_move:
+                        parts.append(f"بداية الحركة (لسا {move_today_pct:.2f}% فقط)")
+                    else:
+                        parts.append(f"تحرك {move_today_pct:.2f}% اليوم (المطلوب {min_move:.0f}%)")
+                    parts.append("كسر قمة/قاع آخر 20 شمعة 5د")
+                    if daily_broke: parts.append("كسر مستوى 20 يوم ✅")
+                    if mar15 or mar5: parts.append("شمعة ماروبوزو باتجاه الكسر")
+                    parts.append(f"فوليوم {bo['rvol']:.1f}×")
+                    reason = " + ".join(parts)
+
+                    tscore, tdetails = get_trend_strength(symbol, h5, h15, hD, direction)
+                    if tscore < 2: continue
+
+                    candidates.append({
+                        "symbol": symbol, "price": price, "hist": hist, "h15": hist15, "hD": fD,
+                        "direction": direction, "sq": sq, "bo": bo, "gap": gap_info, "atr_daily": atr_daily,
+                        "tscore": tscore, "tdetails": tdetails, "score": score, "reason": reason,
+                        "move_pct": move_today_pct
+                    })
+                except Exception as e:
+                    logger.exception(f"خطأ {symbol}: {e}")
+
+            if candidates:
+                candidates.sort(key=lambda x: x["score"], reverse=True)
+                to_send = [candidates[0]]
+                if len(candidates) > 1 and candidates[1]["score"] >= 80:
+                    to_send.append(candidates[1])
+                for c in to_send:
+                    gex = compute_gex(c["symbol"], c["price"])
+                    drvol = day_rvol(hD, c["symbol"])
+                    msg, info = build_report(c["symbol"], c["price"], c["hist"], c["h15"], c["hD"],
+                                             c["direction"], c["sq"], c["bo"], drvol,
+                                             c["tscore"], c["tdetails"], c["gap"], c["atr_daily"], gex,
+                                             reason=c["reason"])
+                    if send_telegram(msg):
+                        _mark(state, f"sent:{c['symbol']}")
+                        if info["option_type"] and info["stops"]:
+                            st = info["stops"]
+                            log_signal(c["symbol"], c["direction"], c["price"], st[0], st[1:], info["option"])
+                    time.sleep(SEND_GAP_SECONDS)
             state = _prune_state(state)
-            now_utc = datetime.now(timezone.utc)
-            due = []
-            for s in SYMBOLS:
-                ls = _last_sent(state, s)
-                if ls is None or (now_utc - ls).total_seconds() >= REPORT_EVERY_MINUTES * 60:
-                    due.append(s)
-            if due:
-                h5, h15, hD, prices = fetch_market_data(due)
-                for symbol in due:
-                    try:
-                        hist = h5.get(symbol)
-                        price = prices.get(symbol)
-                        if hist is None or price is None or len(hist) < 30: continue
-                        atr_daily = calc_atr(hD.get(symbol))
-                        gap_info = calc_gap_metrics(symbol, hD, price, atr_daily)
-                        direction = pick_direction(symbol, h5, h15, hD)
-                        if gap_info and gap_info["active"]:
-                            direction = "UP" if gap_info["is_up"] else "DOWN"
-                        sq = squeeze_metrics(hist)
-                        bo = breakout_for(hist, direction)
-                        drvol = day_rvol(hD, symbol)
-                        best = max(sq["score"] if sq else 0, bo["score"] if bo else 0)
-                        force_send = bool(gap_info and gap_info["active"])
-                        if best >= MIN_REPORT_SCORE or force_send:
-                            tscore, tdetails = get_trend_strength(symbol, h5, h15, hD, direction)
-                            gex = compute_gex(symbol, price)
-                            msg, info = build_report(symbol, price, hist, h15.get(symbol), hD.get(symbol), direction, sq, bo, drvol,
-                                                     tscore, tdetails, gap_info, atr_daily, gex)
-                            if not send_telegram(msg): continue
-                            if info["option_type"] and info["stops"]:
-                                st = info["stops"]
-                                log_signal(symbol, direction, price, st[0], st[1:], info["option"])
-                            time.sleep(SEND_GAP_SECONDS)
-                        state[f"sent:{symbol}"] = datetime.now(timezone.utc).isoformat()
-                        _save_state(state)
-                    except Exception as e:
-                        logger.exception(f"خطأ {symbol}: {e}")
-            time.sleep(30)
         except Exception as e:
             logger.exception(f"خطأ رئيسي: {e}")
             time.sleep(20)
 
-
 @app.get("/")
-def home(): return "Bot OK - Real GEX + Gap + Hourly + Signal Tracking"
+def home(): return "Bot OK - كسر مبكر + انفجار + تقرير جمعة"
 @app.get("/health")
 def health(): return jsonify({"status": "ok", "symbols": len(SYMBOLS), "market_open": is_market_open()})
 @app.get("/stats")
 def stats(): return jsonify(compute_stats())
 
+# ============ تشغيل العامل (نسخة وحدة فقط) ============
 _worker_lock = Lock()
 _worker_started = False
+_lock_fh = None
+def _acquire_single_instance() -> bool:
+    """يمنع تشغيل أكثر من حلقة (مثلاً gunicorn بعدة workers)"""
+    global _lock_fh
+    try:
+        import fcntl
+        fh = open("/tmp/squeeze_bot.lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh = fh
+        return True
+    except ImportError:
+        return True
+    except OSError:
+        return False
 def start_background_worker():
     global _worker_started
     with _worker_lock:
         if _worker_started: return
+        if not _acquire_single_instance():
+            logger.warning("عامل ثاني شغال أصلاً - ما راح أشغل حلقة مكررة")
+            return
         Thread(target=main_loop, name="squeeze-worker", daemon=True).start()
         _worker_started = True
 start_background_worker()
