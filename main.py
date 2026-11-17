@@ -3,6 +3,14 @@
 # الفكرة: ينبه وقت الكسر على شموع مكتملة فقط
 # الجمعة: تقرير أسبوعي بعد الإغلاق، باقي الأيام: تنبيه فوري لأقوى شركة
 # جديد: تنبيه "انفجار + نقطة دافعة + فاصل + غاما" (راجع قسم الانفجار أسفل دالة format_gex_line)
+#
+# === تعديلات هذي النسخة (6) ===
+# 1) القاب وحركة اليوم: prev_close من آخر شمعة تاريخها أقل من اليوم، والافتتاح من شمعة اليوم أو أول شمعة 5د
+# 2) تاريخ العقد: توقيت نيويورك + استبعاد 0DTE
+# 3) الحركة المتوقعة من IV العقد (الرجوع لـ ATR لو IV غير متوفر)
+# 4) السيولة: سبريد + فوليوم العقد + OI
+# 5) تسمية الفوليوم: سهم / عقد
+# 6) تحذير غاما موجبة مع إشارة كسر
 
 from __future__ import annotations
 import html, json, logging, math, os, time
@@ -257,16 +265,40 @@ def weekly_score(hW_sym):
         score += 30; txt.append("ابتلاعية هابطة ✅")
     return score, " | ".join(txt), w_dir
 
-def calc_gap_metrics(symbol, hD, current_price, atr_daily):
+# ---------- [تعديل 1] افتتاح اليوم وإغلاق أمس بشكل صحيح ----------
+def _dates_et(f):
+    """قائمة تواريخ نيويورك لكل شمعة في الإطار"""
+    return [t.date() for t in f.index.tz_convert(US_EASTERN)]
+
+def today_open_price(symbol, hD, h5=None):
+    """افتتاح اليوم: من شمعة اليوم اليومية إن وجدت، وإلا من أول شمعة 5د بعد 9:30. وإلا None"""
+    today = datetime.now(US_EASTERN).date()
+    f = hD.get(symbol) if hD else None
+    if f is not None and len(f) and _dates_et(f)[-1] == today:
+        return float(f["Open"].iloc[-1])
+    g = h5.get(symbol) if h5 else None
+    if g is not None and len(g):
+        idx = g.index.tz_convert(US_EASTERN)
+        mask = [(t.date() == today and (t.hour, t.minute) >= (9, 30)) for t in idx]
+        sub = g[mask]
+        if len(sub):
+            return float(sub["Open"].iloc[0])
+    return None
+
+def calc_gap_metrics(symbol, hD, current_price, atr_daily, h5=None):
     try:
         f = hD.get(symbol)
         if f is None or len(f) < 2: return None
         today = datetime.now(US_EASTERN).date()
-        has_today = f.index[-1].date() == today
-        prev_close = float(f["Close"].iloc[-2] if has_today else f["Close"].iloc[-1])
+        dates = _dates_et(f)
+        # إغلاق أمس = آخر شمعة تاريخها أقل من اليوم (مو حسب الترتيب)
+        prior = f[[d < today for d in dates]]
+        if prior.empty: return None
+        prev_close = float(prior["Close"].iloc[-1])
         if prev_close <= 0: return None
-        if has_today:
-            ref = float(f["Open"].iloc[-1]); source = "فتح"
+        op = today_open_price(symbol, hD, h5)
+        if op is not None and (dates[-1] == today or minutes_since_open() is not None):
+            ref = op; source = "فتح"
         else:
             ref = float(current_price); source = "بري ماركت"
         gap_points = ref - prev_close
@@ -723,7 +755,8 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, leve
     """levels_* = (stop, t1, t2, t3). اليومي يستخدم مستويات 15د، الأسبوعي والشهري يستخدمون مستويات اليومي (أوسع)"""
     if stock_price <= 0: return {}
     target = ContractType.CALL if option_type == "CALL" else ContractType.PUT
-    today = datetime.now(timezone.utc).date()
+    # [تعديل 2] تاريخ نيويورك بدل UTC
+    today = datetime.now(US_EASTERN).date()
     max_expiry = today + timedelta(days=45)
     if option_type == "CALL": low = stock_price * 0.99; high = stock_price * 1.04
     else: low = stock_price * 0.96; high = stock_price * 1.01
@@ -737,7 +770,8 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, leve
         expiry = _as_date(_field(contract, "expiration_date")); strike = _as_float(_field(contract, "strike_price")); cs = _field(contract, "symbol")
         if not expiry or not strike or not cs: continue
         dte = (expiry - today).days
-        if 0 <= dte <= 7: bucket = "daily"; max_spread = MAX_SPREAD_DAILY
+        # [تعديل 2] استبعاد 0DTE: اليومي يبدأ من يوم واحد
+        if 1 <= dte <= 7: bucket = "daily"; max_spread = MAX_SPREAD_DAILY
         elif 8 <= dte <= 20: bucket = "weekly"; max_spread = MAX_SPREAD_WEEKLY
         elif 21 <= dte <= 45: bucket = "monthly"; max_spread = MAX_SPREAD_MONTHLY
         else: continue
@@ -761,7 +795,12 @@ def get_option_recommendations(symbol, stock_price, option_type, atr_daily, leve
             be = strike + mid; be_move = max(0.0, be - stock_price)
         else:
             be = strike - mid; be_move = max(0.0, stock_price - be)
-        exp_move = (atr_daily or 0) * math.sqrt(max(dte, 1))
+        # [تعديل 3] الحركة المتوقعة من IV العقد، والرجوع لـ ATR لو IV غير متوفر
+        iv = _as_float(_field(snap, "implied_volatility"))
+        if iv is not None and 0.05 <= iv <= 5.0:
+            exp_move = stock_price * iv * math.sqrt(max(dte, 1) / 365.0)
+        else:
+            exp_move = (atr_daily or 0) * math.sqrt(max(dte, 1))
         be_ratio = (be_move / exp_move) if exp_move > 0 else 0.0
         if exp_move > 0 and be_ratio > MAX_BE_RATIO: continue
         greeks = _field(snap, "greeks")
@@ -931,6 +970,18 @@ def _strength_label(score):
     if score >= 40: return "متوسط"
     return "ضعيف"
 
+# [تعديل 4] تقييم السيولة: سبريد + فوليوم العقد + OI
+def liquidity_label(o):
+    spread_d = o["ask"] - o["bid"]
+    sp = f"سبريد ${spread_d:.2f}"
+    if o["vol"] == 0:
+        return f"سيولة ضعيفة ❌ (العقد ما تداول اليوم) {sp}"
+    if spread_d >= 0.6:
+        return f"سيولة ضعيفة ❌ {sp}"
+    if spread_d >= 0.3 or o["vol"] < 10 or o["oi"] < 200:
+        return f"سيولة متوسطة ⚠️ {sp}"
+    return f"سيولة ممتازة ✅ {sp}"
+
 def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, trend_score, trend_details, gap_info, atr_daily, gex, reason=""):
     is_neutral = direction not in ("UP", "DOWN") or trend_score < 2
     if is_neutral: option_type = "محايد ⏸️"; emoji = "⚪"
@@ -973,9 +1024,10 @@ def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, t
     if bo:
         status = "تم الكسر ✅ (قمة/قاع آخر 20 شمعة 5د)" if bo["broke"] else f"يبعد {bo['dist']:.1f} متوسط"
         lines.append(f"💥 الانفجار: <b>{bo['score']}/100</b> - {status}")
+    # [تعديل 5] تسمية واضحة: فوليوم السهم
     vol_day = f"اليوم {drvol:.1f}×" if drvol is not None else "اليوم غير متوفر"
     vol_15 = f"آخر 15د {bo['rvol']:.1f}×" if bo else "آخر 15د غير متوفر"
-    lines.append(f"📊 الفوليوم: {vol_day} | {vol_15}")
+    lines.append(f"📊 فوليوم السهم: {vol_day} | {vol_15}")
     if is_neutral:
         lines.append(f"🧭 الاتجاه: محايد ⏸️ ({' '.join(trend_details) if trend_details else 'لا إجماع'}) - لا تدخل")
     else:
@@ -988,6 +1040,9 @@ def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, t
             lines.append("⚠️ الهدف 1 تحت جدار البوت (دعم قوي قبله)")
         if direction == "UP" and gex["call_wall"] > price and t1 > gex["call_wall"]:
             lines.append("⚠️ الهدف 1 فوق جدار الكول (مقاومة قوية قبله)")
+    # [تعديل 6] تحذير: غاما موجبة (تهدئة) مع إشارة كسر
+    if gex and not is_neutral and gex["net_gex"] > 0 and bo and bo["broke"]:
+        lines.append("⚠️ غاما موجبة: الكسر ممكن يرتد (تهدئة)")
     info = {"option_type": None, "stops": stops, "option": None}
     if is_neutral:
         lines.append("\n⏸️ محايد - انتظر")
@@ -1009,12 +1064,10 @@ def build_report(symbol, price, hist, h15sym, hDsym, direction, sq, bo, drvol, t
                 if b in options:
                     o = options[b]
                     if info["option"] is None: info["option"] = o
-                    spread_d = o["ask"] - o["bid"]
-                    if spread_d < 0.3: liq = f"سيولة ممتازة ✅ سبريد ${spread_d:.2f}"
-                    elif spread_d < 0.6: liq = f"سيولة متوسطة ⚠️ سبريد ${spread_d:.2f}"
-                    else: liq = f"سيولة ضعيفة ❌ سبريد ${spread_d:.2f}"
+                    liq = liquidity_label(o)
                     txt = (f"{labels[b]} {o['exp']} ({o['dte']} يوم) {o['whale']}\n"
-                           f"💰 سترايك {o['strike']:.1f}$ - {o['mid']:.1f}$ | {liq} | فوليوم {o['vol']} مصلحة مفتوحة {o['oi']}\n"
+                           f"💰 سترايك {o['strike']:.1f}$ - {o['mid']:.1f}$ | {liq}\n"
+                           f"📊 فوليوم العقد {o['vol']} | مصلحة مفتوحة {o['oi']}\n"
                            f"⚖️ تعادل {o['be']:.2f}$ (يحتاج {o['be_move_pct']:.1f}%) | الحركة المتوقعة ±{o['exp_move']:.1f}$")
                     if o["est_t1"] is not None and o["est_stop"] is not None:
                         txt += f"\n📐 تقدير العقد: عند هدف1 {o['est_t1']:+.0f}% | عند الوقف {o['est_stop']:+.0f}% (بدون ثيتا)"
@@ -1196,7 +1249,7 @@ def main_loop():
                     key = f"pre:{symbol}:{now_et.date()}"
                     if key in state: continue
                     atr_d = calc_atr(hD.get(symbol))
-                    gap_info = calc_gap_metrics(symbol, hD, price, atr_d)
+                    gap_info = calc_gap_metrics(symbol, hD, price, atr_d, h5)
                     if gap_info and gap_info["is_valid"]:
                         gex = compute_gex(symbol, price)
                         msg = (
@@ -1242,7 +1295,7 @@ def main_loop():
                         continue
 
                     atr_daily = calc_atr(hD.get(symbol))
-                    gap_info = calc_gap_metrics(symbol, hD, price, atr_daily)
+                    gap_info = calc_gap_metrics(symbol, hD, price, atr_daily, h5)
                     direction = pick_direction(symbol, h5, h15, hD)
                     if gap_info and gap_info["active"]:
                         direction = "UP" if gap_info["is_up"] else "DOWN"
@@ -1258,7 +1311,8 @@ def main_loop():
                     mar5 = aligned_marubozu(last5, direction)
 
                     fD = hD.get(symbol)
-                    open_today = float(fD["Open"].iloc[-1]) if fD is not None and len(fD) else price
+                    # [تعديل 1] افتتاح اليوم الصحيح (مو افتتاح يوم قديم لو الكاش متأخر)
+                    open_today = today_open_price(symbol, hD, h5) or price
                     move_today_pct = abs(price - open_today) / open_today * 100 if open_today else 0
                     min_move = min_move_for_symbol(symbol)
 
